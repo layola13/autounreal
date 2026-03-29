@@ -445,9 +445,16 @@ def _call_cpp_importer(json_str: str, asset_path: str, compile_blueprint: bool =
                     success = bool(first)
             if len(result) > 1 and result[1] is not None:
                 error_text = str(result[1])
+        elif isinstance(result, str):
+            # On UE 5.7 the Python binding for `bool Foo(..., FString& OutError)`
+            # can collapse to only the out string: success -> "", failure -> None.
+            success = True
+            error_text = result
         elif isinstance(result, bool):
             success = result
-        elif result is not None:
+        elif result is None:
+            success = False
+        else:
             success = bool(result)
 
         if success is None:
@@ -455,6 +462,9 @@ def _call_cpp_importer(json_str: str, asset_path: str, compile_blueprint: bool =
 
         if success is False:
             return False, error_text or "C++ importer returned failure without an error message"
+
+        if hasattr(unreal, "EditorAssetLibrary") and not unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+            return False, error_text or f"C++ importer reported success but asset does not exist: {asset_path}"
 
         return success, error_text
     except Exception as exc:

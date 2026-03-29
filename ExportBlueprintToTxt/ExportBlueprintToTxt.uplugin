@@ -1,0 +1,38 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "ExportBlueprintToTxt",
+	"Description": "export all blueprint to txt file",
+	"Category": "Other",
+	"CreatedBy": "sonygod",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"AdditionalDependencies": [
+      "ContentBrowser"
+    ],
+	"Modules": [
+		{
+			"Name": "ExportBlueprintToTxt",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit",
+			"IconPath": "Resources/Icon1024.jpg"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		},
+		{
+			"Name": "ControlRig",
+			"Enabled": true
+		}
+	]
+}

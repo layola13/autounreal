@@ -1191,6 +1191,8 @@ bool UBPDirectExporter::GenerateMainFile(
 		*MakePythonStringLiteral_ExportBpy(BPType));
 
 	Content += GenerateVariablesSection(BP);
+	Content += GenerateClassDefaultsSection(BP);
+	Content += GenerateInheritedComponentDefaultsSection(BP);
 	Content += GenerateComponentsSection(BP);
 	Content += GenerateInterfacesSection(BP);
 	Content += GenerateDispatchersSection(BP);
@@ -1238,6 +1240,292 @@ FString UBPDirectExporter::GenerateVariablesSection(UBlueprint* BP)
 			*MakePythonStringLiteral_ExportBpy(ContainerStr),
 			*MakePythonStringLiteral_ExportBpy(DefaultValue));
 	}
+	Out += TEXT("\n");
+	return Out;
+}
+
+// ─── GenerateClassDefaultsSection ───────────────────────────────────────────
+
+FString UBPDirectExporter::GenerateClassDefaultsSection(UBlueprint* BP)
+{
+	FString Out;
+	Out += TEXT("# ── Class Defaults ──────────────────────────────────────\n");
+
+	if (!BP->GeneratedClass)
+	{
+		Out += TEXT("\n");
+		return Out;
+	}
+
+	UObject* BPCDO = BP->GeneratedClass->GetDefaultObject(false);
+	UClass* SuperClass = BP->GeneratedClass->GetSuperClass();
+	UObject* ParentCDO = (SuperClass && SuperClass->GetDefaultObject(false))
+		? SuperClass->GetDefaultObject(false) : nullptr;
+
+	if (!BPCDO || !ParentCDO)
+	{
+		Out += TEXT("\n");
+		return Out;
+	}
+
+	bool bHadAny = false;
+
+	for (TFieldIterator<FProperty> It(BP->GeneratedClass, EFieldIteratorFlags::IncludeSuper); It; ++It)
+	{
+		const FProperty* Prop = *It;
+		if (!Prop) continue;
+
+		// Skip non-designer-visible properties
+		if (!Prop->HasAnyPropertyFlags(CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintReadOnly))
+			continue;
+		if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_EditorOnly | CPF_Deprecated))
+			continue;
+
+		// Skip collections — importer doesn't handle them
+		if (CastField<FArrayProperty>(Prop) || CastField<FSetProperty>(Prop) || CastField<FMapProperty>(Prop))
+			continue;
+
+		const void* BPPtr     = Prop->ContainerPtrToValuePtr<void>(BPCDO);
+
+		// Only delta_scroll against parent CDO if parent class owns this property
+		const UClass* PropOwnerClass = Prop->GetOwnerClass();
+		const void* ParentPtr = (PropOwnerClass && ParentCDO->GetClass()->IsChildOf(PropOwnerClass))
+			? Prop->ContainerPtrToValuePtr<void>(ParentCDO) : nullptr;
+
+		// If parent doesn't have this property, skip (it's a BP-only variable, handled elsewhere)
+		if (!BPPtr || !ParentPtr) continue;
+
+		// Skip if identical to parent CDO
+		if (Prop->Identical(BPPtr, ParentPtr)) continue;
+
+		// Skip object properties that are DefaultSubobjects (component slot pointers)
+		if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
+		{
+			UObject* ObjVal = ObjProp->GetObjectPropertyValue(BPPtr);
+			if (!ObjVal || ObjVal->IsDefaultSubobject()) continue;
+		}
+
+		// Serialize value — same dispatch chain as BuildComponentPropertiesPyDict_ExportBpy
+		FString PyValue;
+
+		if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
+		{
+			UObject* ObjVal = ObjProp->GetObjectPropertyValue(BPPtr);
+			if (!ObjVal) continue;
+			PyValue = MakePythonStringLiteral_ExportBpy(ObjVal->GetPathName());
+		}
+		else if (const FClassProperty* ClsProp = CastField<FClassProperty>(Prop))
+		{
+			UClass* ClsVal = Cast<UClass>(ClsProp->GetObjectPropertyValue(BPPtr));
+			if (!ClsVal) continue;
+			PyValue = MakePythonStringLiteral_ExportBpy(ClsVal->GetPathName());
+		}
+		else if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+		{
+			PyValue = BoolProp->GetPropertyValue(BPPtr) ? TEXT("True") : TEXT("False");
+		}
+		else if (const FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+		{
+			PyValue = FString::SanitizeFloat(FloatProp->GetPropertyValue(BPPtr));
+		}
+		else if (const FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+		{
+			PyValue = FString::SanitizeFloat(DoubleProp->GetPropertyValue(BPPtr));
+		}
+		else if (const FIntProperty* IntProp = CastField<FIntProperty>(Prop))
+		{
+			PyValue = FString::FromInt(IntProp->GetPropertyValue(BPPtr));
+		}
+		else if (const FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+		{
+			FName Val = NameProp->GetPropertyValue(BPPtr);
+			if (Val.IsNone()) continue;
+			PyValue = MakePythonStringLiteral_ExportBpy(Val.ToString());
+		}
+		else if (const FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+		{
+			FString Val = StrProp->GetPropertyValue(BPPtr);
+			if (Val.IsEmpty()) continue;
+			PyValue = MakePythonStringLiteral_ExportBpy(Val);
+		}
+		else
+		{
+			FString ExportedValue;
+			Prop->ExportTextItem_Direct(ExportedValue, BPPtr, ParentPtr, BPCDO, PPF_None);
+			if (ExportedValue.IsEmpty()) continue;
+			PyValue = MakePythonStringLiteral_ExportBpy(ExportedValue);
+		}
+
+		Out += FString::Printf(TEXT("bp.default(%s, %s)\n"),
+			*MakePythonStringLiteral_ExportBpy(Prop->GetName()),
+			*PyValue);
+		bHadAny = true;
+	}
+
+	Out += TEXT("\n");
+	return Out;
+}
+
+// ─── GenerateInheritedComponentDefaultsSection ───────────────────────────────
+
+FString UBPDirectExporter::GenerateInheritedComponentDefaultsSection(UBlueprint* BP)
+{
+	FString Out;
+	Out += TEXT("# ── Inherited Component Defaults ────────────────────────\n");
+
+	if (!BP->GeneratedClass)
+	{
+		Out += TEXT("\n");
+		return Out;
+	}
+
+	UObject* BPCDO    = BP->GeneratedClass->GetDefaultObject(false);
+	UClass*  SuperClass = BP->GeneratedClass->GetSuperClass();
+	UObject* ParentCDO  = SuperClass ? SuperClass->GetDefaultObject(false) : nullptr;
+
+	AActor* BPCDOActor     = Cast<AActor>(BPCDO);
+	AActor* ParentCDOActor = Cast<AActor>(ParentCDO);
+
+	if (!BPCDOActor || !ParentCDOActor)
+	{
+		Out += TEXT("\n");
+		return Out;
+	}
+
+	// Build set of SCS component names — already handled by GenerateComponentsSection
+	TSet<FName> SCSNames;
+	if (BP->SimpleConstructionScript)
+	{
+		for (USCS_Node* Node : BP->SimpleConstructionScript->GetAllNodes())
+		{
+			if (Node)
+				SCSNames.Add(Node->GetVariableName());
+		}
+	}
+
+	// Get all components on the BP CDO
+	TArray<UActorComponent*> BPComponents;
+	BPCDOActor->GetComponents(BPComponents);
+
+	// Get all components on the parent CDO for diffing
+	TArray<UActorComponent*> ParentComponents;
+	ParentCDOActor->GetComponents(ParentComponents);
+
+	for (UActorComponent* BPComp : BPComponents)
+	{
+		if (!BPComp) continue;
+
+		FName CompName = BPComp->GetFName();
+
+		// Skip SCS components — GenerateComponentsSection covers them
+		if (SCSNames.Contains(CompName)) continue;
+
+		// Find matching component on parent CDO by name + class
+		UActorComponent* ParentComp = nullptr;
+		for (UActorComponent* PC : ParentComponents)
+		{
+			if (PC && PC->GetFName() == CompName && PC->IsA(BPComp->GetClass()))
+			{
+				ParentComp = PC;
+				break;
+			}
+		}
+		if (!ParentComp) continue;
+
+		// Diff properties against parent component
+		TArray<FString> Entries;
+
+		for (TFieldIterator<FProperty> It(BPComp->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+		{
+			const FProperty* Prop = *It;
+			if (!Prop) continue;
+			if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_EditorOnly)) continue;
+			if (CastField<FArrayProperty>(Prop) || CastField<FSetProperty>(Prop) || CastField<FMapProperty>(Prop))
+				continue;
+
+			const void* ValuePtr   = Prop->ContainerPtrToValuePtr<void>(BPComp);
+
+			// Only diff against parent if the parent component's class actually owns this property
+			const UClass* PropOwnerClass = CastField<FProperty>(Prop) ? Prop->GetOwnerClass() : nullptr;
+			const void* DefaultPtr = (PropOwnerClass && ParentComp->GetClass()->IsChildOf(PropOwnerClass))
+				? Prop->ContainerPtrToValuePtr<void>(ParentComp) : nullptr;
+
+			if (!ValuePtr || !DefaultPtr) continue;
+			if (Prop->Identical(ValuePtr, DefaultPtr)) continue;
+
+			FString PyValue;
+
+			if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
+			{
+				UObject* ObjVal = ObjProp->GetObjectPropertyValue(ValuePtr);
+				if (!ObjVal) continue;
+				// Skip internal CDO subobject references (e.g. AttachParent pointing to Default__ paths)
+				if (ObjVal->IsDefaultSubobject()) continue;
+				if (ObjVal->GetPathName().Contains(TEXT("Default__"))) continue;
+				PyValue = MakePythonStringLiteral_ExportBpy(ObjVal->GetPathName());
+			}
+			else if (const FClassProperty* ClsProp = CastField<FClassProperty>(Prop))
+			{
+				UClass* ClsVal = Cast<UClass>(ClsProp->GetObjectPropertyValue(ValuePtr));
+				if (!ClsVal) continue;
+				PyValue = MakePythonStringLiteral_ExportBpy(ClsVal->GetPathName());
+			}
+			else if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+			{
+				PyValue = BoolProp->GetPropertyValue(ValuePtr) ? TEXT("True") : TEXT("False");
+			}
+			else if (const FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+			{
+				PyValue = FString::SanitizeFloat(FloatProp->GetPropertyValue(ValuePtr));
+			}
+			else if (const FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+			{
+				PyValue = FString::SanitizeFloat(DoubleProp->GetPropertyValue(ValuePtr));
+			}
+			else if (const FIntProperty* IntProp = CastField<FIntProperty>(Prop))
+			{
+				PyValue = FString::FromInt(IntProp->GetPropertyValue(ValuePtr));
+			}
+			else if (const FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+			{
+				FName Val = NameProp->GetPropertyValue(ValuePtr);
+				if (Val.IsNone()) continue;
+				PyValue = MakePythonStringLiteral_ExportBpy(Val.ToString());
+			}
+			else if (const FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+			{
+				FString Val = StrProp->GetPropertyValue(ValuePtr);
+				if (Val.IsEmpty()) continue;
+				PyValue = MakePythonStringLiteral_ExportBpy(Val);
+			}
+			else
+			{
+				FString ExportedValue;
+				Prop->ExportTextItem_Direct(ExportedValue, ValuePtr, DefaultPtr, BPComp, PPF_None);
+				if (ExportedValue.IsEmpty()) continue;
+				PyValue = MakePythonStringLiteral_ExportBpy(ExportedValue);
+			}
+
+			Entries.Add(FString::Printf(TEXT("%s: %s"),
+				*MakePythonStringLiteral_ExportBpy(Prop->GetName()),
+				*PyValue));
+		}
+
+		if (Entries.IsEmpty()) continue;
+
+		FString Dict = TEXT("{");
+		for (int32 i = 0; i < Entries.Num(); ++i)
+		{
+			Dict += Entries[i];
+			if (i < Entries.Num() - 1) Dict += TEXT(", ");
+		}
+		Dict += TEXT("}");
+
+		Out += FString::Printf(TEXT("bp.inherited_component(%s, properties=%s)\n"),
+			*MakePythonStringLiteral_ExportBpy(CompName.ToString()),
+			*Dict);
+	}
+
 	Out += TEXT("\n");
 	return Out;
 }

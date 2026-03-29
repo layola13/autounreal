@@ -107,6 +107,18 @@ class _Dispatcher:
 
 
 @dataclass
+class _ClassDefault:
+    name:  str
+    value: Any
+
+
+@dataclass
+class _InheritedComponent:
+    name:       str
+    properties: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class _Component:
     name:       str
     class_name: str
@@ -488,17 +500,34 @@ class Blueprint:
         self._parent    = parent
         self._bp_type   = bp_type
         self._name      = name or (path.split("/")[-1].split(".")[-1] if path else "")
-        self._interfaces:  List[str]         = []
-        self._variables:   List[_Variable]   = []
-        self._dispatchers: List[_Dispatcher] = []
-        self._components:  List[_Component]  = []
-        self._graphs:      List[_Graph]      = []
-        self._timelines:   List[_Timeline]   = []
+        self._interfaces:           List[str]                  = []
+        self._class_defaults:       List[_ClassDefault]        = []
+        self._inherited_components: List[_InheritedComponent]  = []
+        self._variables:            List[_Variable]            = []
+        self._dispatchers:          List[_Dispatcher]          = []
+        self._components:           List[_Component]           = []
+        self._graphs:               List[_Graph]               = []
+        self._timelines:            List[_Timeline]            = []
 
     # ── Interfaces ────────────────────────────────────────────
 
     def interface(self, interface_path: str) -> "Blueprint":
         self._interfaces.append(interface_path)
+        return self
+
+    # ── Class Defaults ───────────────────────────────────────
+
+    def default(self, name: str, value: Any) -> "Blueprint":
+        self._class_defaults.append(_ClassDefault(name=name, value=value))
+        return self
+
+    # ── Inherited Component Defaults ──────────────────────────
+
+    def inherited_component(self, name: str, *,
+                            properties: Optional[Dict[str, Any]] = None) -> "Blueprint":
+        self._inherited_components.append(_InheritedComponent(
+            name=name, properties=properties or {}
+        ))
         return self
 
     # ── Variables ─────────────────────────────────────────────
@@ -596,6 +625,14 @@ class Blueprint:
             "bp_type":    self._bp_type,
             "name":       self._name,
             "interfaces": self._interfaces,
+            "class_defaults": [
+                {"name": d.name, "value": d.value}
+                for d in self._class_defaults
+            ],
+            "inherited_components": [
+                {"name": c.name, "properties": c.properties}
+                for c in self._inherited_components
+            ],
             "variables": [
                 {
                     "name":              v.name,

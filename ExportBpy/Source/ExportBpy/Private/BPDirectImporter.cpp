@@ -55,6 +55,8 @@
 
 namespace
 {
+USCS_Node* FindComponentNodeByName_ImportBpy(UBlueprint* BP, const FString& ComponentName);
+
 template <typename TObject>
 TObject* ResolveNamedObject_ImportBpy(const FString& Name)
 {
@@ -227,6 +229,204 @@ FString StripGuidSuffix_ImportBpy(const FString& RawName)
 	}
 
 	return Result;
+}
+
+TArray<FString> GetComponentNameCandidates_ImportBpy(const FString& RawName)
+{
+	TArray<FString> Candidates;
+	auto AddCandidate = [&Candidates](const FString& Candidate)
+	{
+		if (!Candidate.IsEmpty())
+		{
+			Candidates.AddUnique(Candidate);
+		}
+	};
+
+	const FString StrippedName = StripGuidSuffix_ImportBpy(RawName);
+	AddCandidate(RawName);
+	AddCandidate(StrippedName);
+
+	auto AddLegacyAliases = [&AddCandidate](const FString& Candidate)
+	{
+		if (Candidate.Equals(TEXT("CollisionCylinder"), ESearchCase::IgnoreCase))
+		{
+			AddCandidate(TEXT("CapsuleComponent"));
+		}
+		else if (Candidate.Equals(TEXT("CapsuleComponent"), ESearchCase::IgnoreCase))
+		{
+			AddCandidate(TEXT("CollisionCylinder"));
+		}
+		else if (Candidate.Equals(TEXT("CharMoveComp"), ESearchCase::IgnoreCase))
+		{
+			AddCandidate(TEXT("CharacterMovement"));
+		}
+		else if (Candidate.Equals(TEXT("CharacterMovement"), ESearchCase::IgnoreCase))
+		{
+			AddCandidate(TEXT("CharMoveComp"));
+		}
+		else if (Candidate.Equals(TEXT("CharacterMesh0"), ESearchCase::IgnoreCase) ||
+			Candidate.Equals(TEXT("CharacterMesh"), ESearchCase::IgnoreCase))
+		{
+			AddCandidate(TEXT("Mesh"));
+		}
+		else if (Candidate.Equals(TEXT("Mesh"), ESearchCase::IgnoreCase))
+		{
+			AddCandidate(TEXT("CharacterMesh0"));
+			AddCandidate(TEXT("CharacterMesh"));
+		}
+	};
+
+	AddLegacyAliases(RawName);
+	if (!StrippedName.Equals(RawName, ESearchCase::CaseSensitive))
+	{
+		AddLegacyAliases(StrippedName);
+	}
+
+	return Candidates;
+}
+
+bool ComponentNameMatches_ImportBpy(const FString& RequestedName, const FString& ActualName)
+{
+	if (RequestedName.IsEmpty() || ActualName.IsEmpty())
+	{
+		return false;
+	}
+
+	const FString ActualStripped = StripGuidSuffix_ImportBpy(ActualName);
+	for (const FString& Candidate : GetComponentNameCandidates_ImportBpy(RequestedName))
+	{
+		if (Candidate.Equals(ActualName, ESearchCase::IgnoreCase) ||
+			Candidate.Equals(ActualStripped, ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+UActorComponent* FindInheritedComponentByName_ImportBpy(UBlueprint* BP, const FString& ComponentName)
+{
+	if (!BP || ComponentName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	auto FindOnActor = [&ComponentName](AActor* Actor) -> UActorComponent*
+	{
+		if (!Actor)
+		{
+			return nullptr;
+		}
+
+		TArray<UActorComponent*> Components;
+		Actor->GetComponents(Components);
+		for (UActorComponent* Component : Components)
+		{
+			if (!Component)
+			{
+				continue;
+			}
+
+			if (ComponentNameMatches_ImportBpy(ComponentName, Component->GetFName().ToString()) ||
+				ComponentNameMatches_ImportBpy(ComponentName, Component->GetName()))
+			{
+				return Component;
+			}
+		}
+
+		return nullptr;
+	};
+
+	if (BP->GeneratedClass)
+	{
+		if (AActor* GeneratedCDO = Cast<AActor>(BP->GeneratedClass->GetDefaultObject(false)))
+		{
+			if (UActorComponent* Found = FindOnActor(GeneratedCDO))
+			{
+				return Found;
+			}
+		}
+	}
+
+	if (BP->ParentClass)
+	{
+		if (AActor* ParentCDO = Cast<AActor>(BP->ParentClass->GetDefaultObject(false)))
+		{
+			if (UActorComponent* Found = FindOnActor(ParentCDO))
+			{
+				return Found;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+USceneComponent* FindInheritedSceneComponentByName_ImportBpy(UBlueprint* BP, const FString& ComponentName)
+{
+	return Cast<USceneComponent>(FindInheritedComponentByName_ImportBpy(BP, ComponentName));
+}
+
+bool CanResolveComponentParent_ImportBpy(
+	UBlueprint* BP,
+	const FString& ParentName,
+	const TMap<FString, USCS_Node*>& KnownNodes)
+{
+	if (ParentName.IsEmpty())
+	{
+		return true;
+	}
+
+	for (const TPair<FString, USCS_Node*>& Entry : KnownNodes)
+	{
+		if (ComponentNameMatches_ImportBpy(ParentName, Entry.Key))
+		{
+			return true;
+		}
+	}
+
+	if (FindComponentNodeByName_ImportBpy(BP, ParentName))
+	{
+		return true;
+	}
+
+	if (FindInheritedSceneComponentByName_ImportBpy(BP, ParentName))
+	{
+		return true;
+	}
+
+	return ResolveNamedObject_ImportBpy<USceneComponent>(ParentName) != nullptr;
+}
+
+FProperty* FindPropertyByNameOrAlias_ImportBpy(UObject* Object, const FString& PropertyName)
+{
+	if (!Object || PropertyName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	if (FProperty* Property = Object->GetClass()->FindPropertyByName(FName(*PropertyName)))
+	{
+		return Property;
+	}
+
+	TArray<FString> Aliases;
+	if (PropertyName.Equals(TEXT("SkeletalMesh"), ESearchCase::IgnoreCase) ||
+		PropertyName.Equals(TEXT("SkinnedAsset"), ESearchCase::IgnoreCase))
+	{
+		Aliases.Add(TEXT("SkeletalMeshAsset"));
+	}
+
+	for (const FString& Alias : Aliases)
+	{
+		if (FProperty* Property = Object->GetClass()->FindPropertyByName(FName(*Alias)))
+		{
+			return Property;
+		}
+	}
+
+	return nullptr;
 }
 
 bool TryParseGuid_ImportBpy(const FString& GuidText, FGuid& OutGuid)
@@ -979,6 +1179,15 @@ void ApplyJsonValueToProperty_ImportBpy(UObject* Object, FProperty* Property, co
 		DoubleProperty->SetPropertyValue(PropertyAddress, Value->AsNumber());
 		return;
 	}
+
+	// Fallback: use ImportText for structs and other complex types (FRotator, FVector, etc.)
+	{
+		FString TextValue = Value->AsString();
+		if (!TextValue.IsEmpty())
+		{
+			Property->ImportText_Direct(*TextValue, PropertyAddress, Object, PPF_None);
+		}
+	}
 }
 
 void ApplyJsonObjectToObject_ImportBpy(UObject* Object, const TSharedPtr<FJsonObject>& PropertiesJson)
@@ -995,7 +1204,7 @@ void ApplyJsonObjectToObject_ImportBpy(UObject* Object, const TSharedPtr<FJsonOb
 			continue;
 		}
 
-		if (FProperty* Property = Object->GetClass()->FindPropertyByName(FName(*Entry.Key)))
+		if (FProperty* Property = FindPropertyByNameOrAlias_ImportBpy(Object, Entry.Key))
 		{
 			ApplyJsonValueToProperty_ImportBpy(Object, Property, Entry.Value);
 		}
@@ -1011,7 +1220,7 @@ USCS_Node* FindComponentNodeByName_ImportBpy(UBlueprint* BP, const FString& Comp
 
 	for (USCS_Node* Node : BP->SimpleConstructionScript->GetAllNodes())
 	{
-		if (Node && Node->GetVariableName().ToString().Equals(ComponentName, ESearchCase::CaseSensitive))
+		if (Node && ComponentNameMatches_ImportBpy(ComponentName, Node->GetVariableName().ToString()))
 		{
 			return Node;
 		}
@@ -1051,9 +1260,28 @@ bool AttachComponentNode_ImportBpy(
 		}
 	}
 
+	for (const TPair<FString, USCS_Node*>& Entry : KnownNodes)
+	{
+		if (USCS_Node* ParentNode = Entry.Value; ParentNode && ComponentNameMatches_ImportBpy(ParentName, Entry.Key))
+		{
+			ParentNode->AddChildNode(Node);
+			return true;
+		}
+	}
+
 	if (USCS_Node* ParentNode = FindComponentNodeByName_ImportBpy(BP, ParentName))
 	{
 		ParentNode->AddChildNode(Node);
+		return true;
+	}
+
+	if (USceneComponent* ParentSceneComponent = FindInheritedSceneComponentByName_ImportBpy(BP, ParentName))
+	{
+		Node->SetParent(ParentSceneComponent);
+		if (!BP->SimpleConstructionScript->GetAllNodes().Contains(Node))
+		{
+			BP->SimpleConstructionScript->AddNode(Node);
+		}
 		return true;
 	}
 
@@ -1132,7 +1360,8 @@ bool ImportComponents_ImportBpy(
 
 			FString ParentName;
 			ComponentJson->TryGetStringField(TEXT("parent"), ParentName);
-			if (!ParentName.IsEmpty() && ParentName != ComponentName && !KnownNodes.Contains(ParentName))
+			if (!ParentName.IsEmpty() && ParentName != ComponentName &&
+				!CanResolveComponentParent_ImportBpy(BP, ParentName, KnownNodes))
 			{
 				continue;
 			}
@@ -1524,6 +1753,101 @@ void ClearGraphNodes_ImportBpy(UBlueprint* BP, UEdGraph* Graph)
 
 // ─── Public entry points ──────────────────────────────────────────────────────
 
+void ImportInterfaces_ImportBpy(UBlueprint* BP, const TArray<TSharedPtr<FJsonValue>>& InterfacesArr)
+{
+	if (!BP) return;
+
+	for (const TSharedPtr<FJsonValue>& Val : InterfacesArr)
+	{
+		if (!Val.IsValid()) continue;
+		FString InterfacePath = Val->AsString();
+		if (InterfacePath.IsEmpty()) continue;
+
+		UClass* InterfaceClass = ResolveNamedObject_ImportBpy<UClass>(InterfacePath);
+		if (!InterfaceClass) continue;
+
+		// Skip if already implemented
+		bool bAlreadyImplemented = false;
+		for (const FBPInterfaceDescription& Existing : BP->ImplementedInterfaces)
+		{
+			if (Existing.Interface == InterfaceClass)
+			{
+				bAlreadyImplemented = true;
+				break;
+			}
+		}
+		if (bAlreadyImplemented) continue;
+
+		FBlueprintEditorUtils::ImplementNewInterface(BP, InterfaceClass->GetFName());
+	}
+}
+
+void ImportClassDefaults_ImportBpy(UBlueprint* BP, const TArray<TSharedPtr<FJsonValue>>& DefaultsArr)
+{
+	if (!BP || !BP->GeneratedClass) return;
+
+	UObject* CDO = BP->GeneratedClass->GetDefaultObject(false);
+	if (!CDO) return;
+
+	for (const TSharedPtr<FJsonValue>& Val : DefaultsArr)
+	{
+		const TSharedPtr<FJsonObject>* EntryObj = nullptr;
+		if (!Val.IsValid() || !Val->TryGetObject(EntryObj) || !EntryObj->IsValid()) continue;
+
+		FString PropName;
+		if (!(*EntryObj)->TryGetStringField(TEXT("name"), PropName) || PropName.IsEmpty()) continue;
+
+		const TSharedPtr<FJsonValue>* PropValue = (*EntryObj)->Values.Find(TEXT("value"));
+		if (!PropValue || !PropValue->IsValid()) continue;
+
+		FProperty* Property = CDO->GetClass()->FindPropertyByName(FName(*PropName));
+		if (!Property) continue;
+
+		ApplyJsonValueToProperty_ImportBpy(CDO, Property, *PropValue);
+	}
+}
+
+void ImportInheritedComponents_ImportBpy(UBlueprint* BP, const TArray<TSharedPtr<FJsonValue>>& InheritedArr)
+{
+	if (!BP || !BP->GeneratedClass) return;
+
+	UObject* CDO = BP->GeneratedClass->GetDefaultObject(false);
+	if (!CDO) return;
+
+	AActor* CDOActor = Cast<AActor>(CDO);
+	if (!CDOActor) return;
+
+	TArray<UActorComponent*> Components;
+	CDOActor->GetComponents(Components);
+
+	for (const TSharedPtr<FJsonValue>& Val : InheritedArr)
+	{
+		const TSharedPtr<FJsonObject>* EntryObj = nullptr;
+		if (!Val.IsValid() || !Val->TryGetObject(EntryObj) || !EntryObj->IsValid()) continue;
+
+		FString CompName;
+		if (!(*EntryObj)->TryGetStringField(TEXT("name"), CompName) || CompName.IsEmpty()) continue;
+
+		const TSharedPtr<FJsonObject>* PropsObj = nullptr;
+		if (!(*EntryObj)->TryGetObjectField(TEXT("properties"), PropsObj) || !PropsObj->IsValid()) continue;
+
+		UActorComponent* TargetComp = nullptr;
+		for (UActorComponent* Comp : Components)
+		{
+			if (Comp &&
+				(ComponentNameMatches_ImportBpy(CompName, Comp->GetFName().ToString()) ||
+					ComponentNameMatches_ImportBpy(CompName, Comp->GetName())))
+			{
+				TargetComp = Comp;
+				break;
+			}
+		}
+		if (!TargetComp) continue;
+
+		ApplyJsonObjectToObject_ImportBpy(TargetComp, *PropsObj);
+	}
+}
+
 bool UBPDirectImporter::ImportBlueprintFromJson(
 	const FString& JsonData,
 	const FString& TargetAssetPath,
@@ -1573,6 +1897,27 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 		{
 			return false;
 		}
+	}
+
+	// Interfaces
+	const TArray<TSharedPtr<FJsonValue>>* InterfacesArr = nullptr;
+	if (Root->TryGetArrayField(TEXT("interfaces"), InterfacesArr) && InterfacesArr)
+	{
+		ImportInterfaces_ImportBpy(BP, *InterfacesArr);
+	}
+
+	// Class Defaults
+	const TArray<TSharedPtr<FJsonValue>>* ClassDefaultsArr = nullptr;
+	if (Root->TryGetArrayField(TEXT("class_defaults"), ClassDefaultsArr) && ClassDefaultsArr)
+	{
+		ImportClassDefaults_ImportBpy(BP, *ClassDefaultsArr);
+	}
+
+	// Inherited Component Defaults
+	const TArray<TSharedPtr<FJsonValue>>* InheritedComponentsArr = nullptr;
+	if (Root->TryGetArrayField(TEXT("inherited_components"), InheritedComponentsArr) && InheritedComponentsArr)
+	{
+		ImportInheritedComponents_ImportBpy(BP, *InheritedComponentsArr);
 	}
 
 	// Graphs

@@ -450,16 +450,11 @@ def _call_cpp_importer(json_str: str, asset_path: str, compile_blueprint: bool =
         elif result is not None:
             success = bool(result)
 
-        if success is False and not error_text:
-            package_path = asset_path.rsplit(".", 1)[0] if "." in asset_path else asset_path
-            if unreal.EditorAssetLibrary.does_asset_exist(asset_path) or unreal.EditorAssetLibrary.does_asset_exist(package_path):
-                return True, ""
-
         if success is None:
-            package_path = asset_path.rsplit(".", 1)[0] if "." in asset_path else asset_path
-            if unreal.EditorAssetLibrary.does_asset_exist(asset_path) or unreal.EditorAssetLibrary.does_asset_exist(package_path):
-                return True, ""
-            return False, error_text
+            return False, error_text or "C++ importer did not return a success flag"
+
+        if success is False:
+            return False, error_text or "C++ importer returned failure without an error message"
 
         return success, error_text
     except Exception as exc:

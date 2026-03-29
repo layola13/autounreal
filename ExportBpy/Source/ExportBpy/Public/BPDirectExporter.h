@@ -122,6 +122,8 @@ private:
 		FString& OutError);
 
 	static FString GenerateVariablesSection(UBlueprint* BP);
+	static FString GenerateClassDefaultsSection(UBlueprint* BP);
+	static FString GenerateInheritedComponentDefaultsSection(UBlueprint* BP);
 	static FString GenerateComponentsSection(UBlueprint* BP);
 	static FString GenerateInterfacesSection(UBlueprint* BP);
 	static FString GenerateDispatchersSection(UBlueprint* BP);

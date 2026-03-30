@@ -199,11 +199,6 @@ FString ResolveTemplateAttachParentName_ExportBpy(const UBlueprint* Blueprint, c
 		return FString();
 	}
 
-	if (const USceneComponent* ParentTemplate = Node->GetParentComponentTemplate(const_cast<UBlueprint*>(Blueprint)))
-	{
-		return ResolveParentComponentTemplateName_ExportBpy(Blueprint, Node, ParentTemplate);
-	}
-
 	if (const USceneComponent* SceneTemplate = Cast<USceneComponent>(Node->ComponentTemplate))
 	{
 		if (const USceneComponent* AttachParent = SceneTemplate->GetAttachParent())
@@ -221,6 +216,11 @@ FString ResolveTemplateAttachParentName_ExportBpy(const UBlueprint* Blueprint, c
 				return ResolveParentComponentTemplateName_ExportBpy(Blueprint, Node, AttachParent);
 			}
 		}
+	}
+
+	if (const USceneComponent* ParentTemplate = Node->GetParentComponentTemplate(const_cast<UBlueprint*>(Blueprint)))
+	{
+		return ResolveParentComponentTemplateName_ExportBpy(Blueprint, Node, ParentTemplate);
 	}
 
 	return FString();
@@ -301,6 +301,72 @@ bool FindParentSCSNodeRecursive_ExportBpy(
 	}
 
 	return false;
+}
+
+FString ResolveComponentParentName_ExportBpy(const UBlueprint* Blueprint, const USCS_Node* Node);
+
+TArray<USCS_Node*> GetSCSNodesParentFirst_ExportBpy(const UBlueprint* Blueprint)
+{
+	TArray<USCS_Node*> OrderedNodes;
+	if (!Blueprint || !Blueprint->SimpleConstructionScript)
+	{
+		return OrderedNodes;
+	}
+
+	const TArray<USCS_Node*> AllNodes = Blueprint->SimpleConstructionScript->GetAllNodes();
+	TMap<FString, USCS_Node*> NodeByName;
+	NodeByName.Reserve(AllNodes.Num());
+	for (USCS_Node* Node : AllNodes)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+
+		const FString NodeName = SanitizeExportedComponentName_ExportBpy(GetSCSNodeName_ExportBpy(Node));
+		if (!NodeName.IsEmpty() && !NodeByName.Contains(NodeName))
+		{
+			NodeByName.Add(NodeName, Node);
+		}
+	}
+
+	TSet<const USCS_Node*> VisitingNodes;
+	TSet<const USCS_Node*> VisitedNodes;
+	TFunction<void(USCS_Node*)> VisitNode = [&](USCS_Node* Node)
+	{
+		if (!Node || VisitedNodes.Contains(Node))
+		{
+			return;
+		}
+
+		// Cycle guard.
+		if (VisitingNodes.Contains(Node))
+		{
+			return;
+		}
+
+		VisitingNodes.Add(Node);
+
+		const FString ParentName = ResolveComponentParentName_ExportBpy(Blueprint, Node);
+		if (!ParentName.IsEmpty())
+		{
+			if (USCS_Node** ParentNodePtr = NodeByName.Find(ParentName))
+			{
+				VisitNode(*ParentNodePtr);
+			}
+		}
+
+		VisitingNodes.Remove(Node);
+		VisitedNodes.Add(Node);
+		OrderedNodes.Add(Node);
+	};
+
+	for (USCS_Node* Node : AllNodes)
+	{
+		VisitNode(Node);
+	}
+
+	return OrderedNodes;
 }
 
 FString ResolveComponentParentName_ExportBpy(const UBlueprint* Blueprint, const USCS_Node* Node)
@@ -1919,6 +1985,12 @@ static FString BuildComponentPropertiesPyDict_ExportBpy(UActorComponent* Templat
 		const FProperty* Prop = *It;
 		if (!Prop) continue;
 		if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_EditorOnly)) continue;
+		const FString PropName = Prop->GetName();
+		if (PropName.Equals(TEXT("AttachParent"), ESearchCase::IgnoreCase) ||
+			PropName.Equals(TEXT("AttachSocketName"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
 
 		// Skip arrays/sets/maps — they're complex, importer doesn't handle them
 		if (CastField<FArrayProperty>(Prop)
@@ -2015,7 +2087,8 @@ FString UBPDirectExporter::GenerateComponentsSection(UBlueprint* BP)
 
 	if (BP->SimpleConstructionScript)
 	{
-		for (USCS_Node* SCSNode : BP->SimpleConstructionScript->GetAllNodes())
+		const TArray<USCS_Node*> OrderedNodes = GetSCSNodesParentFirst_ExportBpy(BP);
+		for (USCS_Node* SCSNode : OrderedNodes)
 		{
 			if (!SCSNode) continue;
 			UClass* CompClass = SCSNode->ComponentClass;
@@ -2861,7 +2934,8 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeBlueprintToJson(UBlueprint* 
 	TArray<TSharedPtr<FJsonValue>> Comps;
 	if (BP->SimpleConstructionScript)
 	{
-		for (USCS_Node* SCSNode : BP->SimpleConstructionScript->GetAllNodes())
+		const TArray<USCS_Node*> OrderedNodes = GetSCSNodesParentFirst_ExportBpy(BP);
+		for (USCS_Node* SCSNode : OrderedNodes)
 		{
 			if (!SCSNode) continue;
 			auto CObj = MakeShared<FJsonObject>();
@@ -2886,6 +2960,12 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeBlueprintToJson(UBlueprint* 
 					const FProperty* Prop = *It;
 					if (!Prop) continue;
 					if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_EditorOnly)) continue;
+					const FString PropName = Prop->GetName();
+					if (PropName.Equals(TEXT("AttachParent"), ESearchCase::IgnoreCase) ||
+						PropName.Equals(TEXT("AttachSocketName"), ESearchCase::IgnoreCase))
+					{
+						continue;
+					}
 					if (CastField<FArrayProperty>(Prop) || CastField<FSetProperty>(Prop) || CastField<FMapProperty>(Prop)) continue;
 
 					const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Template);

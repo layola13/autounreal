@@ -806,6 +806,84 @@ USceneComponent* FindInheritedSceneComponentByName_ImportBpy(UBlueprint* BP, con
 	return Cast<USceneComponent>(FindInheritedComponentByName_ImportBpy(BP, ComponentName));
 }
 
+USceneComponent* ResolveParentSceneTemplate_ImportBpy(
+	UBlueprint* BP,
+	const FString& ParentName,
+	const TMap<FString, USCS_Node*>& KnownNodes)
+{
+	if (ParentName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	auto ResolveTemplateFromNode = [](USCS_Node* Node) -> USceneComponent*
+	{
+		return Node ? Cast<USceneComponent>(Node->ComponentTemplate) : nullptr;
+	};
+
+	if (USCS_Node* const* ParentNodePtr = KnownNodes.Find(ParentName))
+	{
+		if (USceneComponent* Template = ResolveTemplateFromNode(*ParentNodePtr))
+		{
+			return Template;
+		}
+	}
+
+	for (const TPair<FString, USCS_Node*>& Entry : KnownNodes)
+	{
+		if (ComponentNameMatches_ImportBpy(ParentName, Entry.Key))
+		{
+			if (USceneComponent* Template = ResolveTemplateFromNode(Entry.Value))
+			{
+				return Template;
+			}
+		}
+	}
+
+	if (USCS_Node* ParentNode = FindComponentNodeByName_ImportBpy(BP, ParentName))
+	{
+		if (USceneComponent* Template = ResolveTemplateFromNode(ParentNode))
+		{
+			return Template;
+		}
+	}
+
+	if (USceneComponent* InheritedParent = FindInheritedSceneComponentByName_ImportBpy(BP, ParentName))
+	{
+		return InheritedParent;
+	}
+
+	return ResolveNamedObject_ImportBpy<USceneComponent>(ParentName);
+}
+
+bool SyncSceneTemplateAttachment_ImportBpy(
+	USCS_Node* Node,
+	USceneComponent* ParentSceneTemplate,
+	const FName AttachSocketName)
+{
+	if (!Node)
+	{
+		return false;
+	}
+
+	USceneComponent* SceneTemplate = Cast<USceneComponent>(Node->ComponentTemplate);
+	if (!SceneTemplate)
+	{
+		return false;
+	}
+
+	const USceneComponent* CurrentParent = SceneTemplate->GetAttachParent();
+	const FName CurrentSocket = SceneTemplate->GetAttachSocketName();
+	if (CurrentParent == ParentSceneTemplate && CurrentSocket == AttachSocketName)
+	{
+		return false;
+	}
+
+	SceneTemplate->Modify();
+	SceneTemplate->SetupAttachment(ParentSceneTemplate, AttachSocketName);
+	return true;
+}
+
 bool CanResolveComponentParent_ImportBpy(
 	UBlueprint* BP,
 	const FString& ParentName,
@@ -1818,6 +1896,10 @@ bool AttachComponentNode_ImportBpy(
 		if (USCS_Node* ParentNode = *ParentNodePtr)
 		{
 			DetachNodeFromCurrentLocation();
+			Node->Modify();
+			Node->bIsParentComponentNative = false;
+			Node->ParentComponentOrVariableName = ParentNode->GetVariableName();
+			Node->ParentComponentOwnerClassName = NAME_None;
 			Node->SetParent(ParentNode);
 			ParentNode->AddChildNode(Node, /*bAddToAllNodes=*/!bNodeAlreadyInSCS);
 			SCS->ValidateSceneRootNodes();
@@ -1830,6 +1912,10 @@ bool AttachComponentNode_ImportBpy(
 		if (USCS_Node* ParentNode = Entry.Value; ParentNode && ComponentNameMatches_ImportBpy(ParentName, Entry.Key))
 		{
 			DetachNodeFromCurrentLocation();
+			Node->Modify();
+			Node->bIsParentComponentNative = false;
+			Node->ParentComponentOrVariableName = ParentNode->GetVariableName();
+			Node->ParentComponentOwnerClassName = NAME_None;
 			Node->SetParent(ParentNode);
 			ParentNode->AddChildNode(Node, /*bAddToAllNodes=*/!bNodeAlreadyInSCS);
 			SCS->ValidateSceneRootNodes();
@@ -1840,6 +1926,10 @@ bool AttachComponentNode_ImportBpy(
 	if (USCS_Node* ParentNode = FindComponentNodeByName_ImportBpy(BP, ParentName))
 	{
 		DetachNodeFromCurrentLocation();
+		Node->Modify();
+		Node->bIsParentComponentNative = false;
+		Node->ParentComponentOrVariableName = ParentNode->GetVariableName();
+		Node->ParentComponentOwnerClassName = NAME_None;
 		Node->SetParent(ParentNode);
 		ParentNode->AddChildNode(Node, /*bAddToAllNodes=*/!bNodeAlreadyInSCS);
 		SCS->ValidateSceneRootNodes();
@@ -1849,6 +1939,10 @@ bool AttachComponentNode_ImportBpy(
 	if (USceneComponent* ParentSceneComponent = FindInheritedSceneComponentByName_ImportBpy(BP, ParentName))
 	{
 		DetachNodeFromCurrentLocation();
+		Node->Modify();
+		Node->bIsParentComponentNative = true;
+		Node->ParentComponentOrVariableName = ParentSceneComponent->GetFName();
+		Node->ParentComponentOwnerClassName = NAME_None;
 		Node->SetParent(ParentSceneComponent);
 		if (!bNodeAlreadyInSCS)
 		{
@@ -1865,6 +1959,10 @@ bool AttachComponentNode_ImportBpy(
 	if (USceneComponent* ParentSceneComponent = ResolveNamedObject_ImportBpy<USceneComponent>(ParentName))
 	{
 		DetachNodeFromCurrentLocation();
+		Node->Modify();
+		Node->bIsParentComponentNative = true;
+		Node->ParentComponentOrVariableName = ParentSceneComponent->GetFName();
+		Node->ParentComponentOwnerClassName = NAME_None;
 		Node->SetParent(ParentSceneComponent);
 		if (!bNodeAlreadyInSCS)
 		{
@@ -2063,6 +2161,13 @@ bool ImportComponents_ImportBpy(
 					ComponentNode->AttachToName = DesiredAttachName;
 					bCreatedOrUpdatedComponents = true;
 				}
+			}
+
+			const FName EffectiveAttachName = ComponentNode->AttachToName;
+			USceneComponent* ParentSceneTemplate = ResolveParentSceneTemplate_ImportBpy(BP, ParentName, KnownNodes);
+			if (SyncSceneTemplateAttachment_ImportBpy(ComponentNode, ParentSceneTemplate, EffectiveAttachName))
+			{
+				bCreatedOrUpdatedComponents = true;
 			}
 
 			if (ComponentNode->ComponentTemplate)

@@ -1823,6 +1823,17 @@ USCS_Node* FindComponentNodeByName_ImportBpy(UBlueprint* BP, const FString& Comp
 	return nullptr;
 }
 
+void DetachNodeFromSCS_ImportBpy(USimpleConstructionScript* SCS, USCS_Node* Node)
+{
+	if (!SCS || !Node || !SCS->GetAllNodes().Contains(Node))
+	{
+		return;
+	}
+
+	// Use the engine's own detach path so RootNodes/ChildNodes/AllNodes stay consistent.
+	SCS->RemoveNode(Node, /*bValidateSceneRootNodes=*/false);
+}
+
 bool AttachComponentNode_ImportBpy(
 	UBlueprint* BP,
 	USCS_Node* Node,
@@ -1837,57 +1848,16 @@ bool AttachComponentNode_ImportBpy(
 	}
 
 	USimpleConstructionScript* const SCS = BP->SimpleConstructionScript;
-	const bool bNodeAlreadyInSCS = SCS->GetAllNodes().Contains(Node);
-
-	auto DetachNodeFromCurrentLocation = [&]()
-	{
-		if (!bNodeAlreadyInSCS)
-		{
-			return;
-		}
-
-		if (SCS->GetRootNodes().Contains(Node))
-		{
-			TArray<USCS_Node*>& RootNodes = const_cast<TArray<USCS_Node*>&>(SCS->GetRootNodes());
-			SCS->Modify();
-			RootNodes.Remove(Node);
-			return;
-		}
-
-		if (USCS_Node* ExistingParent = SCS->FindParentNode(Node))
-		{
-			ExistingParent->RemoveChildNode(Node, /*bRemoveFromAllNodes=*/false);
-		}
-	};
-
-	auto AddExistingNodeToRoot = [&]()
-	{
-		TArray<USCS_Node*>& RootNodes = const_cast<TArray<USCS_Node*>&>(SCS->GetRootNodes());
-		if (!RootNodes.Contains(Node))
-		{
-			SCS->Modify();
-			RootNodes.Add(Node);
-		}
-	};
 
 	if (ParentName.IsEmpty())
 	{
-		DetachNodeFromCurrentLocation();
+		DetachNodeFromSCS_ImportBpy(SCS, Node);
 		Node->Modify();
 		Node->bIsParentComponentNative = false;
 		Node->ParentComponentOrVariableName = NAME_None;
 		Node->ParentComponentOwnerClassName = NAME_None;
 
-		if (!bNodeAlreadyInSCS)
-		{
-			SCS->AddNode(Node);
-		}
-		else
-		{
-			AddExistingNodeToRoot();
-			SCS->ValidateSceneRootNodes();
-		}
-
+		SCS->AddNode(Node);
 		return true;
 	}
 
@@ -1895,13 +1865,9 @@ bool AttachComponentNode_ImportBpy(
 	{
 		if (USCS_Node* ParentNode = *ParentNodePtr)
 		{
-			DetachNodeFromCurrentLocation();
-			Node->Modify();
-			Node->bIsParentComponentNative = false;
-			Node->ParentComponentOrVariableName = ParentNode->GetVariableName();
-			Node->ParentComponentOwnerClassName = NAME_None;
+			DetachNodeFromSCS_ImportBpy(SCS, Node);
 			Node->SetParent(ParentNode);
-			ParentNode->AddChildNode(Node, /*bAddToAllNodes=*/!bNodeAlreadyInSCS);
+			ParentNode->AddChildNode(Node);
 			SCS->ValidateSceneRootNodes();
 			return true;
 		}
@@ -1911,13 +1877,9 @@ bool AttachComponentNode_ImportBpy(
 	{
 		if (USCS_Node* ParentNode = Entry.Value; ParentNode && ComponentNameMatches_ImportBpy(ParentName, Entry.Key))
 		{
-			DetachNodeFromCurrentLocation();
-			Node->Modify();
-			Node->bIsParentComponentNative = false;
-			Node->ParentComponentOrVariableName = ParentNode->GetVariableName();
-			Node->ParentComponentOwnerClassName = NAME_None;
+			DetachNodeFromSCS_ImportBpy(SCS, Node);
 			Node->SetParent(ParentNode);
-			ParentNode->AddChildNode(Node, /*bAddToAllNodes=*/!bNodeAlreadyInSCS);
+			ParentNode->AddChildNode(Node);
 			SCS->ValidateSceneRootNodes();
 			return true;
 		}
@@ -1925,54 +1887,26 @@ bool AttachComponentNode_ImportBpy(
 
 	if (USCS_Node* ParentNode = FindComponentNodeByName_ImportBpy(BP, ParentName))
 	{
-		DetachNodeFromCurrentLocation();
-		Node->Modify();
-		Node->bIsParentComponentNative = false;
-		Node->ParentComponentOrVariableName = ParentNode->GetVariableName();
-		Node->ParentComponentOwnerClassName = NAME_None;
+		DetachNodeFromSCS_ImportBpy(SCS, Node);
 		Node->SetParent(ParentNode);
-		ParentNode->AddChildNode(Node, /*bAddToAllNodes=*/!bNodeAlreadyInSCS);
+		ParentNode->AddChildNode(Node);
 		SCS->ValidateSceneRootNodes();
 		return true;
 	}
 
 	if (USceneComponent* ParentSceneComponent = FindInheritedSceneComponentByName_ImportBpy(BP, ParentName))
 	{
-		DetachNodeFromCurrentLocation();
-		Node->Modify();
-		Node->bIsParentComponentNative = true;
-		Node->ParentComponentOrVariableName = ParentSceneComponent->GetFName();
-		Node->ParentComponentOwnerClassName = NAME_None;
+		DetachNodeFromSCS_ImportBpy(SCS, Node);
 		Node->SetParent(ParentSceneComponent);
-		if (!bNodeAlreadyInSCS)
-		{
-			SCS->AddNode(Node);
-		}
-		else
-		{
-			AddExistingNodeToRoot();
-			SCS->ValidateSceneRootNodes();
-		}
+		SCS->AddNode(Node);
 		return true;
 	}
 
 	if (USceneComponent* ParentSceneComponent = ResolveNamedObject_ImportBpy<USceneComponent>(ParentName))
 	{
-		DetachNodeFromCurrentLocation();
-		Node->Modify();
-		Node->bIsParentComponentNative = true;
-		Node->ParentComponentOrVariableName = ParentSceneComponent->GetFName();
-		Node->ParentComponentOwnerClassName = NAME_None;
+		DetachNodeFromSCS_ImportBpy(SCS, Node);
 		Node->SetParent(ParentSceneComponent);
-		if (!bNodeAlreadyInSCS)
-		{
-			SCS->AddNode(Node);
-		}
-		else
-		{
-			AddExistingNodeToRoot();
-			SCS->ValidateSceneRootNodes();
-		}
+		SCS->AddNode(Node);
 		return true;
 	}
 
@@ -1985,6 +1919,11 @@ FString ResolveCurrentComponentParentName_ImportBpy(UBlueprint* BP, USCS_Node* N
 	if (!BP || !BP->SimpleConstructionScript || !Node)
 	{
 		return FString();
+	}
+
+	if (USCS_Node* ParentNode = BP->SimpleConstructionScript->FindParentNode(Node))
+	{
+		return ParentNode->GetVariableName().ToString();
 	}
 
 	if (Node->ParentComponentOrVariableName != NAME_None)
@@ -2081,9 +2020,9 @@ bool ImportComponents_ImportBpy(
 	{
 		bool bMadeProgress = false;
 
-		for (int32 Index = PendingComponents.Num() - 1; Index >= 0; --Index)
+		for (int32 Index = 0; Index < PendingComponents.Num();)
 		{
-			const TSharedPtr<FJsonObject>& ComponentJson = PendingComponents[Index];
+			const TSharedPtr<FJsonObject> ComponentJson = PendingComponents[Index];
 			if (!ComponentJson.IsValid())
 			{
 				PendingComponents.RemoveAt(Index);
@@ -2106,6 +2045,7 @@ bool ImportComponents_ImportBpy(
 			if (!ParentName.IsEmpty() && ParentName != ComponentName &&
 				!CanResolveComponentParent_ImportBpy(BP, ParentName, KnownNodes))
 			{
+				++Index;
 				continue;
 			}
 
@@ -2181,6 +2121,7 @@ bool ImportComponents_ImportBpy(
 
 			PendingComponents.RemoveAt(Index);
 			bMadeProgress = true;
+			continue;
 		}
 
 		if (!bMadeProgress)

@@ -5090,6 +5090,221 @@ TSharedPtr<FJsonObject> BuildBlueprintDefaultPropertyMapForPython_BP(UBlueprint*
     return BuildPropertyMapForPythonRoundTrip_BP(BlueprintCDO, ParentCDO, ExcludedPropertyNames);
 }
 
+FString GetSCSNodeVariableName_BP(const USCS_Node* Node)
+{
+    if (!Node)
+    {
+        return FString();
+    }
+
+    FString Name = Node->GetVariableName().ToString();
+    if (Name.IsEmpty() || Name == TEXT("None"))
+    {
+        Name = Node->ComponentTemplate ? Node->ComponentTemplate->GetName() : FString();
+    }
+
+    return Name;
+}
+
+FString SanitizeComponentName_BP(FString Name)
+{
+    Name.TrimStartAndEndInline();
+    if (Name.EndsWith(TEXT("_GEN_VARIABLE")))
+    {
+        Name.LeftChopInline(FCString::Strlen(TEXT("_GEN_VARIABLE")));
+    }
+    if (Name == TEXT("None"))
+    {
+        Name.Reset();
+    }
+    return Name;
+}
+
+bool FindParentSCSNodeRecursive_BP(const USCS_Node* SearchNode, const USCS_Node* TargetNode, const USCS_Node*& OutParentNode)
+{
+    if (!SearchNode || !TargetNode)
+    {
+        return false;
+    }
+
+    for (const USCS_Node* ChildNode : SearchNode->GetChildNodes())
+    {
+        if (!ChildNode)
+        {
+            continue;
+        }
+
+        if (ChildNode == TargetNode)
+        {
+            OutParentNode = SearchNode;
+            return true;
+        }
+
+        if (FindParentSCSNodeRecursive_BP(ChildNode, TargetNode, OutParentNode))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+FString ResolveParentComponentTemplateName_BP(UBlueprint* Blueprint, const USCS_Node* Node, const USceneComponent* ParentTemplate)
+{
+    if (!ParentTemplate)
+    {
+        return FString();
+    }
+
+    if (Blueprint && Blueprint->SimpleConstructionScript)
+    {
+        UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass);
+        for (const USCS_Node* OtherNode : Blueprint->SimpleConstructionScript->GetAllNodes())
+        {
+            if (!OtherNode || OtherNode == Node || !OtherNode->ComponentTemplate)
+            {
+                continue;
+            }
+
+            const UActorComponent* CandidateTemplate = OtherNode->ComponentTemplate;
+            if (CandidateTemplate == ParentTemplate ||
+                CandidateTemplate->GetFName() == ParentTemplate->GetFName())
+            {
+                return SanitizeComponentName_BP(GetSCSNodeVariableName_BP(OtherNode));
+            }
+
+            if (GeneratedClass)
+            {
+                const UActorComponent* ActualTemplate = OtherNode->GetActualComponentTemplate(GeneratedClass);
+                if (ActualTemplate &&
+                    (ActualTemplate == ParentTemplate || ActualTemplate->GetFName() == ParentTemplate->GetFName()))
+                {
+                    return SanitizeComponentName_BP(GetSCSNodeVariableName_BP(OtherNode));
+                }
+            }
+        }
+    }
+
+    return SanitizeComponentName_BP(ParentTemplate->GetFName().ToString());
+}
+
+FString ResolveAttachSocketName_BP(UBlueprint* Blueprint, const USCS_Node* Node)
+{
+    if (!Node)
+    {
+        return FString();
+    }
+
+    if (Node->AttachToName != NAME_None)
+    {
+        return Node->AttachToName.ToString();
+    }
+
+    auto ResolveSceneAttachSocketName = [](const USceneComponent* SceneTemplate) -> FString
+    {
+        if (!SceneTemplate)
+        {
+            return FString();
+        }
+
+        const FName AttachSocketName = SceneTemplate->GetAttachSocketName();
+        return AttachSocketName != NAME_None ? AttachSocketName.ToString() : FString();
+    };
+
+    const FString TemplateAttachSocketName = ResolveSceneAttachSocketName(Cast<USceneComponent>(Node->ComponentTemplate));
+    if (!TemplateAttachSocketName.IsEmpty())
+    {
+        return TemplateAttachSocketName;
+    }
+
+    if (Blueprint)
+    {
+        if (UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass))
+        {
+            const FString ActualAttachSocketName = ResolveSceneAttachSocketName(
+                Cast<USceneComponent>(Node->GetActualComponentTemplate(GeneratedClass)));
+            if (!ActualAttachSocketName.IsEmpty())
+            {
+                return ActualAttachSocketName;
+            }
+        }
+    }
+
+    return FString();
+}
+
+FString ResolvePythonComponentParentName_BP(UBlueprint* Blueprint, const USCS_Node* Node)
+{
+    if (!Node)
+    {
+        return FString();
+    }
+
+    if (const USceneComponent* ParentTemplate = Node->GetParentComponentTemplate(Blueprint))
+    {
+        return ResolveParentComponentTemplateName_BP(Blueprint, Node, ParentTemplate);
+    }
+
+    if (Node->ParentComponentOrVariableName != NAME_None)
+    {
+        return SanitizeComponentName_BP(Node->ParentComponentOrVariableName.ToString());
+    }
+
+    if (!Blueprint || !Blueprint->SimpleConstructionScript)
+    {
+        return FString();
+    }
+
+    const USCS_Node* ParentNode = nullptr;
+    for (const USCS_Node* RootNode : Blueprint->SimpleConstructionScript->GetRootNodes())
+    {
+        if (!RootNode)
+        {
+            continue;
+        }
+
+        if (RootNode == Node)
+        {
+            return FString();
+        }
+
+        if (FindParentSCSNodeRecursive_BP(RootNode, Node, ParentNode))
+        {
+            break;
+        }
+    }
+
+    FString ParentName = SanitizeComponentName_BP(GetSCSNodeVariableName_BP(ParentNode));
+    if (!ParentName.IsEmpty())
+    {
+        return ParentName;
+    }
+
+    if (const USceneComponent* SceneTemplate = Cast<USceneComponent>(Node->ComponentTemplate))
+    {
+        if (const USceneComponent* AttachParent = SceneTemplate->GetAttachParent())
+        {
+            return ResolveParentComponentTemplateName_BP(Blueprint, Node, AttachParent);
+        }
+    }
+
+    if (Blueprint)
+    {
+        if (UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass))
+        {
+            if (const USceneComponent* ActualSceneTemplate = Cast<USceneComponent>(Node->GetActualComponentTemplate(GeneratedClass)))
+            {
+                if (const USceneComponent* AttachParent = ActualSceneTemplate->GetAttachParent())
+                {
+                    return ResolveParentComponentTemplateName_BP(Blueprint, Node, AttachParent);
+                }
+            }
+        }
+    }
+
+    return FString();
+}
+
 void AppendPythonComponentSpecs_BP(UBlueprint* Blueprint, TArray<TSharedPtr<FJsonValue>>& OutComponents)
 {
     OutComponents.Reset();
@@ -5126,14 +5341,16 @@ void AppendPythonComponentSpecs_BP(UBlueprint* Blueprint, TArray<TSharedPtr<FJso
                 TEXT("component_type"),
                 Node->ComponentClass ? Node->ComponentClass->GetPathName() : Node->ComponentTemplate->GetClass()->GetPathName());
 
-            if (Node->ParentComponentOrVariableName != NAME_None)
+            const FString ParentComponentName = ResolvePythonComponentParentName_BP(Blueprint, Node);
+            if (!ParentComponentName.IsEmpty())
             {
-                ComponentSpec->SetStringField(TEXT("parent_component_name"), Node->ParentComponentOrVariableName.ToString());
+                ComponentSpec->SetStringField(TEXT("parent_component_name"), ParentComponentName);
             }
 
-            if (Node->AttachToName != NAME_None)
+            const FString AttachToName = ResolveAttachSocketName_BP(Blueprint, Node);
+            if (!AttachToName.IsEmpty())
             {
-                ComponentSpec->SetStringField(TEXT("attach_to_name"), Node->AttachToName.ToString());
+                ComponentSpec->SetStringField(TEXT("attach_to_name"), AttachToName);
             }
 
             UActorComponent* BaselineComponent = Node->ComponentClass
@@ -6519,6 +6736,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleAddComponentToBlu
         USCS_Node* ParentNode = FindBlueprintComponentNodeByName_BP(Blueprint, ParentComponentName);
         if (ParentNode)
         {
+            NewNode->SetParent(ParentNode);
             ParentNode->AddChildNode(NewNode);
         }
         else if (USceneComponent* ParentSceneComponent = Cast<USceneComponent>(ResolveBlueprintEndpointObject(Blueprint, ParentComponentName)))
@@ -8532,23 +8750,19 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleImportBlueprintPy
                 TEXT("    importlib.reload(sys.modules['ue_bp_dsl.core'])\n")
                 TEXT("if 'ue_bp_dsl' in sys.modules:\n")
                 TEXT("    importlib.reload(sys.modules['ue_bp_dsl'])\n")
-                TEXT("if use_upper_compiler:\n")
-                TEXT("    from bpy_compile import api as bpy_compile_api\n")
-                TEXT("    bpy_compile_api = importlib.reload(bpy_compile_api)\n")
-                TEXT("    compile_source = source_path if os.path.isdir(source_path) else os.path.dirname(source_path)\n")
-                TEXT("    ok, err = bpy_compile_api.compile_and_import(compile_source, target_path=target_path, compile_asset=compile_blueprint)\n")
-                TEXT("    import_mode = 'upper_package'\n")
-                TEXT("    compiled = bool(ok and compile_blueprint)\n")
-                TEXT("    imported_asset_path = target_path\n")
-                TEXT("else:\n")
-                TEXT("    import bp_importer\n")
-                TEXT("    bp_importer = importlib.reload(bp_importer)\n")
-                TEXT("    details = bp_importer.import_path_with_details(source_path, target_path or None, compile_blueprint=compile_blueprint)\n")
-                TEXT("    ok = bool(details.get('success', False))\n")
-                TEXT("    err = details.get('error', '')\n")
-                TEXT("    import_mode = details.get('import_mode', 'bpy_directory')\n")
-                TEXT("    compiled = bool(details.get('compiled', False))\n")
-                TEXT("    imported_asset_path = details.get('asset_path', target_path)\n")
+                TEXT("from bpy_compile import api as bpy_compile_api\n")
+                TEXT("bpy_compile_api = importlib.reload(bpy_compile_api)\n")
+                TEXT("details = bpy_compile_api.import_bpy_package(\n")
+                TEXT("    source_path,\n")
+                TEXT("    target_path=target_path or None,\n")
+                TEXT("    compile_asset=compile_blueprint,\n")
+                TEXT("    use_upper_compiler=use_upper_compiler,\n")
+                TEXT(")\n")
+                TEXT("ok = bool(details.get('success', False))\n")
+                TEXT("err = details.get('error', '')\n")
+                TEXT("import_mode = details.get('import_mode', 'bpy_directory')\n")
+                TEXT("compiled = bool(details.get('compiled', False))\n")
+                TEXT("imported_asset_path = details.get('asset_path', target_path)\n")
                 TEXT("result = {\n")
                 TEXT("    'success': bool(ok),\n")
                 TEXT("    'error': '' if ok else str(err),\n")

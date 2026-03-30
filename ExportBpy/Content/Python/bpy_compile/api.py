@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -111,6 +112,52 @@ def compile_and_import(
     return True, ""
 
 
+def import_bpy_package(
+    source_path: str,
+    *,
+    target_path: Optional[str] = None,
+    compile_asset: bool = True,
+    reference_dir: Optional[str] = None,
+    emit_debug_bpy: bool = False,
+    debug_output_dir: Optional[str] = None,
+    asset_meta_dir: Optional[str] = None,
+    use_upper_compiler: Optional[bool] = None,
+) -> Dict[str, object]:
+    """
+    Unified import entry for both __upper__.py packages and normal .bp.py packages.
+    """
+    ensure_plugin_python_path()
+    normalized_source = os.path.abspath(source_path)
+    normalized_target = target_path or None
+    should_use_upper = _is_upper_package_source(normalized_source) if use_upper_compiler is None else bool(use_upper_compiler)
+
+    if should_use_upper:
+        compile_source = normalized_source if os.path.isdir(normalized_source) else os.path.dirname(normalized_source)
+        ok, err = compile_and_import(
+            compile_source,
+            reference_dir=reference_dir,
+            target_path=normalized_target,
+            compile_asset=compile_asset,
+            emit_debug_bpy=emit_debug_bpy,
+            debug_output_dir=debug_output_dir,
+            asset_meta_dir=asset_meta_dir,
+        )
+        return {
+            "success": bool(ok),
+            "error": "" if ok else str(err),
+            "asset_path": normalized_target or "",
+            "import_mode": "upper_package",
+            "compiled": bool(ok and compile_asset),
+        }
+
+    bp_importer_module = importlib.reload(bp_importer)
+    return bp_importer_module.import_path_with_details(
+        normalized_source,
+        target_path=normalized_target,
+        compile_blueprint=compile_asset,
+    )
+
+
 def import_asset_metas(asset_meta_dir: str) -> Dict:
     """
     单独导入一个目录下所有 *__asset__.meta.py（不涉及蓝图编译）。
@@ -125,3 +172,12 @@ def _default_compiled_package_dir(source_dir: str) -> str:
     package_name = os.path.basename(os.path.abspath(source_dir))
     project_dir = os.path.abspath(os.path.join(source_dir, "..", ".."))
     return os.path.join(project_dir, "ExportedBlueprints", "bpy", package_name)
+
+
+def _is_upper_package_source(source_path: str) -> bool:
+    clean_name = os.path.basename(source_path)
+    if clean_name.lower() == "__upper__.py":
+        return True
+    if os.path.isdir(source_path):
+        return os.path.isfile(os.path.join(source_path, "__upper__.py"))
+    return False

@@ -39,9 +39,15 @@ def _write_upper(pkg: BPPackage, output_dir: str) -> None:
             c_name = comp.get("name", "")
             c_class = comp.get("class_name", "")
             c_parent = comp.get("parent", "")
+            c_attach = comp.get("attach_to_name", "")
+            c_properties = comp.get("properties", {}) or {}
             arg = f'"{c_name}", class_name="{c_class}"'
             if c_parent:
                 arg += f', parent="{c_parent}"'
+            if c_attach:
+                arg += f', attach_to_name="{c_attach}"'
+            if c_properties:
+                arg += f", properties={c_properties!r}"
             lines.append(f"bp.component({arg})")
         lines.append("")
 

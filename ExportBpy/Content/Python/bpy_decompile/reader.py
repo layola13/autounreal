@@ -56,7 +56,7 @@ class BPPackage:
     parent_class: str = ""
     bp_type: str = "Normal"
     variables: List[Dict[str, Any]] = field(default_factory=list)
-    components: List[Dict[str, str]] = field(default_factory=list)
+    components: List[Dict[str, Any]] = field(default_factory=list)
     graphs: List[GraphInfo] = field(default_factory=list)
 
 
@@ -174,7 +174,7 @@ class _BPCapture:
         self.parent = ""
         self.bp_type = "Normal"
         self.variables: List[Dict[str, Any]] = []
-        self.components: List[Dict[str, str]] = []
+        self.components: List[Dict[str, Any]] = []
         self._graphs_pending: List[_GraphCapture] = []
 
     def event_graph(self, name: str) -> _GraphCapture:
@@ -187,8 +187,22 @@ class _BPCapture:
         self._graphs_pending.append(graph)
         return graph
 
-    def component(self, comp_name: str, class_name: str = "", parent: str = ""):
-        self.components.append({"name": comp_name, "class_name": class_name, "parent": parent})
+    def component(
+        self,
+        comp_name: str,
+        class_name: str = "",
+        parent: str = "",
+        attach_to_name: str = "",
+        properties: Optional[Dict[str, Any]] = None,
+        **_,
+    ):
+        self.components.append({
+            "name": comp_name,
+            "class_name": class_name,
+            "parent": parent,
+            "attach_to_name": attach_to_name,
+            "properties": properties or {},
+        })
 
     def variable(self, var_name: str, **kwargs):
         kwargs["name"] = var_name
@@ -294,8 +308,22 @@ def _parse_bp_file(path: str, pkg: BPPackage):
             pkg.bp_type = bp_type
             return self_inner
 
-        def component(self_inner, name: str, class_name: str = "", parent: str = ""):
-            pkg.components.append({"name": name, "class_name": class_name, "parent": parent})
+        def component(
+            self_inner,
+            name: str,
+            class_name: str = "",
+            parent: str = "",
+            attach_to_name: str = "",
+            properties: Optional[Dict[str, Any]] = None,
+            **_,
+        ):
+            pkg.components.append({
+                "name": name,
+                "class_name": class_name,
+                "parent": parent,
+                "attach_to_name": attach_to_name,
+                "properties": properties or {},
+            })
             return self_inner
 
         def var(self_inner, name: str, **kwargs):

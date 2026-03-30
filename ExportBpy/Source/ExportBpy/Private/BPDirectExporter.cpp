@@ -3,6 +3,7 @@
 #include "BPDirectExporter.h"
 
 #include "Engine/Blueprint.h"
+#include "Engine/BlueprintGeneratedClass.h"
 #include "Animation/AnimBlueprint.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
@@ -35,6 +36,7 @@
 #include "K2Node_CallDelegate.h"
 #include "K2Node_CustomEvent.h"
 #include "K2Node_FunctionTerminator.h"
+#include "Components/SceneComponent.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -116,6 +118,239 @@ FString GetJsonStringField_ExportBpy(
 	}
 
 	return Fallback;
+}
+
+FString GetSCSNodeName_ExportBpy(const USCS_Node* Node)
+{
+	if (!Node)
+	{
+		return FString();
+	}
+
+	FString NodeName = Node->GetVariableName().ToString();
+	if (NodeName.IsEmpty() || NodeName == TEXT("None"))
+	{
+		NodeName = Node->ComponentTemplate ? Node->ComponentTemplate->GetName() : FString();
+	}
+
+	return NodeName;
+}
+
+FString SanitizeExportedComponentName_ExportBpy(FString Name)
+{
+	Name.TrimStartAndEndInline();
+	if (Name.EndsWith(TEXT("_GEN_VARIABLE")))
+	{
+		Name.LeftChopInline(FCString::Strlen(TEXT("_GEN_VARIABLE")));
+	}
+	if (Name == TEXT("None"))
+	{
+		Name.Reset();
+	}
+	return Name;
+}
+
+FString ResolveParentComponentTemplateName_ExportBpy(
+	const UBlueprint* Blueprint,
+	const USCS_Node* Node,
+	const USceneComponent* ParentTemplate)
+{
+	if (!ParentTemplate)
+	{
+		return FString();
+	}
+
+	if (Blueprint && Blueprint->SimpleConstructionScript)
+	{
+		UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass);
+		for (const USCS_Node* OtherNode : Blueprint->SimpleConstructionScript->GetAllNodes())
+		{
+			if (!OtherNode || OtherNode == Node || !OtherNode->ComponentTemplate)
+			{
+				continue;
+			}
+
+			const UActorComponent* CandidateTemplate = OtherNode->ComponentTemplate;
+			if (CandidateTemplate == ParentTemplate ||
+				CandidateTemplate->GetFName() == ParentTemplate->GetFName())
+			{
+				return SanitizeExportedComponentName_ExportBpy(GetSCSNodeName_ExportBpy(OtherNode));
+			}
+
+			if (GeneratedClass)
+			{
+				const UActorComponent* ActualTemplate = OtherNode->GetActualComponentTemplate(GeneratedClass);
+				if (ActualTemplate &&
+					(ActualTemplate == ParentTemplate || ActualTemplate->GetFName() == ParentTemplate->GetFName()))
+				{
+					return SanitizeExportedComponentName_ExportBpy(GetSCSNodeName_ExportBpy(OtherNode));
+				}
+			}
+		}
+	}
+
+	return SanitizeExportedComponentName_ExportBpy(ParentTemplate->GetFName().ToString());
+}
+
+FString ResolveTemplateAttachParentName_ExportBpy(const UBlueprint* Blueprint, const USCS_Node* Node)
+{
+	if (!Blueprint || !Blueprint->SimpleConstructionScript || !Node)
+	{
+		return FString();
+	}
+
+	if (const USceneComponent* ParentTemplate = Node->GetParentComponentTemplate(const_cast<UBlueprint*>(Blueprint)))
+	{
+		return ResolveParentComponentTemplateName_ExportBpy(Blueprint, Node, ParentTemplate);
+	}
+
+	if (const USceneComponent* SceneTemplate = Cast<USceneComponent>(Node->ComponentTemplate))
+	{
+		if (const USceneComponent* AttachParent = SceneTemplate->GetAttachParent())
+		{
+			return ResolveParentComponentTemplateName_ExportBpy(Blueprint, Node, AttachParent);
+		}
+	}
+
+	if (UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass))
+	{
+		if (const USceneComponent* ActualSceneTemplate = Cast<USceneComponent>(Node->GetActualComponentTemplate(GeneratedClass)))
+		{
+			if (const USceneComponent* AttachParent = ActualSceneTemplate->GetAttachParent())
+			{
+				return ResolveParentComponentTemplateName_ExportBpy(Blueprint, Node, AttachParent);
+			}
+		}
+	}
+
+	return FString();
+}
+
+FString ResolveComponentAttachToName_ExportBpy(const UBlueprint* Blueprint, const USCS_Node* Node)
+{
+	if (!Node)
+	{
+		return FString();
+	}
+
+	if (Node->AttachToName != NAME_None)
+	{
+		return Node->AttachToName.ToString();
+	}
+
+	auto ResolveSceneAttachSocketName = [](const USceneComponent* SceneTemplate) -> FString
+	{
+		if (!SceneTemplate)
+		{
+			return FString();
+		}
+
+		const FName AttachSocketName = SceneTemplate->GetAttachSocketName();
+		return AttachSocketName != NAME_None ? AttachSocketName.ToString() : FString();
+	};
+
+	const FString TemplateAttachSocketName = ResolveSceneAttachSocketName(Cast<USceneComponent>(Node->ComponentTemplate));
+	if (!TemplateAttachSocketName.IsEmpty())
+	{
+		return TemplateAttachSocketName;
+	}
+
+	if (Blueprint)
+	{
+		if (UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass))
+		{
+			const FString ActualAttachSocketName = ResolveSceneAttachSocketName(
+				Cast<USceneComponent>(Node->GetActualComponentTemplate(GeneratedClass)));
+			if (!ActualAttachSocketName.IsEmpty())
+			{
+				return ActualAttachSocketName;
+			}
+		}
+	}
+
+	return FString();
+}
+
+bool FindParentSCSNodeRecursive_ExportBpy(
+	const USCS_Node* SearchNode,
+	const USCS_Node* TargetNode,
+	const USCS_Node*& OutParentNode)
+{
+	if (!SearchNode || !TargetNode)
+	{
+		return false;
+	}
+
+	for (const USCS_Node* ChildNode : SearchNode->GetChildNodes())
+	{
+		if (!ChildNode)
+		{
+			continue;
+		}
+
+		if (ChildNode == TargetNode)
+		{
+			OutParentNode = SearchNode;
+			return true;
+		}
+
+		if (FindParentSCSNodeRecursive_ExportBpy(ChildNode, TargetNode, OutParentNode))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+FString ResolveComponentParentName_ExportBpy(const UBlueprint* Blueprint, const USCS_Node* Node)
+{
+	if (!Node)
+	{
+		return FString();
+	}
+
+	const FString TemplateParentName = ResolveTemplateAttachParentName_ExportBpy(Blueprint, Node);
+	if (!TemplateParentName.IsEmpty())
+	{
+		return TemplateParentName;
+	}
+
+	if (Node->ParentComponentOrVariableName != NAME_None)
+	{
+		return SanitizeExportedComponentName_ExportBpy(Node->ParentComponentOrVariableName.ToString());
+	}
+
+	if (!Blueprint || !Blueprint->SimpleConstructionScript)
+	{
+		return FString();
+	}
+
+	const USCS_Node* ParentNode = nullptr;
+	for (const USCS_Node* RootNode : Blueprint->SimpleConstructionScript->GetRootNodes())
+	{
+		if (!RootNode)
+		{
+			continue;
+		}
+
+		if (RootNode == Node)
+		{
+			return FString();
+		}
+
+		if (FindParentSCSNodeRecursive_ExportBpy(RootNode, Node, ParentNode))
+		{
+			break;
+		}
+	}
+
+	const FString ParentName = SanitizeExportedComponentName_ExportBpy(GetSCSNodeName_ExportBpy(ParentNode));
+	if (!ParentName.IsEmpty())
+	{
+		return ParentName;
+	}
+	return FString();
 }
 
 FString BuildDefaultBpyExportPath_ExportBpy(UBlueprint* Blueprint)
@@ -1152,7 +1387,30 @@ bool UBPDirectExporter::ExportBlueprintToPy(
 		return false;
 	}
 
-	return GenerateMainFile(BP, BPOutDir, GraphModules, OutError);
+	if (!GenerateMainFile(BP, BPOutDir, GraphModules, OutError))
+	{
+		return false;
+	}
+
+	// Keep the adjacent single-file export in sync with the package export.
+	FString BpyText;
+	FString BpyError;
+	if (!ReadBlueprintToBpyText(BlueprintPath, BpyText, BpyError))
+	{
+		OutError = BpyError.IsEmpty()
+			? FString::Printf(TEXT("Failed to generate companion bpy file for %s"), *BlueprintPath)
+			: BpyError;
+		return false;
+	}
+
+	const FString CompanionBpyPath = FPaths::Combine(BPOutDir, BPName + TEXT(".bp.py"));
+	if (!FFileHelper::SaveStringToFile(BpyText, *CompanionBpyPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		OutError = FString::Printf(TEXT("Cannot write %s"), *CompanionBpyPath);
+		return false;
+	}
+
+	return true;
 }
 
 bool UBPDirectExporter::ReadBlueprintToBpyText(
@@ -1763,9 +2021,8 @@ FString UBPDirectExporter::GenerateComponentsSection(UBlueprint* BP)
 			UClass* CompClass = SCSNode->ComponentClass;
 			FString ClassName = CompClass ? CompClass->GetName() : TEXT("Unknown");
 			FString CompName = SCSNode->GetVariableName().ToString();
-			FString ParentName;
-			if (SCSNode->ParentComponentOrVariableName != NAME_None)
-				ParentName = SCSNode->ParentComponentOrVariableName.ToString();
+			const FString ParentName = ResolveComponentParentName_ExportBpy(BP, SCSNode);
+			const FString AttachToName = ResolveComponentAttachToName_ExportBpy(BP, SCSNode);
 
 			// Collect component template properties (SkeletalMesh, AnimClass, camera settings, etc.)
 			FString PropertiesDict = TEXT("{}");
@@ -1774,23 +2031,20 @@ FString UBPDirectExporter::GenerateComponentsSection(UBlueprint* BP)
 				PropertiesDict = BuildComponentPropertiesPyDict_ExportBpy(SCSNode->ComponentTemplate);
 			}
 
-			if (PropertiesDict == TEXT("{}"))
+			TArray<FString> ComponentArgs;
+			ComponentArgs.Add(MakePythonStringLiteral_ExportBpy(CompName));
+			ComponentArgs.Add(FString::Printf(TEXT("class_name=%s"), *MakePythonStringLiteral_ExportBpy(ClassName)));
+			ComponentArgs.Add(FString::Printf(TEXT("parent=%s"), *MakePythonStringLiteral_ExportBpy(ParentName)));
+			if (!AttachToName.IsEmpty())
 			{
-				Out += FString::Printf(
-					TEXT("bp.component(%s, class_name=%s, parent=%s)\n"),
-					*MakePythonStringLiteral_ExportBpy(CompName),
-					*MakePythonStringLiteral_ExportBpy(ClassName),
-					*MakePythonStringLiteral_ExportBpy(ParentName));
+				ComponentArgs.Add(FString::Printf(TEXT("attach_to_name=%s"), *MakePythonStringLiteral_ExportBpy(AttachToName)));
 			}
-			else
+			if (PropertiesDict != TEXT("{}"))
 			{
-				Out += FString::Printf(
-					TEXT("bp.component(%s, class_name=%s, parent=%s, properties=%s)\n"),
-					*MakePythonStringLiteral_ExportBpy(CompName),
-					*MakePythonStringLiteral_ExportBpy(ClassName),
-					*MakePythonStringLiteral_ExportBpy(ParentName),
-					*PropertiesDict);
+				ComponentArgs.Add(FString::Printf(TEXT("properties=%s"), *PropertiesDict));
 			}
+
+			Out += FString::Printf(TEXT("bp.component(%s)\n"), *FString::Join(ComponentArgs, TEXT(", ")));
 		}
 	}
 	Out += TEXT("\n");
@@ -2613,7 +2867,12 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeBlueprintToJson(UBlueprint* 
 			auto CObj = MakeShared<FJsonObject>();
 			CObj->SetStringField(TEXT("name"),       SCSNode->GetVariableName().ToString());
 			CObj->SetStringField(TEXT("class_name"), SCSNode->ComponentClass ? SCSNode->ComponentClass->GetName() : TEXT(""));
-			CObj->SetStringField(TEXT("parent"),     SCSNode->ParentComponentOrVariableName.ToString());
+			CObj->SetStringField(TEXT("parent"),     ResolveComponentParentName_ExportBpy(BP, SCSNode));
+			const FString AttachToName = ResolveComponentAttachToName_ExportBpy(BP, SCSNode);
+			if (!AttachToName.IsEmpty())
+			{
+				CObj->SetStringField(TEXT("attach_to_name"), AttachToName);
+			}
 
 			// Export non-default component template properties (SkeletalMesh, AnimClass, etc.)
 			auto PropsObj = MakeShared<FJsonObject>();

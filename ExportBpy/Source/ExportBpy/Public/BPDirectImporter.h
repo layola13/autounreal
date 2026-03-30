@@ -42,6 +42,12 @@ public:
 		bool bCompileBlueprint,
 		FString& OutError);
 
+	UFUNCTION(BlueprintCallable, Category = "ExportBpy")
+	static FString ImportBlueprintFromJsonDetailed(
+		const FString& JsonData,
+		const FString& TargetAssetPath,
+		bool bCompileBlueprint);
+
 	/**
 	 * 将独立资产（InputAction / InputMappingContext / Chooser / PoseSearchDatabase 等）
 	 * 从旧的扁平属性 JSON，或新的 standalone asset meta JSON，导入到目标资产。
@@ -107,13 +113,14 @@ private:
 	static UEdGraphNode* CreateVariableNode(
 		UEdGraph* Graph,
 		const TSharedPtr<FJsonObject>& NodeJson,
-		bool bIsGet);
+		bool bIsGet,
+		FString& OutError);
 
 	static UEdGraphNode* CreateBranchNode(UEdGraph* Graph);
 
 	// ── Connection / type helpers ──────────────────────────────────────────────
 
-	static void ConnectPins(
+	static bool ConnectPins(
 		UEdGraphNode* SrcNode,
 		const FString& SrcPinName,
 		const FString& SrcPinFullName,
@@ -121,7 +128,8 @@ private:
 		UEdGraphNode* DstNode,
 		const FString& DstPinName,
 		const FString& DstPinFullName,
-		const FString& DstPinId);
+		const FString& DstPinId,
+		FString& OutError);
 
 	static void ParsePinType(const FString& TypeStr, FEdGraphPinType& OutType);
 

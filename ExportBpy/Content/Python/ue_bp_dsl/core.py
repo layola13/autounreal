@@ -123,6 +123,7 @@ class _Component:
     name:       str
     class_name: str
     parent:     Optional[str]       = None
+    attach_to_name: Optional[str]   = None
     properties: Dict[str, Any]      = field(default_factory=dict)
 
 
@@ -566,10 +567,12 @@ class Blueprint:
 
     def component(self, name: str, class_name: str, *,
                   parent: Optional[str] = None,
+                  attach_to_name: Optional[str] = None,
                   properties: Optional[Dict[str, Any]] = None) -> "Blueprint":
         self._components.append(_Component(
             name=name, class_name=class_name,
-            parent=parent, properties=properties or {},
+            parent=parent, attach_to_name=attach_to_name,
+            properties=properties or {},
         ))
         return self
 
@@ -656,6 +659,7 @@ class Blueprint:
                     "name":       c.name,
                     "class_name": c.class_name,
                     "parent":     c.parent or "",
+                    "attach_to_name": c.attach_to_name or "",
                     "properties": c.properties,
                 }
                 for c in self._components

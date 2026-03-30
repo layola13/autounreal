@@ -531,17 +531,27 @@ def _call_cpp_importer(json_str: str, asset_path: str, compile_blueprint: bool =
     try:
         import unreal
 
-        if hasattr(unreal, "BPDirectImporter"):
+        if hasattr(unreal, "BPDirectImporter") and hasattr(unreal.BPDirectImporter, "import_blueprint_from_json_detailed"):
+            result = unreal.BPDirectImporter.import_blueprint_from_json_detailed(
+                json_str, asset_path, compile_blueprint
+            )
+        elif hasattr(unreal, "call_function"):
+            result = unreal.call_function(
+                "BPDirectImporter", "ImportBlueprintFromJson", json_str, asset_path, compile_blueprint
+            )
+        elif hasattr(unreal, "BPDirectImporter"):
             result = unreal.BPDirectImporter.import_blueprint_from_json(
                 json_str, asset_path, compile_blueprint
             )
         else:
-            result = unreal.call_function(
-                "BPDirectImporter", "ImportBlueprintFromJson", json_str, asset_path, compile_blueprint
-            )
+            return False, "Unreal Python bridge cannot call BPDirectImporter.ImportBlueprintFromJson"
 
         success: Optional[bool] = None
         error_text = ""
+        if isinstance(result, str):
+            parsed = _parse_import_result_json(result)
+            if parsed is not None:
+                return parsed
         if isinstance(result, tuple):
             if result:
                 first = result[0]
@@ -575,3 +585,13 @@ def _call_cpp_importer(json_str: str, asset_path: str, compile_blueprint: bool =
         return success, error_text
     except Exception as exc:
         return False, str(exc)
+
+
+def _parse_import_result_json(result_text: str) -> Optional[Tuple[bool, str]]:
+    try:
+        payload = json.loads(result_text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or "success" not in payload:
+        return None
+    return bool(payload.get("success", False)), str(payload.get("error", ""))

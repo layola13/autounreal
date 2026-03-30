@@ -95,9 +95,18 @@ def _write_main_file(path: str, bp: Any, graph_files: List[str]) -> None:
     lines.append("")
     lines.append("# ── Components ──────────────────────────────────────────")
     for comp in getattr(bp, "_components", []):
-        lines.append(
-            f"bp.component({comp.name!r}, class_name={comp.class_name!r}, parent={comp.parent!r})"
-        )
+        args = [
+            repr(comp.name),
+            f"class_name={comp.class_name!r}",
+            f"parent={comp.parent!r}",
+        ]
+        attach_to_name = getattr(comp, "attach_to_name", None)
+        if attach_to_name:
+            args.append(f"attach_to_name={attach_to_name!r}")
+        properties = getattr(comp, "properties", None) or {}
+        if properties:
+            args.append(f"properties={properties!r}")
+        lines.append(f"bp.component({', '.join(args)})")
     lines.append("")
     lines.append("# ── Interfaces ──────────────────────────────────────────")
     for interface_path in getattr(bp, "_interfaces", []):

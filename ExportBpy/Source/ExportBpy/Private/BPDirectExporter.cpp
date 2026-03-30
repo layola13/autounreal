@@ -40,8 +40,10 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UObjectIterator.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Misc/PackageName.h"
 #include "HAL/FileManager.h"
 #include "EdGraphSchema_K2.h"
 #include "Dom/JsonObject.h"
@@ -49,6 +51,7 @@
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 #include "UObject/UnrealType.h"
+#include "EditorAssetLibrary.h"
 
 namespace
 {
@@ -119,6 +122,113 @@ FString BuildDefaultBpyExportPath_ExportBpy(UBlueprint* Blueprint)
 {
 	const FString BlueprintName = FPaths::MakeValidFileName(Blueprint ? Blueprint->GetName() : TEXT("Unknown"));
 	return FPaths::Combine(FPaths::ProjectDir(), TEXT("ExportedBlueprints"), TEXT("bpy"), BlueprintName, BlueprintName + TEXT(".bp.py"));
+}
+
+FString NormalizeStandaloneAssetObjectPath_ExportBpy(const FString& AssetPath)
+{
+	FString Normalized = AssetPath;
+	Normalized.TrimStartAndEndInline();
+	if (Normalized.StartsWith(TEXT("/")) && !Normalized.Contains(TEXT(".")))
+	{
+		const FString AssetName = FPackageName::GetLongPackageAssetName(Normalized);
+		if (!AssetName.IsEmpty())
+		{
+			return FString::Printf(TEXT("%s.%s"), *Normalized, *AssetName);
+		}
+	}
+
+	return Normalized;
+}
+
+bool ShouldSkipStandaloneProperty_ExportBpy(const FProperty* Property)
+{
+	return !Property || Property->HasAnyPropertyFlags(CPF_Transient | CPF_EditorOnly | CPF_Deprecated);
+}
+
+TSharedPtr<FJsonObject> SerializeObjectProperties_ExportBpy(UObject* Object, const UObject* DefaultsObject)
+{
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	if (!Object)
+	{
+		return Result;
+	}
+
+	for (TFieldIterator<FProperty> It(Object->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+	{
+		const FProperty* Property = *It;
+		if (ShouldSkipStandaloneProperty_ExportBpy(Property))
+		{
+			continue;
+		}
+
+		const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Object);
+		const void* DefaultPtr = DefaultsObject ? Property->ContainerPtrToValuePtr<void>(DefaultsObject) : nullptr;
+		if (DefaultPtr && Property->Identical(ValuePtr, DefaultPtr, PPF_None))
+		{
+			continue;
+		}
+
+		FString ExportedValue;
+		Property->ExportTextItem_Direct(ExportedValue, ValuePtr, DefaultPtr, Object, PPF_None);
+		Result->SetStringField(Property->GetName(), ExportedValue);
+	}
+
+	return Result;
+}
+
+TArray<TSharedPtr<FJsonValue>> SerializeStandaloneSubobjects_ExportBpy(UObject* Asset)
+{
+	TArray<TSharedPtr<FJsonValue>> Results;
+	if (!Asset)
+	{
+		return Results;
+	}
+
+	TArray<UObject*> Subobjects;
+	GetObjectsWithOuter(Asset, Subobjects, false);
+	Subobjects.RemoveAll([](const UObject* Object)
+	{
+		return Object == nullptr || Object->HasAnyFlags(RF_Transient | RF_ClassDefaultObject);
+	});
+	Subobjects.Sort([](const UObject& A, const UObject& B)
+	{
+		return A.GetPathName() < B.GetPathName();
+	});
+
+	for (UObject* Subobject : Subobjects)
+	{
+		TSharedPtr<FJsonObject> SubobjectJson = MakeShared<FJsonObject>();
+		SubobjectJson->SetStringField(TEXT("name"), Subobject->GetName());
+		SubobjectJson->SetStringField(TEXT("gate"), Subobject->GetPathName());
+		SubobjectJson->SetStringField(TEXT("class"), Subobject->GetClass()->GetPathName());
+		SubobjectJson->SetObjectField(
+			TEXT("properties"),
+			SerializeObjectProperties_ExportBpy(Subobject, Subobject->GetClass()->GetDefaultObject(false)));
+		Results.Add(MakeShared<FJsonValueObject>(SubobjectJson));
+	}
+
+	return Results;
+}
+
+TSharedPtr<FJsonObject> BuildStandaloneAssetMeta_ExportBpy(UObject* Asset)
+{
+	TSharedPtr<FJsonObject> Meta = MakeShared<FJsonObject>();
+	if (!Asset)
+	{
+		return Meta;
+	}
+
+	Meta->SetStringField(TEXT("kind"), TEXT("standalone_asset"));
+	Meta->SetStringField(TEXT("asset"), Asset->GetPathName());
+	Meta->SetStringField(TEXT("asset_class"), Asset->GetClass()->GetPathName());
+	Meta->SetStringField(TEXT("export_type"), TEXT("generic_object"));
+	Meta->SetStringField(TEXT("outer"), Asset->GetOuter() ? Asset->GetOuter()->GetPathName() : TEXT(""));
+	Meta->SetStringField(TEXT("package"), Asset->GetOutermost() ? Asset->GetOutermost()->GetName() : TEXT(""));
+	Meta->SetObjectField(
+		TEXT("properties"),
+		SerializeObjectProperties_ExportBpy(Asset, Asset->GetClass()->GetDefaultObject(false)));
+	Meta->SetArrayField(TEXT("subobjects"), SerializeStandaloneSubobjects_ExportBpy(Asset));
+	return Meta;
 }
 
 FString EscapePythonString_ExportBpy(const FString& Text)
@@ -2396,103 +2506,28 @@ bool UBPDirectExporter::ExportStandaloneAssetToPy(
 	const FString& OutputDir,
 	FString& OutError)
 {
-	// Load the asset as a generic UObject (works for InputAction, IMC, Chooser, PoseSearchDatabase, etc.)
-	UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *AssetPath);
+	const FString ObjectPath = NormalizeStandaloneAssetObjectPath_ExportBpy(AssetPath);
+	UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *ObjectPath);
 	if (!Asset)
 	{
-		OutError = FString::Printf(TEXT("Cannot load asset: %s"), *AssetPath);
+		const FString PackagePath = FPackageName::ObjectPathToPackageName(ObjectPath);
+		if (!PackagePath.IsEmpty())
+		{
+			Asset = Cast<UObject>(UEditorAssetLibrary::LoadAsset(PackagePath));
+		}
+	}
+	if (!Asset)
+	{
+		OutError = FString::Printf(TEXT("Cannot load asset: %s"), *ObjectPath);
 		return false;
 	}
 
-	const UObject* CDO = Asset->GetClass()->GetDefaultObject(false);
-
-	// Collect non-default properties into a flat dict
-	TArray<FString> Entries;
-	for (TFieldIterator<FProperty> It(Asset->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
-	{
-		const FProperty* Prop = *It;
-		if (!Prop) continue;
-		if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_EditorOnly)) continue;
-		if (CastField<FArrayProperty>(Prop)
-			|| CastField<FSetProperty>(Prop)
-			|| CastField<FMapProperty>(Prop))
-		{
-			continue;
-		}
-
-		const void* ValuePtr  = Prop->ContainerPtrToValuePtr<void>(Asset);
-		const void* DefaultPtr = CDO ? Prop->ContainerPtrToValuePtr<void>(CDO) : nullptr;
-		if (DefaultPtr && Prop->Identical(ValuePtr, DefaultPtr)) continue;
-
-		FString PyValue;
-		if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop))
-		{
-			UObject* ObjVal = ObjProp->GetObjectPropertyValue(ValuePtr);
-			if (!ObjVal) continue;
-			PyValue = MakePythonStringLiteral_ExportBpy(ObjVal->GetPathName());
-		}
-		else if (const FClassProperty* ClsProp = CastField<FClassProperty>(Prop))
-		{
-			UClass* ClsVal = Cast<UClass>(ClsProp->GetObjectPropertyValue(ValuePtr));
-			if (!ClsVal) continue;
-			PyValue = MakePythonStringLiteral_ExportBpy(ClsVal->GetPathName());
-		}
-		else if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
-		{
-			PyValue = BoolProp->GetPropertyValue(ValuePtr) ? TEXT("True") : TEXT("False");
-		}
-		else if (const FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
-		{
-			PyValue = FString::SanitizeFloat(FloatProp->GetPropertyValue(ValuePtr));
-		}
-		else if (const FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
-		{
-			PyValue = FString::SanitizeFloat(DoubleProp->GetPropertyValue(ValuePtr));
-		}
-		else if (const FIntProperty* IntProp = CastField<FIntProperty>(Prop))
-		{
-			PyValue = FString::FromInt(IntProp->GetPropertyValue(ValuePtr));
-		}
-		else if (const FNameProperty* NameProp = CastField<FNameProperty>(Prop))
-		{
-			FName Val = NameProp->GetPropertyValue(ValuePtr);
-			if (Val.IsNone()) continue;
-			PyValue = MakePythonStringLiteral_ExportBpy(Val.ToString());
-		}
-		else if (const FStrProperty* StrProp = CastField<FStrProperty>(Prop))
-		{
-			FString Val = StrProp->GetPropertyValue(ValuePtr);
-			if (Val.IsEmpty()) continue;
-			PyValue = MakePythonStringLiteral_ExportBpy(Val);
-		}
-		else
-		{
-			FString ExportedValue;
-			Prop->ExportTextItem_Direct(ExportedValue, ValuePtr, DefaultPtr, Asset, PPF_None);
-			if (ExportedValue.IsEmpty()) continue;
-			PyValue = MakePythonStringLiteral_ExportBpy(ExportedValue);
-		}
-
-		Entries.Add(FString::Printf(TEXT("    %s: %s"),
-			*MakePythonStringLiteral_ExportBpy(Prop->GetName()),
-			*PyValue));
-	}
-
-	// Build META = { "asset": ..., "asset_class": ..., "properties": {...} }
+	const TSharedPtr<FJsonObject> Meta = BuildStandaloneAssetMeta_ExportBpy(Asset);
 	FString Content;
 	Content += TEXT("# Auto-generated by ExportBpy\n\n");
-	Content += TEXT("META = {\n");
-	Content += FString::Printf(TEXT("    \"asset\": %s,\n"),
-		*MakePythonStringLiteral_ExportBpy(AssetPath));
-	Content += FString::Printf(TEXT("    \"asset_class\": %s,\n"),
-		*MakePythonStringLiteral_ExportBpy(Asset->GetClass()->GetPathName()));
-	Content += TEXT("    \"properties\": {\n");
-	for (const FString& Entry : Entries)
-	{
-		Content += TEXT("    ") + Entry + TEXT(",\n");
-	}
-	Content += TEXT("    },\n");
-	Content += TEXT("}\n");
+	Content += TEXT("META = ");
+	Content += SerializeJsonPretty_ExportBpy(Meta);
+	Content += TEXT("\n");
 
 	// Write to OutputDir/__asset__.meta.py (one file per asset, named after the asset)
 	const FString SafeName = FPaths::MakeValidFileName(Asset->GetName());

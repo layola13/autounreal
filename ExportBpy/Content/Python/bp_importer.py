@@ -71,18 +71,36 @@ def import_directory(
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
 ) -> Tuple[bool, str]:
+    details = import_directory_with_details(
+        dir_path, target_path=target_path, compile_blueprint=compile_blueprint
+    )
+    return bool(details.get("success")), str(details.get("error", ""))
+
+
+def import_directory_with_details(
+    dir_path: str,
+    target_path: Optional[str] = None,
+    compile_blueprint: bool = True,
+) -> Dict[str, Any]:
     """
-    从 DSL 目录导入蓝图。
+    从 DSL 目录导入蓝图或 standalone asset package。
     """
     if not os.path.isdir(dir_path):
-        return False, f"目录不存在: {dir_path}"
+        return _error_details(f"目录不存在: {dir_path}")
 
     try:
         bp_obj = _exec_directory_dsl(dir_path)
     except Exception as exc:
-        return False, f"执行 DSL 目录失败: {exc}"
+        return _error_details(f"执行 DSL 目录失败: {exc}")
 
-    return _import_blueprint_object(bp_obj, target_path, compile_blueprint=compile_blueprint)
+    if _is_standalone_asset_descriptor(bp_obj):
+        return _import_standalone_asset_directory(
+            dir_path, bp_obj, target_path=target_path
+        )
+
+    return _import_blueprint_object_with_details(
+        bp_obj, target_path, compile_blueprint=compile_blueprint
+    )
 
 
 def import_file(
@@ -90,23 +108,40 @@ def import_file(
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
 ) -> Tuple[bool, str]:
+    details = import_file_with_details(
+        py_path, target_path=target_path, compile_blueprint=compile_blueprint
+    )
+    return bool(details.get("success")), str(details.get("error", ""))
+
+
+def import_file_with_details(
+    py_path: str,
+    target_path: Optional[str] = None,
+    compile_blueprint: bool = True,
+) -> Dict[str, Any]:
     """
     兼容旧单文件导入。
     """
     if not os.path.isfile(py_path):
-        return False, f"文件不存在: {py_path}"
+        return _error_details(f"文件不存在: {py_path}")
 
     if os.path.basename(py_path) == MAIN_BP_FILE:
-        return import_directory(os.path.dirname(py_path), target_path, compile_blueprint=compile_blueprint)
+        return import_directory_with_details(
+            os.path.dirname(py_path),
+            target_path=target_path,
+            compile_blueprint=compile_blueprint,
+        )
     if not py_path.endswith(".bp.py"):
-        return False, f"仅支持导入 .bp.py 文件: {py_path}"
+        return _error_details(f"仅支持导入 .bp.py 文件: {py_path}")
 
     try:
         bp_obj = _exec_file_dsl(py_path)
     except Exception as exc:
-        return False, f"执行 DSL 脚本失败: {exc}"
+        return _error_details(f"执行 DSL 脚本失败: {exc}")
 
-    return _import_blueprint_object(bp_obj, target_path, compile_blueprint=compile_blueprint)
+    return _import_blueprint_object_with_details(
+        bp_obj, target_path, compile_blueprint=compile_blueprint
+    )
 
 
 def import_path(
@@ -114,9 +149,24 @@ def import_path(
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
 ) -> Tuple[bool, str]:
+    details = import_path_with_details(
+        path, target_path=target_path, compile_blueprint=compile_blueprint
+    )
+    return bool(details.get("success")), str(details.get("error", ""))
+
+
+def import_path_with_details(
+    path: str,
+    target_path: Optional[str] = None,
+    compile_blueprint: bool = True,
+) -> Dict[str, Any]:
     if os.path.isdir(path):
-        return import_directory(path, target_path, compile_blueprint=compile_blueprint)
-    return import_file(path, target_path, compile_blueprint=compile_blueprint)
+        return import_directory_with_details(
+            path, target_path=target_path, compile_blueprint=compile_blueprint
+        )
+    return import_file_with_details(
+        path, target_path=target_path, compile_blueprint=compile_blueprint
+    )
 
 
 def import_batch(files: Dict[str, str]) -> Dict[str, Any]:
@@ -138,7 +188,10 @@ def import_blueprint_object(
     """
     导入一个已经构建完成的 Blueprint 对象。
     """
-    return _import_blueprint_object(bp_obj, target_path, compile_blueprint=compile_blueprint)
+    details = _import_blueprint_object_with_details(
+        bp_obj, target_path, compile_blueprint=compile_blueprint
+    )
+    return bool(details.get("success")), str(details.get("error", ""))
 
 
 def _import_blueprint_object(
@@ -146,27 +199,49 @@ def _import_blueprint_object(
     target_path: Optional[str],
     compile_blueprint: bool = True,
 ) -> Tuple[bool, str]:
+    details = _import_blueprint_object_with_details(
+        bp_obj, target_path, compile_blueprint=compile_blueprint
+    )
+    return bool(details.get("success")), str(details.get("error", ""))
+
+
+def _import_blueprint_object_with_details(
+    bp_obj: Any,
+    target_path: Optional[str],
+    compile_blueprint: bool = True,
+) -> Dict[str, Any]:
     asset_path = target_path or bp_obj._path
     if not asset_path:
-        return False, "未指定目标资产路径，且脚本中 Blueprint(path=...) 未设置"
+        return _error_details("未指定目标资产路径，且脚本中 Blueprint(path=...) 未设置")
 
     try:
         payload = bp_obj.to_dict()
         json_str = json.dumps(payload, ensure_ascii=False, indent=2)
     except Exception as exc:
-        return False, f"序列化失败: {exc}"
+        return _error_details(f"序列化失败: {exc}")
 
     if not _HAS_UNREAL:
         print(f"[bp_importer] dry-run — target: {asset_path}")
         print(json_str[:2000])
-        return True, ""
+        return {
+            "success": True,
+            "error": "",
+            "asset_path": asset_path,
+            "import_mode": "bpy_directory",
+            "compiled": bool(compile_blueprint),
+        }
 
-    return _call_cpp_importer(json_str, asset_path, compile_blueprint=compile_blueprint)
+    ok, err = _call_cpp_importer(json_str, asset_path, compile_blueprint=compile_blueprint)
+    return {
+        "success": ok,
+        "error": err,
+        "asset_path": asset_path,
+        "import_mode": "bpy_directory",
+        "compiled": bool(ok and compile_blueprint),
+    }
 
 
 def _exec_directory_dsl(dir_path: str):
-    from ue_bp_dsl.core import Blueprint
-
     main_path = os.path.join(dir_path, MAIN_BP_FILE)
     if not os.path.isfile(main_path):
         raise FileNotFoundError(f"目录缺少 {MAIN_BP_FILE}: {dir_path}")
@@ -184,6 +259,12 @@ def _exec_directory_dsl(dir_path: str):
         bp = getattr(module, "bp", None)
         if bp is None:
             raise ValueError(f"{os.path.basename(main_path)} 未定义顶层变量 'bp'")
+
+        if _is_standalone_asset_descriptor(bp):
+            return bp
+
+        from ue_bp_dsl.core import Blueprint
+
         if not isinstance(bp, Blueprint):
             raise TypeError(f"'bp' 类型错误: 期望 Blueprint，得到 {type(bp)}")
 
@@ -202,6 +283,31 @@ def _exec_directory_dsl(dir_path: str):
         stale_keys = [key for key in sys.modules if key == package_name or key.startswith(package_name + ".")]
         for key in stale_keys:
             sys.modules.pop(key, None)
+
+
+def _is_standalone_asset_descriptor(bp_obj: Any) -> bool:
+    return isinstance(bp_obj, dict) and bp_obj.get("kind") == "standalone_asset"
+
+
+def _import_standalone_asset_directory(
+    dir_path: str,
+    descriptor: Dict[str, Any],
+    target_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    import asset_importer
+
+    _ = descriptor
+    return asset_importer.import_asset_package(dir_path, target_path=target_path)
+
+
+def _error_details(message: str) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "error": message,
+        "asset_path": "",
+        "import_mode": "bpy_directory",
+        "compiled": False,
+    }
 
 
 def _exec_file_dsl(py_path: str):

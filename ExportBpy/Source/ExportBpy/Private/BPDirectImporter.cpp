@@ -45,6 +45,9 @@
 #include "Engine/SCS_Node.h"
 #include "Components/ActorComponent.h"
 #include "Components/SceneComponent.h"
+#include "InputMappingContext.h"
+#include "InputModifiers.h"
+#include "InputTriggers.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonReader.h"
@@ -102,6 +105,47 @@ UBlueprint* LoadBlueprintAsset_ImportBpy(const FString& AssetPath)
 	}
 
 	return Cast<UBlueprint>(StaticLoadObject(UBlueprint::StaticClass(), nullptr, *ObjectPath));
+}
+
+FString NormalizeStandaloneAssetObjectPath_ImportBpy(const FString& AssetPath)
+{
+	FString Normalized = AssetPath;
+	Normalized.TrimStartAndEndInline();
+	if (Normalized.StartsWith(TEXT("/")) && !Normalized.Contains(TEXT(".")))
+	{
+		const FString AssetName = FPackageName::GetLongPackageAssetName(Normalized);
+		if (!AssetName.IsEmpty())
+		{
+			return FString::Printf(TEXT("%s.%s"), *Normalized, *AssetName);
+		}
+	}
+
+	return Normalized;
+}
+
+UObject* LoadStandaloneAsset_ImportBpy(const FString& AssetPath)
+{
+	const FString ObjectPath = NormalizeStandaloneAssetObjectPath_ImportBpy(AssetPath);
+	if (ObjectPath.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	if (UObject* Loaded = StaticLoadObject(UObject::StaticClass(), nullptr, *ObjectPath))
+	{
+		return Loaded;
+	}
+
+	const FString PackagePath = FPackageName::ObjectPathToPackageName(ObjectPath);
+	if (!PackagePath.IsEmpty())
+	{
+		if (UObject* Loaded = Cast<UObject>(UEditorAssetLibrary::LoadAsset(PackagePath)))
+		{
+			return Loaded;
+		}
+	}
+
+	return nullptr;
 }
 
 UClass* ResolveNodeClass_ImportBpy(const FString& NodeClassName)
@@ -164,6 +208,347 @@ UClass* ResolveComponentClass_ImportBpy(const FString& ComponentClassName)
 	}
 
 	return nullptr;
+}
+
+bool CreateOrReplaceStandaloneAsset_ImportBpy(
+	const FString& AssetPath,
+	const FString& AssetClassPath,
+	bool bReplaceExisting,
+	UObject*& OutAsset,
+	FString& OutError)
+{
+	OutAsset = nullptr;
+
+	const FString ObjectPath = NormalizeStandaloneAssetObjectPath_ImportBpy(AssetPath);
+	const FString PackagePath = FPackageName::ObjectPathToPackageName(ObjectPath);
+	const FString AssetName = FPackageName::ObjectPathToObjectName(ObjectPath);
+	if (PackagePath.IsEmpty() || AssetName.IsEmpty())
+	{
+		OutError = FString::Printf(TEXT("Invalid standalone asset path: %s"), *AssetPath);
+		return false;
+	}
+
+	if (!bReplaceExisting)
+	{
+		if (UObject* ExistingAsset = LoadStandaloneAsset_ImportBpy(ObjectPath))
+		{
+			OutAsset = ExistingAsset;
+			return true;
+		}
+	}
+	else if (UEditorAssetLibrary::DoesAssetExist(PackagePath))
+	{
+		if (!UEditorAssetLibrary::DeleteAsset(PackagePath))
+		{
+			OutError = FString::Printf(TEXT("Failed to delete existing asset before import: %s"), *PackagePath);
+			return false;
+		}
+	}
+
+	UClass* AssetClass = ResolveNamedObject_ImportBpy<UClass>(AssetClassPath);
+	if (!AssetClass)
+	{
+		OutError = FString::Printf(TEXT("Cannot load asset class: %s"), *AssetClassPath);
+		return false;
+	}
+
+	UPackage* Package = CreatePackage(*PackagePath);
+	if (!Package)
+	{
+		OutError = FString::Printf(TEXT("Cannot create package for asset: %s"), *PackagePath);
+		return false;
+	}
+
+	OutAsset = NewObject<UObject>(Package, AssetClass, *AssetName, RF_Public | RF_Standalone);
+	if (!OutAsset)
+	{
+		OutError = FString::Printf(TEXT("Failed to create asset: %s (%s)"), *ObjectPath, *AssetClassPath);
+		return false;
+	}
+
+	FAssetRegistryModule::AssetCreated(OutAsset);
+	return true;
+}
+
+struct FEnhancedMappingInstancedRefs_ImportBpy
+{
+	TArray<FString> ModifierNames;
+	TArray<FString> TriggerNames;
+};
+
+bool FindMatchingParenthesis_ImportBpy(const FString& Text, int32 OpenIndex, int32& OutCloseIndex)
+{
+	if (!Text.IsValidIndex(OpenIndex) || Text[OpenIndex] != TEXT('('))
+	{
+		return false;
+	}
+
+	int32 Depth = 0;
+	bool bInQuotes = false;
+	for (int32 Index = OpenIndex; Index < Text.Len(); ++Index)
+	{
+		const TCHAR Char = Text[Index];
+		if (Char == TEXT('"'))
+		{
+			bInQuotes = !bInQuotes;
+			continue;
+		}
+
+		if (bInQuotes)
+		{
+			continue;
+		}
+
+		if (Char == TEXT('('))
+		{
+			++Depth;
+		}
+		else if (Char == TEXT(')'))
+		{
+			--Depth;
+			if (Depth == 0)
+			{
+				OutCloseIndex = Index;
+				return true;
+			}
+			if (Depth < 0)
+			{
+				return false;
+			}
+		}
+	}
+
+	return false;
+}
+
+TArray<FString> SplitTopLevelCommaSeparated_ImportBpy(const FString& Text)
+{
+	TArray<FString> Results;
+	FString Current;
+	int32 Depth = 0;
+	bool bInQuotes = false;
+
+	for (int32 Index = 0; Index < Text.Len(); ++Index)
+	{
+		const TCHAR Char = Text[Index];
+		if (Char == TEXT('"'))
+		{
+			bInQuotes = !bInQuotes;
+			Current.AppendChar(Char);
+			continue;
+		}
+
+		if (!bInQuotes)
+		{
+			if (Char == TEXT('('))
+			{
+				++Depth;
+			}
+			else if (Char == TEXT(')'))
+			{
+				Depth = FMath::Max(0, Depth - 1);
+			}
+			else if (Char == TEXT(',') && Depth == 0)
+			{
+				Current.TrimStartAndEndInline();
+				if (!Current.IsEmpty())
+				{
+					Results.Add(Current);
+				}
+				Current.Reset();
+				continue;
+			}
+		}
+
+		Current.AppendChar(Char);
+	}
+
+	Current.TrimStartAndEndInline();
+	if (!Current.IsEmpty())
+	{
+		Results.Add(Current);
+	}
+
+	return Results;
+}
+
+TArray<FString> ExtractInstancedObjectNamesFromField_ImportBpy(const FString& MappingEntryText, const FString& FieldName)
+{
+	TArray<FString> Names;
+	const FString Token = FieldName + TEXT("=(");
+	const int32 TokenIndex = MappingEntryText.Find(Token, ESearchCase::CaseSensitive);
+	if (TokenIndex == INDEX_NONE)
+	{
+		return Names;
+	}
+
+	const int32 OpenIndex = TokenIndex + FieldName.Len() + 1;
+	int32 CloseIndex = INDEX_NONE;
+	if (!FindMatchingParenthesis_ImportBpy(MappingEntryText, OpenIndex, CloseIndex))
+	{
+		return Names;
+	}
+
+	const FString InnerText = MappingEntryText.Mid(OpenIndex + 1, CloseIndex - OpenIndex - 1);
+	for (FString Entry : SplitTopLevelCommaSeparated_ImportBpy(InnerText))
+	{
+		Entry.TrimStartAndEndInline();
+		if (Entry.IsEmpty() || Entry.Equals(TEXT("None"), ESearchCase::CaseSensitive))
+		{
+			continue;
+		}
+
+		if (Entry.StartsWith(TEXT("\"")) && Entry.EndsWith(TEXT("\"")) && Entry.Len() >= 2)
+		{
+			Entry = Entry.Mid(1, Entry.Len() - 2);
+		}
+
+		int32 ColonIndex = INDEX_NONE;
+		if (!Entry.FindLastChar(TEXT(':'), ColonIndex))
+		{
+			continue;
+		}
+
+		FString ObjectName = Entry.Mid(ColonIndex + 1);
+		int32 QuoteTailIndex = INDEX_NONE;
+		if (ObjectName.FindLastChar(TEXT('\''), QuoteTailIndex))
+		{
+			ObjectName = ObjectName.Left(QuoteTailIndex);
+		}
+
+		ObjectName.TrimStartAndEndInline();
+		if (!ObjectName.IsEmpty())
+		{
+			Names.Add(ObjectName);
+		}
+	}
+
+	return Names;
+}
+
+bool ParseInputMappingInstancedRefs_ImportBpy(
+	const FString& DefaultKeyMappingsText,
+	TArray<FEnhancedMappingInstancedRefs_ImportBpy>& OutRefs,
+	FString& OutError)
+{
+	OutRefs.Reset();
+
+	const FString Token = TEXT("Mappings=(");
+	const int32 TokenIndex = DefaultKeyMappingsText.Find(Token, ESearchCase::CaseSensitive);
+	if (TokenIndex == INDEX_NONE)
+	{
+		return true;
+	}
+
+	const int32 OpenIndex = TokenIndex + Token.Len() - 1;
+	int32 CloseIndex = INDEX_NONE;
+	if (!FindMatchingParenthesis_ImportBpy(DefaultKeyMappingsText, OpenIndex, CloseIndex))
+	{
+		OutError = TEXT("Failed to parse DefaultKeyMappings text: unmatched parenthesis in Mappings");
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
+		return false;
+	}
+
+	const FString InnerMappingsText = DefaultKeyMappingsText.Mid(OpenIndex + 1, CloseIndex - OpenIndex - 1);
+	for (const FString& MappingEntryText : SplitTopLevelCommaSeparated_ImportBpy(InnerMappingsText))
+	{
+		FEnhancedMappingInstancedRefs_ImportBpy MappingRefs;
+		MappingRefs.ModifierNames = ExtractInstancedObjectNamesFromField_ImportBpy(MappingEntryText, TEXT("Modifiers"));
+		MappingRefs.TriggerNames = ExtractInstancedObjectNamesFromField_ImportBpy(MappingEntryText, TEXT("Triggers"));
+		OutRefs.Add(MappingRefs);
+	}
+
+	return true;
+}
+
+bool RestoreInputMappingInstancedRefs_ImportBpy(
+	UObject* Asset,
+	const TSharedPtr<FJsonObject>* StandalonePropertiesObj,
+	FString& OutError)
+{
+	UInputMappingContext* InputMappingContext = Cast<UInputMappingContext>(Asset);
+	if (!InputMappingContext || !StandalonePropertiesObj || !(*StandalonePropertiesObj).IsValid())
+	{
+		return true;
+	}
+
+	FString DefaultKeyMappingsText;
+	if (!(*StandalonePropertiesObj)->TryGetStringField(TEXT("DefaultKeyMappings"), DefaultKeyMappingsText) ||
+		DefaultKeyMappingsText.IsEmpty())
+	{
+		return true;
+	}
+
+	TArray<FEnhancedMappingInstancedRefs_ImportBpy> ParsedRefs;
+	if (!ParseInputMappingInstancedRefs_ImportBpy(DefaultKeyMappingsText, ParsedRefs, OutError))
+	{
+		return false;
+	}
+
+	const int32 MappingCount = InputMappingContext->GetMappings().Num();
+	if (ParsedRefs.Num() != MappingCount)
+	{
+		OutError = FString::Printf(
+			TEXT("Parsed DefaultKeyMappings count mismatch for %s: parsed=%d imported=%d"),
+			*Asset->GetPathName(),
+			ParsedRefs.Num(),
+			MappingCount);
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
+		return false;
+	}
+
+	TArray<UObject*> InnerObjects;
+	GetObjectsWithOuter(Asset, InnerObjects, false);
+
+	TMap<FString, UObject*> InnerObjectMap;
+	for (UObject* InnerObject : InnerObjects)
+	{
+		if (InnerObject)
+		{
+			InnerObjectMap.Add(InnerObject->GetName(), InnerObject);
+		}
+	}
+
+	for (int32 MappingIndex = 0; MappingIndex < ParsedRefs.Num(); ++MappingIndex)
+	{
+		FEnhancedActionKeyMapping& Mapping = InputMappingContext->GetMapping(MappingIndex);
+		Mapping.Modifiers.Reset();
+		Mapping.Triggers.Reset();
+
+		for (const FString& ModifierName : ParsedRefs[MappingIndex].ModifierNames)
+		{
+			UObject* const* FoundObject = InnerObjectMap.Find(ModifierName);
+			UInputModifier* Modifier = FoundObject ? Cast<UInputModifier>(*FoundObject) : nullptr;
+			if (!Modifier)
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to resolve InputMappingContext modifier subobject '%s' on %s"),
+					*ModifierName,
+					*Asset->GetPathName());
+				UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
+				return false;
+			}
+			Mapping.Modifiers.Add(Modifier);
+		}
+
+		for (const FString& TriggerName : ParsedRefs[MappingIndex].TriggerNames)
+		{
+			UObject* const* FoundObject = InnerObjectMap.Find(TriggerName);
+			UInputTrigger* Trigger = FoundObject ? Cast<UInputTrigger>(*FoundObject) : nullptr;
+			if (!Trigger)
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to resolve InputMappingContext trigger subobject '%s' on %s"),
+					*TriggerName,
+					*Asset->GetPathName());
+				UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
+				return false;
+			}
+			Mapping.Triggers.Add(Trigger);
+		}
+	}
+
+	return true;
 }
 
 FString StripGuidSuffix_ImportBpy(const FString& RawName)
@@ -1124,6 +1509,28 @@ void ApplyJsonValueToProperty_ImportBpy(UObject* Object, FProperty* Property, co
 		return;
 	}
 
+	int32 PortFlags = PPF_None;
+	const bool bCanUseInstanceSubobjects =
+		CastField<FObjectPropertyBase>(Property) ||
+		CastField<FArrayProperty>(Property) ||
+		CastField<FSetProperty>(Property) ||
+		CastField<FMapProperty>(Property);
+	if (bCanUseInstanceSubobjects &&
+		Property->HasAnyPropertyFlags(CPF_ContainsInstancedReference | CPF_InstancedReference))
+	{
+		PortFlags |= PPF_InstanceSubobjects;
+	}
+
+	if (Value->Type == EJson::String &&
+		!CastField<FStrProperty>(Property) &&
+		!CastField<FTextProperty>(Property) &&
+		!CastField<FNameProperty>(Property))
+	{
+		const FString TextValue = Value->AsString();
+		Property->ImportText_Direct(*TextValue, PropertyAddress, Object, PortFlags);
+		return;
+	}
+
 	if (FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
 	{
 		UObject* ObjectValue = ResolveNamedObject_ImportBpy<UObject>(Value->AsString());
@@ -1185,7 +1592,7 @@ void ApplyJsonValueToProperty_ImportBpy(UObject* Object, FProperty* Property, co
 		FString TextValue = Value->AsString();
 		if (!TextValue.IsEmpty())
 		{
-			Property->ImportText_Direct(*TextValue, PropertyAddress, Object, PPF_None);
+			Property->ImportText_Direct(*TextValue, PropertyAddress, Object, PortFlags);
 		}
 	}
 }
@@ -1209,6 +1616,62 @@ void ApplyJsonObjectToObject_ImportBpy(UObject* Object, const TSharedPtr<FJsonOb
 			ApplyJsonValueToProperty_ImportBpy(Object, Property, Entry.Value);
 		}
 	}
+}
+
+bool RecreateStandaloneAssetSubobjects_ImportBpy(
+	UObject* Asset,
+	const TArray<TSharedPtr<FJsonValue>>* SubobjectValues,
+	FString& OutError)
+{
+	if (!Asset || !SubobjectValues)
+	{
+		return true;
+	}
+
+	for (const TSharedPtr<FJsonValue>& SubobjectValue : *SubobjectValues)
+	{
+		if (!SubobjectValue.IsValid() || SubobjectValue->Type != EJson::Object)
+		{
+			OutError = TEXT("Standalone asset subobject entry must be an object");
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject> SubobjectJson = SubobjectValue->AsObject();
+		FString SubobjectName;
+		FString SubobjectClassPath;
+		SubobjectJson->TryGetStringField(TEXT("name"), SubobjectName);
+		SubobjectJson->TryGetStringField(TEXT("class"), SubobjectClassPath);
+		if (SubobjectName.IsEmpty() || SubobjectClassPath.IsEmpty())
+		{
+			OutError = TEXT("Standalone asset subobject entry is missing name or class");
+			return false;
+		}
+
+		UClass* SubobjectClass = ResolveNamedObject_ImportBpy<UClass>(SubobjectClassPath);
+		if (!SubobjectClass)
+		{
+			OutError = FString::Printf(TEXT("Cannot load standalone subobject class: %s"), *SubobjectClassPath);
+			return false;
+		}
+
+		UObject* Subobject = NewObject<UObject>(Asset, SubobjectClass, *SubobjectName, RF_Public | RF_Transactional);
+		if (!Subobject)
+		{
+			OutError = FString::Printf(TEXT("Failed to create standalone subobject: %s"), *SubobjectName);
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* PropertiesJson = nullptr;
+		if (SubobjectJson->TryGetObjectField(TEXT("properties"), PropertiesJson) && PropertiesJson && PropertiesJson->IsValid())
+		{
+			ApplyJsonObjectToObject_ImportBpy(Subobject, *PropertiesJson);
+		}
+
+		Subobject->Modify();
+		Subobject->PostEditChange();
+	}
+
+	return true;
 }
 
 USCS_Node* FindComponentNodeByName_ImportBpy(UBlueprint* BP, const FString& ComponentName)
@@ -3019,15 +3482,6 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 	const FString& PropertiesJson,
 	FString& OutError)
 {
-	// Load the existing asset
-	UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *AssetPath);
-	if (!Asset)
-	{
-		OutError = FString::Printf(TEXT("Cannot load asset: %s"), *AssetPath);
-		return false;
-	}
-
-	// Parse the JSON properties dict
 	TSharedPtr<FJsonObject> PropsObj;
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PropertiesJson);
 	if (!FJsonSerializer::Deserialize(Reader, PropsObj) || !PropsObj.IsValid())
@@ -3036,8 +3490,76 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 		return false;
 	}
 
-	// Apply properties using the shared reflection helper (same as component property import)
-	ApplyJsonObjectToObject_ImportBpy(Asset, PropsObj);
+	const TSharedPtr<FJsonObject>* StandalonePropertiesObj = nullptr;
+	const TArray<TSharedPtr<FJsonValue>>* StandaloneSubobjects = nullptr;
+	const bool bHasStandaloneProperties = PropsObj->TryGetObjectField(TEXT("properties"), StandalonePropertiesObj);
+	const bool bHasStandaloneSubobjects = PropsObj->TryGetArrayField(TEXT("subobjects"), StandaloneSubobjects);
+	const bool bIsStandaloneMeta =
+		bHasStandaloneProperties ||
+		bHasStandaloneSubobjects ||
+		PropsObj->HasField(TEXT("asset_class"));
+
+	FString EffectiveAssetPath = NormalizeStandaloneAssetObjectPath_ImportBpy(AssetPath);
+	if (EffectiveAssetPath.IsEmpty())
+	{
+		PropsObj->TryGetStringField(TEXT("asset"), EffectiveAssetPath);
+		EffectiveAssetPath = NormalizeStandaloneAssetObjectPath_ImportBpy(EffectiveAssetPath);
+	}
+
+	if (EffectiveAssetPath.IsEmpty())
+	{
+		OutError = TEXT("Standalone asset import is missing a target asset path");
+		return false;
+	}
+
+	UObject* Asset = nullptr;
+	if (bIsStandaloneMeta)
+	{
+		FString AssetClassPath;
+		PropsObj->TryGetStringField(TEXT("asset_class"), AssetClassPath);
+		if (AssetClassPath.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("Standalone asset meta is missing asset_class: %s"), *EffectiveAssetPath);
+			return false;
+		}
+
+		if (!CreateOrReplaceStandaloneAsset_ImportBpy(
+			EffectiveAssetPath,
+			AssetClassPath,
+			true,
+			Asset,
+			OutError))
+		{
+			return false;
+		}
+
+		Asset->Modify();
+		if (!RecreateStandaloneAssetSubobjects_ImportBpy(Asset, StandaloneSubobjects, OutError))
+		{
+			return false;
+		}
+
+		if (StandalonePropertiesObj && StandalonePropertiesObj->IsValid())
+		{
+			ApplyJsonObjectToObject_ImportBpy(Asset, *StandalonePropertiesObj);
+			if (!RestoreInputMappingInstancedRefs_ImportBpy(Asset, StandalonePropertiesObj, OutError))
+			{
+				return false;
+			}
+		}
+	}
+	else
+	{
+		Asset = LoadStandaloneAsset_ImportBpy(EffectiveAssetPath);
+		if (!Asset)
+		{
+			OutError = FString::Printf(TEXT("Cannot load asset: %s"), *EffectiveAssetPath);
+			return false;
+		}
+
+		Asset->Modify();
+		ApplyJsonObjectToObject_ImportBpy(Asset, PropsObj);
+	}
 
 	// Mark dirty and save
 	UPackage* Package = Asset->GetOutermost();
@@ -3047,6 +3569,7 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 		return false;
 	}
 
+	Asset->PostEditChange();
 	Package->MarkPackageDirty();
 
 	const FString PackageName     = Package->GetName();

@@ -42,6 +42,7 @@ public class ExportBpy : ModuleRules
 			"Kismet",
 			"AnimGraph",
 			"AnimGraphRuntime",
+			"EnhancedInput",
 
 			// JSON
 			"Json",

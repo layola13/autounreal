@@ -44,10 +44,10 @@ public:
 
 	/**
 	 * 将独立资产（InputAction / InputMappingContext / Chooser / PoseSearchDatabase 等）
-	 * 的属性从一个扁平 JSON 属性字典字符串写回到已有资产。
+	 * 从旧的扁平属性 JSON，或新的 standalone asset meta JSON，导入到目标资产。
 	 *
-	 * @param AssetPath       Unreal 软对象路径，资产必须已存在
-	 * @param PropertiesJson  JSON 对象字符串，key = 属性名，value = 属性值
+	 * @param AssetPath       Unreal 软对象路径；新 meta 模式下可用于覆盖 META 中的 asset 路径
+	 * @param PropertiesJson  JSON 对象字符串；支持 flat properties 和完整 standalone meta
 	 * @param OutError        失败时的错误信息
 	 * @return                true 表示成功
 	 */

@@ -99,7 +99,7 @@ public:
 
 	/**
 	 * 导出独立资产（InputAction / InputMappingContext / Chooser / PoseSearchDatabase 等）
-	 * 的非默认属性到 __asset__.meta.py 文件。
+	 * 的 standalone meta 到 __asset__.meta.py 文件。
 	 *
 	 * @param AssetPath   Unreal 软对象路径，例如 /Game/Input/Actions/IA_Jump.IA_Jump
 	 * @param OutputDir   输出目录（文件名固定为 __asset__.meta.py）

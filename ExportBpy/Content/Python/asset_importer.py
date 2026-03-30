@@ -1,55 +1,36 @@
 # Copyright sonygodx@gmail.com. All Rights Reserved.
 # -*- coding: utf-8 -*-
 """
-asset_importer.py — 将 __asset__.meta.py 中的属性重新写入 Unreal 独立资产
+asset_importer.py — 导入独立 UE 资产。
 
-支持的资产类型（不限于）：
-  - InputAction
-  - InputMappingContext
-  - ChooserTable
-  - PoseSearchDatabase
-
-用法：
-    import asset_importer
-
-    # 导入单个 meta 文件
-    ok, err = asset_importer.import_asset_meta(
-        "F:/project/thirdperson57/ExportedBlueprints/assets/IA_Jump__asset__.meta.py"
-    )
-
-    # 批量导入目录下所有 meta 文件
-    results = asset_importer.import_asset_meta_dir(
-        "F:/project/thirdperson57/ExportedBlueprints/assets"
-    )
+兼容两种输入格式：
+  1. 旧格式：__asset__.meta.py
+  2. 新格式：package_dir/__bp__.bp.py + package_dir/asset_meta.py
 """
 
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import os
 from typing import Any, Dict, Optional, Tuple
 
 try:
     import unreal  # type: ignore
+
     _HAS_UNREAL = True
 except ImportError:
     _HAS_UNREAL = False
 
 
-def import_asset_meta(meta_path: str) -> Tuple[bool, str]:
+MAIN_BP_FILE = "__bp__.bp.py"
+DEFAULT_META_FILE = "asset_meta.py"
+
+
+def import_asset_meta(meta_path: str, target_path: Optional[str] = None) -> Tuple[bool, str]:
     """
-    读取一个 *__asset__.meta.py 文件，将其 META["properties"] 写回到
-    META["asset"] 指定的 Unreal 资产。
-
-    参数
-    ----
-    meta_path : str
-        __asset__.meta.py 文件的绝对路径
-
-    返回
-    ----
-    (ok, error_message)
+    读取一个 *__asset__.meta.py 或 asset_meta.py，并写回到目标资产。
     """
     if not os.path.isfile(meta_path):
         return False, f"meta 文件不存在: {meta_path}"
@@ -58,23 +39,77 @@ def import_asset_meta(meta_path: str) -> Tuple[bool, str]:
     if meta is None:
         return False, f"无法解析 META 字典: {meta_path}"
 
-    asset_path = meta.get("asset", "")
-    if not asset_path:
-        return False, f"META 缺少 'asset' 字段: {meta_path}"
+    details = import_asset_meta_dict(meta, target_path=target_path)
+    return bool(details.get("success")), str(details.get("error", ""))
 
-    properties: Dict[str, Any] = meta.get("properties", {})
-    if not properties:
-        # 没有属性需要写入，视为成功
-        return True, ""
 
-    return _apply_properties(asset_path, properties)
+def import_asset_meta_dict(meta: Dict[str, Any], target_path: Optional[str] = None) -> Dict[str, Any]:
+    normalized_target_path = _normalize_asset_path(target_path or meta.get("asset", ""))
+    if not normalized_target_path:
+        return {"success": False, "error": "META 缺少目标资产路径"}
+
+    rewritten_meta = _rewrite_meta_for_target(meta, normalized_target_path)
+    ok, err = _apply_asset_meta(normalized_target_path, rewritten_meta)
+    return {
+        "success": ok,
+        "error": err,
+        "asset_path": normalized_target_path,
+        "import_mode": "standalone_asset_meta",
+        "compiled": False,
+    }
+
+
+def import_asset_package(package_path: str, target_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    导入一个 standalone asset bpy package。
+    """
+    package_dir, main_path = _resolve_package_inputs(package_path)
+    if not package_dir or not os.path.isfile(main_path):
+        return {
+            "success": False,
+            "error": f"找不到 standalone asset package: {package_path}",
+            "import_mode": "standalone_asset_package",
+            "compiled": False,
+        }
+
+    descriptor = _load_python_literal(main_path, "bp")
+    if not isinstance(descriptor, dict) or descriptor.get("kind") != "standalone_asset":
+        return {
+            "success": False,
+            "error": f"不是 standalone asset package: {main_path}",
+            "import_mode": "standalone_asset_package",
+            "compiled": False,
+        }
+
+    meta_file = descriptor.get("meta_file", DEFAULT_META_FILE)
+    meta_path = os.path.join(package_dir, meta_file)
+    if not os.path.isfile(meta_path):
+        return {
+            "success": False,
+            "error": f"standalone asset package 缺少 meta 文件: {meta_path}",
+            "import_mode": "standalone_asset_package",
+            "compiled": False,
+        }
+
+    meta = _load_meta_dict(meta_path)
+    if meta is None:
+        return {
+            "success": False,
+            "error": f"无法解析 META 字典: {meta_path}",
+            "import_mode": "standalone_asset_package",
+            "compiled": False,
+        }
+
+    details = import_asset_meta_dict(meta, target_path=target_path)
+    details["import_mode"] = "standalone_asset_package"
+    details["package_dir"] = package_dir
+    details["meta_path"] = meta_path
+    return details
 
 
 def import_asset_meta_dir(dir_path: str) -> Dict[str, Any]:
     """
     批量导入目录下所有 *__asset__.meta.py 文件。
-
-    返回 {"succeeded": [...], "failed": [...]} 字典。
     """
     if not os.path.isdir(dir_path):
         return {"succeeded": [], "failed": [{"asset": dir_path, "error": "目录不存在"}]}
@@ -93,45 +128,134 @@ def import_asset_meta_dir(dir_path: str) -> Dict[str, Any]:
     return {"succeeded": succeeded, "failed": failed}
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+def _resolve_package_inputs(package_path: str) -> Tuple[str, str]:
+    normalized_path = os.path.abspath(package_path)
+    if os.path.isdir(normalized_path):
+        return normalized_path, os.path.join(normalized_path, MAIN_BP_FILE)
+
+    if os.path.isfile(normalized_path) and os.path.basename(normalized_path) == MAIN_BP_FILE:
+        return os.path.dirname(normalized_path), normalized_path
+
+    return "", ""
+
+
+def _normalize_asset_path(asset_path: str) -> str:
+    normalized = (asset_path or "").strip()
+    if normalized.startswith("/") and "." not in normalized:
+        asset_name = normalized.rsplit("/", 1)[-1]
+        if asset_name:
+            return f"{normalized}.{asset_name}"
+    return normalized
+
 
 def _load_meta_dict(meta_path: str) -> Optional[Dict[str, Any]]:
-    """静态解析 __asset__.meta.py，提取 META 字典（不执行代码）。"""
-    with open(meta_path, "r", encoding="utf-8") as fh:
-        tree = ast.parse(fh.read(), filename=meta_path)
+    return _load_python_literal(meta_path, "META")
+
+
+def _load_python_literal(py_path: str, variable_name: str) -> Optional[Dict[str, Any]]:
+    with open(py_path, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=py_path)
 
     for stmt in tree.body:
         if not isinstance(stmt, ast.Assign):
             continue
         for target in stmt.targets:
-            if isinstance(target, ast.Name) and target.id == "META":
+            if isinstance(target, ast.Name) and target.id == variable_name:
                 value = ast.literal_eval(stmt.value)
                 return value if isinstance(value, dict) else None
     return None
 
 
-def _apply_properties(asset_path: str, properties: Dict[str, Any]) -> Tuple[bool, str]:
-    """将 properties 字典 JSON 序列化后调用 C++ ImportStandaloneAssetFromJson。"""
+def _rewrite_meta_for_target(meta: Dict[str, Any], target_asset_path: str) -> Dict[str, Any]:
+    rewritten = copy.deepcopy(meta)
+    source_asset_path = _normalize_asset_path(rewritten.get("asset", ""))
+    target_asset_path = _normalize_asset_path(target_asset_path)
+
+    rewritten["kind"] = rewritten.get("kind", "standalone_asset")
+    rewritten["asset"] = target_asset_path
+
+    if target_asset_path.startswith("/") and "." in target_asset_path:
+        rewritten["package"] = target_asset_path.rsplit(".", 1)[0]
+        rewritten["outer"] = target_asset_path.rsplit(".", 1)[0]
+
+    if source_asset_path and source_asset_path != target_asset_path:
+        rewritten = _deep_replace_asset_path(rewritten, source_asset_path, target_asset_path)
+        rewritten["asset"] = target_asset_path
+        if target_asset_path.startswith("/") and "." in target_asset_path:
+            rewritten["package"] = target_asset_path.rsplit(".", 1)[0]
+            rewritten["outer"] = target_asset_path.rsplit(".", 1)[0]
+
+    return rewritten
+
+
+def _deep_replace_asset_path(value: Any, source_asset_path: str, target_asset_path: str) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _deep_replace_asset_path(item, source_asset_path, target_asset_path)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _deep_replace_asset_path(item, source_asset_path, target_asset_path)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return value.replace(source_asset_path, target_asset_path)
+    return value
+
+
+def _apply_asset_meta(asset_path: str, meta: Dict[str, Any]) -> Tuple[bool, str]:
     try:
-        props_json = json.dumps(properties, ensure_ascii=False)
+        meta_json = json.dumps(meta, ensure_ascii=False)
     except Exception as exc:
-        return False, f"序列化 properties 失败: {exc}"
+        return False, f"序列化 META 失败: {exc}"
 
     if not _HAS_UNREAL:
-        # dry-run
         print(f"[asset_importer] dry-run — asset: {asset_path}")
-        print(props_json[:1000])
+        print(meta_json[:2000])
         return True, ""
 
-    result = unreal.BPDirectImporter.import_standalone_asset_from_json(
-        asset_path, props_json
-    )
-    return _normalize_result(result)
+    try:
+        result = unreal.BPDirectImporter.import_standalone_asset_from_json(
+            asset_path, meta_json
+        )
+    except Exception as exc:
+        return False, str(exc)
+
+    return _normalize_result(result, asset_path)
 
 
-def _normalize_result(result) -> Tuple[bool, str]:
+def _normalize_result(result, asset_path: str) -> Tuple[bool, str]:
+    success: Optional[bool] = None
+    error_text = ""
+
     if isinstance(result, tuple):
-        ok = bool(result[0]) if result else False
-        err = str(result[1]) if len(result) > 1 else ""
-        return ok, err
-    return bool(result), ""
+        if result:
+            first = result[0]
+            if isinstance(first, bool):
+                success = first
+            elif first is not None:
+                success = bool(first)
+        if len(result) > 1 and result[1] is not None:
+            error_text = str(result[1])
+    elif isinstance(result, str):
+        success = True
+        error_text = result
+    elif isinstance(result, bool):
+        success = result
+    elif result is None:
+        success = False
+    else:
+        success = bool(result)
+
+    if success is None:
+        return False, error_text or "C++ importer did not return a success flag"
+    if success is False:
+        return False, error_text or "C++ importer returned failure without an error message"
+
+    if hasattr(unreal, "EditorAssetLibrary") and not unreal.EditorAssetLibrary.does_asset_exist(
+        asset_path.rsplit(".", 1)[0]
+    ):
+        return False, error_text or f"C++ importer reported success but asset does not exist: {asset_path}"
+
+    return True, error_text

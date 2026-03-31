@@ -22,6 +22,7 @@
 #include "K2Node_IfThenElse.h"
 #include "K2Node_ExecutionSequence.h"
 #include "K2Node_DynamicCast.h"
+#include "K2Node_GetSubsystem.h"
 #include "K2Node_Message.h"
 #include "K2Node_Select.h"
 #include "K2Node_SwitchEnum.h"
@@ -39,6 +40,7 @@
 #include "Components/SceneComponent.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
+#include "InputAction.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "UObject/UObjectGlobals.h"
@@ -446,6 +448,69 @@ bool ShouldSkipStandaloneProperty_ExportBpy(const FProperty* Property)
 	return !Property || Property->HasAnyPropertyFlags(CPF_Transient | CPF_EditorOnly | CPF_Deprecated);
 }
 
+FString MakeInstancedObjectReferenceLiteral_ExportBpy(const UObject* Object)
+{
+	if (!Object)
+	{
+		return TEXT("");
+	}
+
+	return FString::Printf(
+		TEXT("\"%s'%s'\""),
+		*Object->GetClass()->GetPathName(),
+		*Object->GetPathName());
+}
+
+template <typename TObjectType>
+FString SerializeInstancedObjectArray_ExportBpy(const TArray<TObjectPtr<TObjectType>>& Objects)
+{
+	FString Result = TEXT("(");
+	bool bFirst = true;
+
+	for (TObjectType* Object : Objects)
+	{
+		if (!Object)
+		{
+			continue;
+		}
+
+		if (!bFirst)
+		{
+			Result += TEXT(",");
+		}
+		bFirst = false;
+		Result += MakeInstancedObjectReferenceLiteral_ExportBpy(Object);
+	}
+
+	Result += TEXT(")");
+	return Result;
+}
+
+void AppendInputActionStandaloneProperties_ExportBpy(
+	UObject* Asset,
+	const TSharedPtr<FJsonObject>& PropertiesJson)
+{
+	UInputAction* const InputAction = Cast<UInputAction>(Asset);
+	if (!InputAction || !PropertiesJson.IsValid())
+	{
+		return;
+	}
+
+	if (InputAction->Triggers.Num() > 0)
+	{
+		PropertiesJson->SetStringField(
+			TEXT("Triggers"),
+			SerializeInstancedObjectArray_ExportBpy(InputAction->Triggers));
+	}
+
+	if (InputAction->Modifiers.Num() > 0)
+	{
+		PropertiesJson->SetStringField(
+			TEXT("Modifiers"),
+			SerializeInstancedObjectArray_ExportBpy(InputAction->Modifiers));
+	}
+}
+
 TSharedPtr<FJsonObject> SerializeObjectProperties_ExportBpy(UObject* Object, const UObject* DefaultsObject)
 {
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -525,9 +590,12 @@ TSharedPtr<FJsonObject> BuildStandaloneAssetMeta_ExportBpy(UObject* Asset)
 	Meta->SetStringField(TEXT("export_type"), TEXT("generic_object"));
 	Meta->SetStringField(TEXT("outer"), Asset->GetOuter() ? Asset->GetOuter()->GetPathName() : TEXT(""));
 	Meta->SetStringField(TEXT("package"), Asset->GetOutermost() ? Asset->GetOutermost()->GetName() : TEXT(""));
+	TSharedPtr<FJsonObject> PropertiesJson =
+		SerializeObjectProperties_ExportBpy(Asset, Asset->GetClass()->GetDefaultObject(false));
+	AppendInputActionStandaloneProperties_ExportBpy(Asset, PropertiesJson);
 	Meta->SetObjectField(
 		TEXT("properties"),
-		SerializeObjectProperties_ExportBpy(Asset, Asset->GetClass()->GetDefaultObject(false)));
+		PropertiesJson);
 	Meta->SetArrayField(TEXT("subobjects"), SerializeStandaloneSubobjects_ExportBpy(Asset));
 	return Meta;
 }
@@ -1068,6 +1136,29 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 			Info.FunctionName = MacroGraph->GetName();
 			Info.TargetType = MacroGraph->GetPathName();
 			Info.NodeProps.Add(TEXT("MacroGraph"), MacroGraph->GetPathName());
+		}
+	}
+	else if (const UK2Node_GetSubsystem* GetSubsystemNode = Cast<UK2Node_GetSubsystem>(Node))
+	{
+		UClass* SubsystemClass = nullptr;
+
+		if (UEdGraphPin* ResultPin = GetSubsystemNode->GetResultPin())
+		{
+			SubsystemClass = Cast<UClass>(ResultPin->PinType.PinSubCategoryObject.Get());
+		}
+
+		if (!SubsystemClass)
+		{
+			if (UEdGraphPin* ClassPin = GetSubsystemNode->GetClassPin())
+			{
+				SubsystemClass = Cast<UClass>(ClassPin->DefaultObject);
+			}
+		}
+
+		if (SubsystemClass)
+		{
+			Info.TargetType = SubsystemClass->GetPathName();
+			Info.NodeProps.Add(TEXT("CustomClass"), SubsystemClass->GetPathName());
 		}
 	}
 
@@ -2379,15 +2470,22 @@ bool UBPDirectExporter::GenerateGraphFile(
 	};
 
 	Lines += TEXT("        # Nodes\n");
-	for (const FNodeInfo& Info : NodeInfos)
+	if (NodeInfos.IsEmpty())
 	{
-		Lines += TEXT("        ") + NodeToCtorLine(Info) + TEXT("\n");
-		for (const FString& DefaultLine : NodeToDefaultValueLines(Info))
-		{
-			Lines += TEXT("        ") + DefaultLine + TEXT("\n");
-		}
+		Lines += TEXT("        pass\n\n");
 	}
-	Lines += TEXT("\n");
+	else
+	{
+		for (const FNodeInfo& Info : NodeInfos)
+		{
+			Lines += TEXT("        ") + NodeToCtorLine(Info) + TEXT("\n");
+			for (const FString& DefaultLine : NodeToDefaultValueLines(Info))
+			{
+				Lines += TEXT("        ") + DefaultLine + TEXT("\n");
+			}
+		}
+		Lines += TEXT("\n");
+	}
 
 	AppendConnectionSections(Lines);
 

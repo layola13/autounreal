@@ -33,6 +33,7 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "KismetCompiler.h"
+#include "Editor.h"
 #include "AssetToolsModule.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "PackageTools.h"
@@ -45,9 +46,11 @@
 #include "Engine/SCS_Node.h"
 #include "Components/ActorComponent.h"
 #include "Components/SceneComponent.h"
+#include "InputAction.h"
 #include "InputMappingContext.h"
 #include "InputModifiers.h"
 #include "InputTriggers.h"
+#include "InputCoreTypes.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonReader.h"
@@ -59,6 +62,8 @@
 namespace
 {
 USCS_Node* FindComponentNodeByName_ImportBpy(UBlueprint* BP, const FString& ComponentName);
+FString GetNodePropString_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson, const TCHAR* Key);
+UClass* ResolveNodeClass_ImportBpy(const FString& NodeClassName);
 
 template <typename TObject>
 TObject* ResolveNamedObject_ImportBpy(const FString& Name)
@@ -77,7 +82,55 @@ TObject* ResolveNamedObject_ImportBpy(const FString& Name)
 		return Found;
 	}
 
-	return Cast<TObject>(StaticLoadObject(TObject::StaticClass(), nullptr, *Name));
+	auto TryLoad = [](const FString& Candidate) -> TObject*
+	{
+		if (Candidate.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		if (TObject* Loaded = Cast<TObject>(UEditorAssetLibrary::LoadAsset(Candidate)))
+		{
+			return Loaded;
+		}
+
+		return Cast<TObject>(StaticLoadObject(TObject::StaticClass(), nullptr, *Candidate));
+	};
+
+	if (TObject* Loaded = TryLoad(Name))
+	{
+		return Loaded;
+	}
+
+	FString PackagePath = Name;
+	FString ObjectPath = Name;
+	if (const int32 DotIndex = Name.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd); DotIndex != INDEX_NONE)
+	{
+		PackagePath = Name.Left(DotIndex);
+	}
+	else if (Name.StartsWith(TEXT("/")))
+	{
+		const FString AssetName = FPaths::GetBaseFilename(Name);
+		ObjectPath = FString::Printf(TEXT("%s.%s"), *Name, *AssetName);
+	}
+
+	if (PackagePath != Name)
+	{
+		if (TObject* Loaded = TryLoad(PackagePath))
+		{
+			return Loaded;
+		}
+	}
+
+	if (ObjectPath != Name)
+	{
+		if (TObject* Loaded = TryLoad(ObjectPath))
+		{
+			return Loaded;
+		}
+	}
+
+	return nullptr;
 }
 
 UBlueprint* LoadBlueprintAsset_ImportBpy(const FString& AssetPath)
@@ -201,6 +254,295 @@ UObject* LoadStandaloneAsset_ImportBpy(const FString& AssetPath)
 	return nullptr;
 }
 
+FString ResolveEnhancedInputActionRef_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson)
+{
+	if (!NodeJson.IsValid())
+	{
+		return FString();
+	}
+
+	FString ActionRef = GetNodePropString_ImportBpy(NodeJson, TEXT("InputAction"));
+	if (!ActionRef.IsEmpty())
+	{
+		return ActionRef;
+	}
+
+	NodeJson->TryGetStringField(TEXT("input_action_path"), ActionRef);
+	if (!ActionRef.IsEmpty())
+	{
+		return ActionRef;
+	}
+
+	NodeJson->TryGetStringField(TEXT("input_action"), ActionRef);
+	if (!ActionRef.IsEmpty())
+	{
+		return ActionRef;
+	}
+
+	NodeJson->TryGetStringField(TEXT("member_name"), ActionRef);
+	return ActionRef;
+}
+
+UInputAction* ResolveInputActionAsset_ImportBpy(const FString& ActionRef)
+{
+	if (ActionRef.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	if (UInputAction* InputAction = ResolveNamedObject_ImportBpy<UInputAction>(ActionRef))
+	{
+		return InputAction;
+	}
+
+	const FString NormalizedObjectPath = NormalizeStandaloneAssetObjectPath_ImportBpy(ActionRef);
+	if (!NormalizedObjectPath.Equals(ActionRef, ESearchCase::CaseSensitive))
+	{
+		if (UInputAction* InputAction = ResolveNamedObject_ImportBpy<UInputAction>(NormalizedObjectPath))
+		{
+			return InputAction;
+		}
+	}
+
+	FString AssetName = ActionRef;
+	if (ActionRef.StartsWith(TEXT("/")))
+	{
+		AssetName = FPackageName::GetLongPackageAssetName(ActionRef);
+		if (AssetName.IsEmpty())
+		{
+			AssetName = FPaths::GetBaseFilename(ActionRef);
+		}
+	}
+	else if (ActionRef.Contains(TEXT(".")))
+	{
+		AssetName = FPaths::GetBaseFilename(ActionRef);
+	}
+
+	AssetName.TrimStartAndEndInline();
+	if (AssetName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	TArray<FAssetData> Assets;
+	AssetRegistryModule.Get().GetAssetsByClass(UInputAction::StaticClass()->GetClassPathName(), Assets, true);
+	for (const FAssetData& Asset : Assets)
+	{
+		if (Asset.AssetName.ToString().Equals(AssetName, ESearchCase::IgnoreCase))
+		{
+			return Cast<UInputAction>(Asset.GetAsset());
+		}
+	}
+
+	return nullptr;
+}
+
+bool IsEnhancedInputActionNode_ImportBpy(const UEdGraphNode* Node)
+{
+	return Node && Node->GetClass() && Node->GetClass()->GetName().Equals(TEXT("K2Node_EnhancedInputAction"), ESearchCase::CaseSensitive);
+}
+
+FString ResolveGetSubsystemTargetTypeRef_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson)
+{
+	if (!NodeJson.IsValid())
+	{
+		return FString();
+	}
+
+	FString TargetType;
+	if (NodeJson->TryGetStringField(TEXT("target_type"), TargetType) && !TargetType.IsEmpty())
+	{
+		return TargetType;
+	}
+
+	const TSharedPtr<FJsonObject>* NodePropsObj = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("node_props"), NodePropsObj) && NodePropsObj && NodePropsObj->IsValid())
+	{
+		if ((*NodePropsObj)->TryGetStringField(TEXT("CustomClass"), TargetType) && !TargetType.IsEmpty())
+		{
+			return TargetType;
+		}
+
+		if ((*NodePropsObj)->TryGetStringField(TEXT("TargetType"), TargetType) && !TargetType.IsEmpty())
+		{
+			return TargetType;
+		}
+	}
+
+	return FString();
+}
+
+bool IsGetSubsystemNode_ImportBpy(const UEdGraphNode* Node)
+{
+	if (!Node || !Node->GetClass())
+	{
+		return false;
+	}
+
+	const FString ClassName = Node->GetClass()->GetName();
+	return ClassName.Equals(TEXT("K2Node_GetSubsystem"), ESearchCase::CaseSensitive)
+		|| ClassName.Equals(TEXT("K2Node_GetSubsystemFromPC"), ESearchCase::CaseSensitive)
+		|| ClassName.Equals(TEXT("K2Node_GetEngineSubsystem"), ESearchCase::CaseSensitive)
+		|| ClassName.Equals(TEXT("K2Node_GetEditorSubsystem"), ESearchCase::CaseSensitive);
+}
+
+bool ApplyGetSubsystemClassToNode_ImportBpy(
+	UEdGraphNode* Node,
+	const TSharedPtr<FJsonObject>& NodeJson,
+	FString& OutError)
+{
+	if (!IsGetSubsystemNode_ImportBpy(Node))
+	{
+		return true;
+	}
+
+	const FString TargetType = ResolveGetSubsystemTargetTypeRef_ImportBpy(NodeJson);
+	if (TargetType.IsEmpty())
+	{
+		return true;
+	}
+
+	UClass* const SubsystemClass = ResolveNamedObject_ImportBpy<UClass>(TargetType);
+	if (!SubsystemClass)
+	{
+		OutError = FString::Printf(
+			TEXT("Cannot resolve subsystem class '%s' on node %s"),
+			*TargetType,
+			*DescribeNode_ImportBpy(Node));
+		return false;
+	}
+
+	FProperty* const Property = Node->GetClass()->FindPropertyByName(TEXT("CustomClass"));
+	FObjectPropertyBase* const ObjectProperty = CastField<FObjectPropertyBase>(Property);
+	void* const PropertyAddress = ObjectProperty ? ObjectProperty->ContainerPtrToValuePtr<void>(Node) : nullptr;
+	if (!ObjectProperty || !PropertyAddress)
+	{
+		OutError = FString::Printf(
+			TEXT("GetSubsystem node %s does not expose CustomClass property for import"),
+			*DescribeNode_ImportBpy(Node));
+		return false;
+	}
+
+	Node->Modify();
+	ObjectProperty->SetObjectPropertyValue(PropertyAddress, SubsystemClass);
+
+	if (UEdGraphPin* ClassPin = Node->FindPin(TEXT("Class")))
+	{
+		ClassPin->DefaultObject = SubsystemClass;
+		ClassPin->DefaultValue = SubsystemClass->GetPathName();
+		ClassPin->AutogeneratedDefaultValue = ClassPin->DefaultValue;
+	}
+
+	if (UEdGraphPin* ResultPin = Node->FindPin(UEdGraphSchema_K2::PN_ReturnValue))
+	{
+		ResultPin->PinType.PinSubCategoryObject = SubsystemClass;
+	}
+
+	return true;
+}
+
+bool ApplyEnhancedInputActionToNode_ImportBpy(
+	UEdGraphNode* Node,
+	const TSharedPtr<FJsonObject>& NodeJson,
+	FString& OutError)
+{
+	if (!IsEnhancedInputActionNode_ImportBpy(Node))
+	{
+		return true;
+	}
+
+	const FString ActionRef = ResolveEnhancedInputActionRef_ImportBpy(NodeJson);
+	if (ActionRef.IsEmpty())
+	{
+		return true;
+	}
+
+	UInputAction* const InputAction = ResolveInputActionAsset_ImportBpy(ActionRef);
+	if (!InputAction)
+	{
+		OutError = FString::Printf(
+			TEXT("Cannot resolve enhanced input action '%s' on node %s"),
+			*ActionRef,
+			*DescribeNode_ImportBpy(Node));
+		return false;
+	}
+
+	FProperty* const Property = Node->GetClass()->FindPropertyByName(TEXT("InputAction"));
+	FObjectPropertyBase* const ObjectProperty = CastField<FObjectPropertyBase>(Property);
+	void* const PropertyAddress = ObjectProperty ? Property->ContainerPtrToValuePtr<void>(Node) : nullptr;
+	if (!ObjectProperty || !PropertyAddress)
+	{
+		OutError = FString::Printf(
+			TEXT("Enhanced input node %s does not expose InputAction property for import"),
+			*DescribeNode_ImportBpy(Node));
+		return false;
+	}
+
+	Node->Modify();
+	ObjectProperty->SetObjectPropertyValue(PropertyAddress, InputAction);
+
+	if (UEdGraphPin* ActionPin = Node->FindPin(TEXT("InputAction")))
+	{
+		ActionPin->DefaultObject = InputAction;
+		ActionPin->DefaultValue = InputAction->GetPathName();
+		ActionPin->AutogeneratedDefaultValue = ActionPin->DefaultValue;
+	}
+
+	return true;
+}
+
+UEdGraphNode* CreateEnhancedInputActionNode_ImportBpy(
+	UEdGraph* Graph,
+	const TSharedPtr<FJsonObject>& NodeJson,
+	FString& OutError)
+{
+	if (!Graph || !NodeJson.IsValid())
+	{
+		return nullptr;
+	}
+
+	const FString ActionRef = ResolveEnhancedInputActionRef_ImportBpy(NodeJson);
+	if (!ResolveInputActionAsset_ImportBpy(ActionRef))
+	{
+		OutError = FString::Printf(TEXT("Cannot resolve enhanced input action '%s'"), *ActionRef);
+		return nullptr;
+	}
+
+	UClass* const EnhancedInputNodeClass = ResolveNodeClass_ImportBpy(TEXT("K2Node_EnhancedInputAction"));
+	if (!EnhancedInputNodeClass || !EnhancedInputNodeClass->IsChildOf(UEdGraphNode::StaticClass()))
+	{
+		OutError = TEXT("Cannot resolve K2Node_EnhancedInputAction class");
+		return nullptr;
+	}
+
+	UEdGraphNode* ActionNode = NewObject<UEdGraphNode>(Graph, EnhancedInputNodeClass);
+	if (!ActionNode)
+	{
+		OutError = TEXT("Failed to allocate K2Node_EnhancedInputAction");
+		return nullptr;
+	}
+
+	ActionNode->CreateNewGuid();
+	ActionNode->PostPlacedNewNode();
+	Graph->AddNode(ActionNode, false, false);
+	if (!ApplyEnhancedInputActionToNode_ImportBpy(ActionNode, NodeJson, OutError))
+	{
+		return nullptr;
+	}
+	ActionNode->AllocateDefaultPins();
+	if (!ApplyEnhancedInputActionToNode_ImportBpy(ActionNode, NodeJson, OutError))
+	{
+		return nullptr;
+	}
+	ActionNode->ReconstructNode();
+	if (!ApplyEnhancedInputActionToNode_ImportBpy(ActionNode, NodeJson, OutError))
+	{
+		return nullptr;
+	}
+	return ActionNode;
+}
+
 UClass* ResolveNodeClass_ImportBpy(const FString& NodeClassName)
 {
 	if (NodeClassName.IsEmpty())
@@ -215,7 +557,19 @@ UClass* ResolveNodeClass_ImportBpy(const FString& NodeClassName)
 
 	if (NodeClassName.StartsWith(TEXT("K2Node_")))
 	{
-		return ResolveNamedObject_ImportBpy<UClass>(FString::Printf(TEXT("/Script/BlueprintGraph.%s"), *NodeClassName));
+		static const TCHAR* ScriptModules[] = {
+			TEXT("BlueprintGraph"),
+			TEXT("InputBlueprintNodes"),
+		};
+
+		for (const TCHAR* ModuleName : ScriptModules)
+		{
+			if (UClass* NodeClass = ResolveNamedObject_ImportBpy<UClass>(
+				FString::Printf(TEXT("/Script/%s.%s"), ModuleName, *NodeClassName)))
+			{
+				return NodeClass;
+			}
+		}
 	}
 
 	return nullptr;
@@ -291,6 +645,14 @@ bool CreateOrReplaceStandaloneAsset_ImportBpy(
 	}
 	else if (UEditorAssetLibrary::DoesAssetExist(PackagePath))
 	{
+		if (UPackage* ExistingPackage = FindPackage(nullptr, *PackagePath))
+		{
+			if (!ExistingPackage->IsFullyLoaded())
+			{
+				ExistingPackage->FullyLoad();
+			}
+		}
+
 		if (!UEditorAssetLibrary::DeleteAsset(PackagePath))
 		{
 			OutError = FString::Printf(TEXT("Failed to delete existing asset before import: %s"), *PackagePath);
@@ -312,6 +674,18 @@ bool CreateOrReplaceStandaloneAsset_ImportBpy(
 		return false;
 	}
 
+	// Standalone assets are frequently round-tripped into an existing package path.
+	// After delete/recreate, UE can keep the package in a partially-loaded state,
+	// which then hard-fails SavePackage. Force the package into a saveable state.
+	if (!Package->IsFullyLoaded())
+	{
+		Package->FullyLoad();
+		if (!Package->IsFullyLoaded())
+		{
+			Package->MarkAsFullyLoaded();
+		}
+	}
+
 	OutAsset = NewObject<UObject>(Package, AssetClass, *AssetName, RF_Public | RF_Standalone);
 	if (!OutAsset)
 	{
@@ -325,6 +699,8 @@ bool CreateOrReplaceStandaloneAsset_ImportBpy(
 
 struct FEnhancedMappingInstancedRefs_ImportBpy
 {
+	FString ActionRef;
+	FString KeyName;
 	TArray<FString> ModifierNames;
 	TArray<FString> TriggerNames;
 };
@@ -479,6 +855,100 @@ TArray<FString> ExtractInstancedObjectNamesFromField_ImportBpy(const FString& Ma
 	return Names;
 }
 
+FString ExtractSingleFieldValueFromMappingEntry_ImportBpy(const FString& MappingEntryText, const FString& FieldName)
+{
+	const FString Token = FieldName + TEXT("=");
+	const int32 TokenIndex = MappingEntryText.Find(Token, ESearchCase::CaseSensitive);
+	if (TokenIndex == INDEX_NONE)
+	{
+		return FString();
+	}
+
+	int32 ValueStart = TokenIndex + Token.Len();
+	while (ValueStart < MappingEntryText.Len() && FChar::IsWhitespace(MappingEntryText[ValueStart]))
+	{
+		++ValueStart;
+	}
+
+	if (!MappingEntryText.IsValidIndex(ValueStart))
+	{
+		return FString();
+	}
+
+	int32 ValueEnd = ValueStart;
+	bool bInQuotes = false;
+	if (MappingEntryText[ValueStart] == TEXT('\"'))
+	{
+		bInQuotes = true;
+		++ValueEnd;
+		while (ValueEnd < MappingEntryText.Len())
+		{
+			if (MappingEntryText[ValueEnd] == TEXT('\"'))
+			{
+				++ValueEnd;
+				break;
+			}
+			++ValueEnd;
+		}
+	}
+	else
+	{
+		while (ValueEnd < MappingEntryText.Len())
+		{
+			const TCHAR Char = MappingEntryText[ValueEnd];
+			if (Char == TEXT(',') || Char == TEXT(')'))
+			{
+				break;
+			}
+			++ValueEnd;
+		}
+	}
+
+	FString Value = MappingEntryText.Mid(ValueStart, ValueEnd - ValueStart);
+	Value.TrimStartAndEndInline();
+	if (bInQuotes && Value.Len() >= 2 && Value.StartsWith(TEXT("\"")) && Value.EndsWith(TEXT("\"")))
+	{
+		Value = Value.Mid(1, Value.Len() - 2);
+	}
+
+	return Value;
+}
+
+FKey ResolveInputKey_ImportBpy(const FString& RequestedKeyName)
+{
+	const FString TrimmedKeyName = RequestedKeyName.TrimStartAndEnd();
+	if (TrimmedKeyName.IsEmpty())
+	{
+		return EKeys::Invalid;
+	}
+
+	const FKey DirectKey(*TrimmedKeyName);
+	if (DirectKey.IsValid())
+	{
+		return DirectKey;
+	}
+
+	TArray<FKey> AllKeys;
+	EKeys::GetAllKeys(AllKeys);
+	for (const FKey& CandidateKey : AllKeys)
+	{
+		if (!CandidateKey.IsValid())
+		{
+			continue;
+		}
+
+		if (CandidateKey.GetFName().ToString().Equals(TrimmedKeyName, ESearchCase::IgnoreCase) ||
+			CandidateKey.ToString().Equals(TrimmedKeyName, ESearchCase::IgnoreCase) ||
+			CandidateKey.GetDisplayName(false).ToString().Equals(TrimmedKeyName, ESearchCase::IgnoreCase) ||
+			CandidateKey.GetDisplayName(true).ToString().Equals(TrimmedKeyName, ESearchCase::IgnoreCase))
+		{
+			return CandidateKey;
+		}
+	}
+
+	return EKeys::Invalid;
+}
+
 bool ParseInputMappingInstancedRefs_ImportBpy(
 	const FString& DefaultKeyMappingsText,
 	TArray<FEnhancedMappingInstancedRefs_ImportBpy>& OutRefs,
@@ -506,12 +976,51 @@ bool ParseInputMappingInstancedRefs_ImportBpy(
 	for (const FString& MappingEntryText : SplitTopLevelCommaSeparated_ImportBpy(InnerMappingsText))
 	{
 		FEnhancedMappingInstancedRefs_ImportBpy MappingRefs;
+		MappingRefs.ActionRef = ExtractSingleFieldValueFromMappingEntry_ImportBpy(MappingEntryText, TEXT("Action"));
+		MappingRefs.KeyName = ExtractSingleFieldValueFromMappingEntry_ImportBpy(MappingEntryText, TEXT("Key"));
 		MappingRefs.ModifierNames = ExtractInstancedObjectNamesFromField_ImportBpy(MappingEntryText, TEXT("Modifiers"));
 		MappingRefs.TriggerNames = ExtractInstancedObjectNamesFromField_ImportBpy(MappingEntryText, TEXT("Triggers"));
 		OutRefs.Add(MappingRefs);
 	}
 
 	return true;
+}
+
+TArray<FString> ExtractInstancedObjectNamesFromText_ImportBpy(const FString& Text)
+{
+	TArray<FString> Names;
+	int32 SearchIndex = 0;
+
+	while (SearchIndex < Text.Len())
+	{
+		const int32 ColonIndex = Text.Find(TEXT(":"), ESearchCase::CaseSensitive, ESearchDir::FromStart, SearchIndex);
+		if (ColonIndex == INDEX_NONE)
+		{
+			break;
+		}
+
+		int32 EndIndex = ColonIndex + 1;
+		while (EndIndex < Text.Len())
+		{
+			const TCHAR Char = Text[EndIndex];
+			if (Char == TEXT('\'') || Char == TEXT('"') || Char == TEXT(',') || Char == TEXT(')'))
+			{
+				break;
+			}
+			++EndIndex;
+		}
+
+		FString ObjectName = Text.Mid(ColonIndex + 1, EndIndex - ColonIndex - 1);
+		ObjectName.TrimStartAndEndInline();
+		if (!ObjectName.IsEmpty())
+		{
+			Names.Add(ObjectName);
+		}
+
+		SearchIndex = EndIndex + 1;
+	}
+
+	return Names;
 }
 
 bool RestoreInputMappingInstancedRefs_ImportBpy(
@@ -538,18 +1047,6 @@ bool RestoreInputMappingInstancedRefs_ImportBpy(
 		return false;
 	}
 
-	const int32 MappingCount = InputMappingContext->GetMappings().Num();
-	if (ParsedRefs.Num() != MappingCount)
-	{
-		OutError = FString::Printf(
-			TEXT("Parsed DefaultKeyMappings count mismatch for %s: parsed=%d imported=%d"),
-			*Asset->GetPathName(),
-			ParsedRefs.Num(),
-			MappingCount);
-		UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
-		return false;
-	}
-
 	TArray<UObject*> InnerObjects;
 	GetObjectsWithOuter(Asset, InnerObjects, false);
 
@@ -562,9 +1059,50 @@ bool RestoreInputMappingInstancedRefs_ImportBpy(
 		}
 	}
 
+	InputMappingContext->UnmapAll();
+
 	for (int32 MappingIndex = 0; MappingIndex < ParsedRefs.Num(); ++MappingIndex)
 	{
-		FEnhancedActionKeyMapping& Mapping = InputMappingContext->GetMapping(MappingIndex);
+		UInputAction* Action = nullptr;
+		if (!ParsedRefs[MappingIndex].ActionRef.IsEmpty())
+		{
+			Action = ResolveInputActionAsset_ImportBpy(ParsedRefs[MappingIndex].ActionRef);
+			if (!Action)
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to resolve InputMappingContext action '%s' on %s"),
+					*ParsedRefs[MappingIndex].ActionRef,
+					*Asset->GetPathName());
+				UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
+				return false;
+			}
+		}
+		else
+		{
+			OutError = FString::Printf(
+				TEXT("InputMappingContext mapping %d is missing an action on %s"),
+				MappingIndex,
+				*Asset->GetPathName());
+			UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
+			return false;
+		}
+
+		FKey ParsedKey = EKeys::Invalid;
+		if (!ParsedRefs[MappingIndex].KeyName.IsEmpty())
+		{
+			ParsedKey = ResolveInputKey_ImportBpy(ParsedRefs[MappingIndex].KeyName);
+			if (!ParsedKey.IsValid())
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to resolve InputMappingContext key '%s' on %s"),
+					*ParsedRefs[MappingIndex].KeyName,
+					*Asset->GetPathName());
+				UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
+				return false;
+			}
+		}
+
+		FEnhancedActionKeyMapping& Mapping = InputMappingContext->MapKey(Action, ParsedKey);
 		Mapping.Modifiers.Reset();
 		Mapping.Triggers.Reset();
 
@@ -598,6 +1136,94 @@ bool RestoreInputMappingInstancedRefs_ImportBpy(
 				return false;
 			}
 			Mapping.Triggers.Add(Trigger);
+		}
+	}
+
+PRAGMA_DISABLE_DEPRECATION_WARNINGS
+	if (FArrayProperty* LegacyMappingsProperty = FindFProperty<FArrayProperty>(UInputMappingContext::StaticClass(), TEXT("Mappings")))
+	{
+		if (TArray<FEnhancedActionKeyMapping>* LegacyMappings =
+			LegacyMappingsProperty->ContainerPtrToValuePtr<TArray<FEnhancedActionKeyMapping>>(InputMappingContext))
+		{
+			*LegacyMappings = InputMappingContext->GetMappings();
+		}
+	}
+PRAGMA_ENABLE_DEPRECATION_WARNINGS
+
+	return true;
+}
+
+bool RestoreInputActionInstancedRefs_ImportBpy(
+	UObject* Asset,
+	const TSharedPtr<FJsonObject>* StandalonePropertiesObj,
+	FString& OutError)
+{
+	UInputAction* InputAction = Cast<UInputAction>(Asset);
+	if (!InputAction || !StandalonePropertiesObj || !(*StandalonePropertiesObj).IsValid())
+	{
+		return true;
+	}
+
+	FString TriggersText;
+	FString ModifiersText;
+	const bool bHasTriggers = (*StandalonePropertiesObj)->TryGetStringField(TEXT("Triggers"), TriggersText);
+	const bool bHasModifiers = (*StandalonePropertiesObj)->TryGetStringField(TEXT("Modifiers"), ModifiersText);
+	if (!bHasTriggers && !bHasModifiers)
+	{
+		return true;
+	}
+
+	TArray<UObject*> InnerObjects;
+	GetObjectsWithOuter(Asset, InnerObjects, false);
+
+	TMap<FString, UObject*> InnerObjectMap;
+	for (UObject* InnerObject : InnerObjects)
+	{
+		if (InnerObject)
+		{
+			InnerObjectMap.Add(InnerObject->GetName(), InnerObject);
+		}
+	}
+
+	if (bHasTriggers)
+	{
+		InputAction->Triggers.Reset();
+		for (const FString& TriggerName : ExtractInstancedObjectNamesFromText_ImportBpy(TriggersText))
+		{
+			UObject* const* FoundObject = InnerObjectMap.Find(TriggerName);
+			UInputTrigger* Trigger = FoundObject ? Cast<UInputTrigger>(*FoundObject) : nullptr;
+			if (!Trigger)
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to resolve InputAction trigger subobject '%s' on %s"),
+					*TriggerName,
+					*Asset->GetPathName());
+				UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
+				return false;
+			}
+
+			InputAction->Triggers.Add(Trigger);
+		}
+	}
+
+	if (bHasModifiers)
+	{
+		InputAction->Modifiers.Reset();
+		for (const FString& ModifierName : ExtractInstancedObjectNamesFromText_ImportBpy(ModifiersText))
+		{
+			UObject* const* FoundObject = InnerObjectMap.Find(ModifierName);
+			UInputModifier* Modifier = FoundObject ? Cast<UInputModifier>(*FoundObject) : nullptr;
+			if (!Modifier)
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to resolve InputAction modifier subobject '%s' on %s"),
+					*ModifierName,
+					*Asset->GetPathName());
+				UE_LOG(LogTemp, Warning, TEXT("%s"), *OutError);
+				return false;
+			}
+
+			InputAction->Modifiers.Add(Modifier);
 		}
 	}
 
@@ -804,6 +1430,83 @@ UActorComponent* FindInheritedComponentByName_ImportBpy(UBlueprint* BP, const FS
 USceneComponent* FindInheritedSceneComponentByName_ImportBpy(UBlueprint* BP, const FString& ComponentName)
 {
 	return Cast<USceneComponent>(FindInheritedComponentByName_ImportBpy(BP, ComponentName));
+}
+
+UActorComponent* FindParentInheritedComponentByName_ImportBpy(UBlueprint* BP, const FString& ComponentName)
+{
+	if (!BP || ComponentName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	auto FindOnActor = [&ComponentName](AActor* Actor) -> UActorComponent*
+	{
+		if (!Actor)
+		{
+			return nullptr;
+		}
+
+		TArray<UActorComponent*> Components;
+		Actor->GetComponents(Components);
+		for (UActorComponent* Component : Components)
+		{
+			if (!Component)
+			{
+				continue;
+			}
+
+			if (ComponentNameMatches_ImportBpy(ComponentName, Component->GetFName().ToString()) ||
+				ComponentNameMatches_ImportBpy(ComponentName, Component->GetName()))
+			{
+				return Component;
+			}
+		}
+
+		return nullptr;
+	};
+
+	for (UClass* Class = BP->ParentClass; Class; Class = Class->GetSuperClass())
+	{
+		if (AActor* ParentCDO = Cast<AActor>(Class->GetDefaultObject(false)))
+		{
+			if (UActorComponent* Found = FindOnActor(ParentCDO))
+			{
+				return Found;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+void NormalizeInheritedSceneMobility_ImportBpy(
+	UBlueprint* BP,
+	const FString& ComponentName,
+	UActorComponent* TargetComp,
+	const TSharedPtr<FJsonObject>& PropsObj)
+{
+	if (!BP || !TargetComp || !PropsObj.IsValid() || PropsObj->HasField(TEXT("Mobility")))
+	{
+		return;
+	}
+
+	USceneComponent* TargetScene = Cast<USceneComponent>(TargetComp);
+	if (!TargetScene)
+	{
+		return;
+	}
+
+	EComponentMobility::Type DesiredMobility = EComponentMobility::Movable;
+	if (const USceneComponent* ParentScene = Cast<USceneComponent>(FindParentInheritedComponentByName_ImportBpy(BP, ComponentName)))
+	{
+		DesiredMobility = ParentScene->GetMobility();
+	}
+
+	if (TargetScene->GetMobility() != DesiredMobility)
+	{
+		TargetScene->Modify();
+		TargetScene->SetMobility(DesiredMobility);
+	}
 }
 
 USceneComponent* ResolveParentSceneTemplate_ImportBpy(
@@ -1056,15 +1759,15 @@ int32 GetGraphImportPriority_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson)
 	}
 
 	const FString GraphType = GraphJson->GetStringField(TEXT("graph_type"));
-	if (GraphType == TEXT("event_graph"))
+	if (GraphType == TEXT("function"))
 	{
 		return 0;
 	}
-	if (GraphType == TEXT("function"))
+	if (GraphType == TEXT("macro"))
 	{
 		return 1;
 	}
-	if (GraphType == TEXT("macro"))
+	if (GraphType == TEXT("event_graph"))
 	{
 		return 2;
 	}
@@ -1284,10 +1987,14 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 			{
 				Schema->TrySetDefaultObject(*Pin, DefaultObject, false);
 			}
-			else
+
+			if (Pin->DefaultObject != DefaultObject)
 			{
 				Pin->DefaultObject = DefaultObject;
 			}
+			Pin->DefaultValue.Reset();
+			Pin->AutogeneratedDefaultValue.Reset();
+
 			return;
 		}
 	}
@@ -1436,6 +2143,22 @@ FString NormalizeRequestedPinName_ImportBpy(UEdGraphNode* Node, const FString& R
 
 void EnsureDynamicPinsForRequest_ImportBpy(UEdGraphNode* Node, const FString& RequestedPinName, EEdGraphPinDirection Direction)
 {
+	if (UK2Node_ExecutionSequence* SequenceNode = Cast<UK2Node_ExecutionSequence>(Node))
+	{
+		if (Direction == EGPD_Output && RequestedPinName.StartsWith(TEXT("then_"), ESearchCase::IgnoreCase))
+		{
+			const FString RequestedIndexText = RequestedPinName.RightChop(5);
+			int32 RequestedIndex = INDEX_NONE;
+			if (LexTryParseString(RequestedIndex, *RequestedIndexText) && RequestedIndex >= 0)
+			{
+				while (!SequenceNode->GetThenPinGivenIndex(RequestedIndex))
+				{
+					SequenceNode->AddInputPin();
+				}
+			}
+		}
+	}
+
 	if (UK2Node_SwitchInteger* SwitchInt = Cast<UK2Node_SwitchInteger>(Node))
 	{
 		if (Direction == EGPD_Output)
@@ -1749,6 +2472,50 @@ void ApplyJsonObjectToObject_ImportBpy(UObject* Object, const TSharedPtr<FJsonOb
 	}
 }
 
+bool ShouldSkipStandaloneAssetProperty_ImportBpy(const UObject* Asset, const FString& PropertyName)
+{
+	if (!Asset || PropertyName.IsEmpty())
+	{
+		return false;
+	}
+
+	if (Asset->IsA(UInputMappingContext::StaticClass()))
+	{
+		return PropertyName == TEXT("DefaultKeyMappings") ||
+			PropertyName == TEXT("Mappings") ||
+			PropertyName == TEXT("MappingProfileOverrides");
+	}
+
+	if (Asset->IsA(UInputAction::StaticClass()))
+	{
+		return PropertyName == TEXT("Triggers") ||
+			PropertyName == TEXT("Modifiers");
+	}
+
+	return false;
+}
+
+void ApplyStandaloneAssetProperties_ImportBpy(UObject* Asset, const TSharedPtr<FJsonObject>& PropertiesJson)
+{
+	if (!Asset || !PropertiesJson.IsValid())
+	{
+		return;
+	}
+
+	for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : PropertiesJson->Values)
+	{
+		if (!Entry.Value.IsValid() || ShouldSkipStandaloneAssetProperty_ImportBpy(Asset, Entry.Key))
+		{
+			continue;
+		}
+
+		if (FProperty* Property = FindPropertyByNameOrAlias_ImportBpy(Asset, Entry.Key))
+		{
+			ApplyJsonValueToProperty_ImportBpy(Asset, Property, Entry.Value);
+		}
+	}
+}
+
 bool RecreateStandaloneAssetSubobjects_ImportBpy(
 	UObject* Asset,
 	const TArray<TSharedPtr<FJsonValue>>* SubobjectValues,
@@ -1849,13 +2616,52 @@ bool AttachComponentNode_ImportBpy(
 
 	USimpleConstructionScript* const SCS = BP->SimpleConstructionScript;
 
-	if (ParentName.IsEmpty())
+	auto ClearExternalParentMetadata = [Node]()
 	{
-		DetachNodeFromSCS_ImportBpy(SCS, Node);
+		if (!Node)
+		{
+			return;
+		}
+
 		Node->Modify();
 		Node->bIsParentComponentNative = false;
 		Node->ParentComponentOrVariableName = NAME_None;
 		Node->ParentComponentOwnerClassName = NAME_None;
+	};
+
+	auto ReattachToCurrentBlueprintParent = [SCS, Node, &ClearExternalParentMetadata](USCS_Node* ParentNode) -> bool
+	{
+		if (!SCS || !Node || !ParentNode)
+		{
+			return false;
+		}
+
+		// For components in the current Blueprint, the relationship belongs in the
+		// SCS tree (ChildNodes), not in ParentComponentOwnerClassName metadata.
+		ClearExternalParentMetadata();
+		ParentNode->AddChildNode(Node);
+		SCS->ValidateSceneRootNodes();
+		return true;
+	};
+
+	auto ReattachToExternalParent = [SCS, Node](const USceneComponent* ParentSceneComponent) -> bool
+	{
+		if (!SCS || !Node || !ParentSceneComponent)
+		{
+			return false;
+		}
+
+		// Native or inherited Blueprint parents are represented as root-node
+		// attachments via ParentComponentOrVariableName metadata.
+		Node->SetParent(ParentSceneComponent);
+		SCS->AddNode(Node);
+		return true;
+	};
+
+	if (ParentName.IsEmpty())
+	{
+		DetachNodeFromSCS_ImportBpy(SCS, Node);
+		ClearExternalParentMetadata();
 
 		SCS->AddNode(Node);
 		return true;
@@ -1866,10 +2672,7 @@ bool AttachComponentNode_ImportBpy(
 		if (USCS_Node* ParentNode = *ParentNodePtr)
 		{
 			DetachNodeFromSCS_ImportBpy(SCS, Node);
-			Node->SetParent(ParentNode);
-			ParentNode->AddChildNode(Node);
-			SCS->ValidateSceneRootNodes();
-			return true;
+			return ReattachToCurrentBlueprintParent(ParentNode);
 		}
 	}
 
@@ -1878,36 +2681,26 @@ bool AttachComponentNode_ImportBpy(
 		if (USCS_Node* ParentNode = Entry.Value; ParentNode && ComponentNameMatches_ImportBpy(ParentName, Entry.Key))
 		{
 			DetachNodeFromSCS_ImportBpy(SCS, Node);
-			Node->SetParent(ParentNode);
-			ParentNode->AddChildNode(Node);
-			SCS->ValidateSceneRootNodes();
-			return true;
+			return ReattachToCurrentBlueprintParent(ParentNode);
 		}
 	}
 
 	if (USCS_Node* ParentNode = FindComponentNodeByName_ImportBpy(BP, ParentName))
 	{
 		DetachNodeFromSCS_ImportBpy(SCS, Node);
-		Node->SetParent(ParentNode);
-		ParentNode->AddChildNode(Node);
-		SCS->ValidateSceneRootNodes();
-		return true;
+		return ReattachToCurrentBlueprintParent(ParentNode);
 	}
 
 	if (USceneComponent* ParentSceneComponent = FindInheritedSceneComponentByName_ImportBpy(BP, ParentName))
 	{
 		DetachNodeFromSCS_ImportBpy(SCS, Node);
-		Node->SetParent(ParentSceneComponent);
-		SCS->AddNode(Node);
-		return true;
+		return ReattachToExternalParent(ParentSceneComponent);
 	}
 
 	if (USceneComponent* ParentSceneComponent = ResolveNamedObject_ImportBpy<USceneComponent>(ParentName))
 	{
 		DetachNodeFromSCS_ImportBpy(SCS, Node);
-		Node->SetParent(ParentSceneComponent);
-		SCS->AddNode(Node);
-		return true;
+		return ReattachToExternalParent(ParentSceneComponent);
 	}
 
 	OutError = FString::Printf(TEXT("Parent component not found: %s"), *ParentName);
@@ -2164,15 +2957,53 @@ bool ApplyNodeProps_ImportBpy(UEdGraphNode* Node, const TSharedPtr<FJsonObject>&
 		return true;
 	}
 
-	const TSharedPtr<FJsonObject>* NodePropsObj = nullptr;
-	if (!NodeJson->TryGetObjectField(TEXT("node_props"), NodePropsObj) || !NodePropsObj->IsValid())
-	{
-		return true;
-	}
-
 	bool bNeedsReconstruct = false;
 	bool bApplySelectIndexTypePostReconstruct = false;
 	FEdGraphPinType SelectIndexPinType;
+
+	if (IsEnhancedInputActionNode_ImportBpy(Node))
+	{
+		if (!ApplyEnhancedInputActionToNode_ImportBpy(Node, NodeJson, OutError))
+		{
+			return false;
+		}
+
+		bNeedsReconstruct = true;
+	}
+
+	if (IsGetSubsystemNode_ImportBpy(Node))
+	{
+		if (!ApplyGetSubsystemClassToNode_ImportBpy(Node, NodeJson, OutError))
+		{
+			return false;
+		}
+
+		bNeedsReconstruct = true;
+	}
+
+	const TSharedPtr<FJsonObject>* NodePropsObj = nullptr;
+	if (!NodeJson->TryGetObjectField(TEXT("node_props"), NodePropsObj) || !NodePropsObj->IsValid())
+	{
+		if (bNeedsReconstruct)
+		{
+			Node->ReconstructNode();
+			if (IsGetSubsystemNode_ImportBpy(Node))
+			{
+				if (!ApplyGetSubsystemClassToNode_ImportBpy(Node, NodeJson, OutError))
+				{
+					return false;
+				}
+			}
+			if (IsEnhancedInputActionNode_ImportBpy(Node))
+			{
+				if (!ApplyEnhancedInputActionToNode_ImportBpy(Node, NodeJson, OutError))
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
 
 	if (UK2Node_Select* SelectNode = Cast<UK2Node_Select>(Node))
 	{
@@ -2337,6 +3168,20 @@ bool ApplyNodeProps_ImportBpy(UEdGraphNode* Node, const TSharedPtr<FJsonObject>&
 	if (bNeedsReconstruct)
 	{
 		Node->ReconstructNode();
+		if (IsGetSubsystemNode_ImportBpy(Node))
+		{
+			if (!ApplyGetSubsystemClassToNode_ImportBpy(Node, NodeJson, OutError))
+			{
+				return false;
+			}
+		}
+		if (IsEnhancedInputActionNode_ImportBpy(Node))
+		{
+			if (!ApplyEnhancedInputActionToNode_ImportBpy(Node, NodeJson, OutError))
+			{
+				return false;
+			}
+		}
 	}
 
 	if (bApplySelectIndexTypePostReconstruct)
@@ -2410,11 +3255,13 @@ bool ApplyPinIds_ImportBpy(UEdGraphNode* Node, const TSharedPtr<FJsonObject>& No
 		}
 		if (!Pin)
 		{
-			OutError = FString::Printf(
-				TEXT("Cannot resolve pin '%s' while applying pin id on node %s"),
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("BPDirectImporter: skipping pin id for unresolved pin '%s' on node %s"),
 				*RequestedPinName,
 				*DescribeNode_ImportBpy(Node));
-			return false;
+			continue;
 		}
 
 		FGuid ParsedGuid;
@@ -2637,6 +3484,7 @@ void ImportInheritedComponents_ImportBpy(UBlueprint* BP, const TArray<TSharedPtr
 		}
 		if (!TargetComp) continue;
 
+		NormalizeInheritedSceneMobility_ImportBpy(BP, CompName, TargetComp, *PropsObj);
 		ApplyJsonObjectToObject_ImportBpy(TargetComp, *PropsObj);
 	}
 }
@@ -2647,6 +3495,12 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	bool bCompileBlueprint,
 	FString& OutError)
 {
+	if (GEditor && GEditor->PlayWorld)
+	{
+		OutError = TEXT("Cannot import blueprint while the editor is in play mode. Stop PIE and retry.");
+		return false;
+	}
+
 	// 	// Parse JSON
 	TSharedPtr<FJsonObject> Root;
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonData);
@@ -2797,6 +3651,16 @@ UBlueprint* UBPDirectImporter::CreateBlueprintAsset(
 	{
 		OutError = FString::Printf(TEXT("Cannot create package: %s"), *PackageName);
 		return nullptr;
+	}
+
+	if (UBlueprint* ExistingBlueprint = FindObject<UBlueprint>(Package, *AssetName))
+	{
+		return ExistingBlueprint;
+	}
+
+	if (UBlueprint* ExistingBlueprint = LoadBlueprintAsset_ImportBpy(AssetPath))
+	{
+		return ExistingBlueprint;
 	}
 
 	UBlueprint* BP = FKismetEditorUtilities::CreateBlueprint(
@@ -3101,6 +3965,11 @@ bool UBPDirectImporter::CreateGraph(
 				Node = CreateNode(Graph, NodeObj, OutError);
 			}
 
+			if (!Node && !OutError.IsEmpty())
+			{
+				return false;
+			}
+
 			if (Node)
 				NodeMap.Add(Uid, Node);
 		}
@@ -3164,6 +4033,33 @@ bool UBPDirectImporter::CreateGraph(
 			}
 
 			if (!ConnectPins(*SrcNodePtr, SrcPin, SrcPinFull, SrcPinId, *DstNodePtr, DstPin, DstPinFull, DstPinId, OutError))
+			{
+				return false;
+			}
+		}
+	}
+
+	// Some nodes (notably promotable operator nodes) can lose input defaults once
+	// wildcard typing settles during connection creation. Re-apply defaults after
+	// all links exist so the imported graph retains authored constant values.
+	if (NodesArr)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue->AsObject();
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			const FString Uid = NodeObj->GetStringField(TEXT("uid"));
+			UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
+			if (!ExistingNode || !*ExistingNode)
+			{
+				continue;
+			}
+
+			if (!ApplyPinDefaults_ImportBpy(*ExistingNode, NodeObj, OutError))
 			{
 				return false;
 			}
@@ -3287,6 +4183,11 @@ UEdGraphNode* UBPDirectImporter::CreateNode(
 	else if (NodeClass == TEXT("K2Node_IfThenElse"))
 	{
 		Result = CreateBranchNode(Graph);
+	}
+	// ── Enhanced Input Action ───────────────────────────────────────
+	else if (NodeClass == TEXT("K2Node_EnhancedInputAction"))
+	{
+		Result = CreateEnhancedInputActionNode_ImportBpy(Graph, NodeJson, OutError);
 	}
 	// ── Sequence ─────────────────────────────────────────────────────
 	else if (NodeClass == TEXT("K2Node_ExecutionSequence"))
@@ -3973,8 +4874,12 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 
 		if (StandalonePropertiesObj && StandalonePropertiesObj->IsValid())
 		{
-			ApplyJsonObjectToObject_ImportBpy(Asset, *StandalonePropertiesObj);
+			ApplyStandaloneAssetProperties_ImportBpy(Asset, *StandalonePropertiesObj);
 			if (!RestoreInputMappingInstancedRefs_ImportBpy(Asset, StandalonePropertiesObj, OutError))
+			{
+				return false;
+			}
+			if (!RestoreInputActionInstancedRefs_ImportBpy(Asset, StandalonePropertiesObj, OutError))
 			{
 				return false;
 			}
@@ -4003,6 +4908,15 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 
 	Asset->PostEditChange();
 	Package->MarkPackageDirty();
+
+	if (!Package->IsFullyLoaded())
+	{
+		Package->FullyLoad();
+		if (!Package->IsFullyLoaded())
+		{
+			Package->MarkAsFullyLoaded();
+		}
+	}
 
 	const FString PackageName     = Package->GetName();
 	const FString PackageFileName = FPackageName::LongPackageNameToFilename(

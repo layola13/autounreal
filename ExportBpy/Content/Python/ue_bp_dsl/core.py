@@ -347,95 +347,115 @@ class GraphContext:
         self._graph.nodes.append(n)
         return NodeProxy(n, self._graph)
 
-    def event(self, event_name: str) -> NodeProxy:
-        return self._add("K2Node_Event", member_name=event_name)
+    def event(self, event_name: str, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_Event", member_name=event_name, pos=pos)
 
     def custom_event(self, name: str,
-                     params: Optional[List[Tuple[str, str]]] = None) -> NodeProxy:
+                     params: Optional[List[Tuple[str, str]]] = None,
+                     *,
+                     pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
         return self._add("K2Node_CustomEvent",
-                         member_name=name, custom_params=params or [])
+                         member_name=name, custom_params=params or [], pos=pos)
 
-    def call_function(self, func_ref: str, *, node_class: str = "K2Node_CallFunction") -> NodeProxy:
+    def call_function(
+        self,
+        func_ref: str,
+        *,
+        node_class: str = "K2Node_CallFunction",
+        pos: Optional[Tuple[float, float]] = None,
+    ) -> NodeProxy:
         """func_ref 格式: 'ClassName::FunctionName'"""
-        return self._add(node_class, function_ref=func_ref)
+        return self._add(node_class, function_ref=func_ref, pos=pos)
 
-    def call(self, func_ref: str, *, node_class: str = "K2Node_CallFunction") -> NodeProxy:
-        return self.call_function(func_ref, node_class=node_class)
+    def call(
+        self,
+        func_ref: str,
+        *,
+        node_class: str = "K2Node_CallFunction",
+        pos: Optional[Tuple[float, float]] = None,
+    ) -> NodeProxy:
+        return self.call_function(func_ref, node_class=node_class, pos=pos)
 
-    def message(self, func_ref: str, *, node_class: str = "K2Node_Message") -> NodeProxy:
-        return self._add(node_class, function_ref=func_ref)
+    def message(
+        self,
+        func_ref: str,
+        *,
+        node_class: str = "K2Node_Message",
+        pos: Optional[Tuple[float, float]] = None,
+    ) -> NodeProxy:
+        return self._add(node_class, function_ref=func_ref, pos=pos)
 
-    def get_var(self, var_name: str) -> NodeProxy:
-        return self._add("K2Node_VariableGet", member_name=var_name)
+    def get_var(self, var_name: str, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_VariableGet", member_name=var_name, pos=pos)
 
-    def get_component(self, component_name: str) -> NodeProxy:
-        return self._add("K2Node_VariableGet", member_name=component_name)
+    def get_component(self, component_name: str, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_VariableGet", member_name=component_name, pos=pos)
 
-    def set_var(self, var_name: str) -> NodeProxy:
-        return self._add("K2Node_VariableSet", member_name=var_name)
+    def set_var(self, var_name: str, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_VariableSet", member_name=var_name, pos=pos)
 
-    def branch(self) -> NodeProxy:
-        return self._add("K2Node_IfThenElse")
+    def branch(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_IfThenElse", pos=pos)
 
-    def sequence(self) -> NodeProxy:
-        return self._add("K2Node_ExecutionSequence")
+    def sequence(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_ExecutionSequence", pos=pos)
 
-    def for_each_loop(self) -> NodeProxy:
-        return self._add("K2Node_ForEachElementInArray")
+    def for_each_loop(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_ForEachElementInArray", pos=pos)
 
-    def cast(self, target_class: str) -> NodeProxy:
-        return self._add("K2Node_DynamicCast", target_type=target_class)
+    def cast(self, target_class: str, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_DynamicCast", target_type=target_class, pos=pos)
 
-    def call_dispatcher(self, dispatcher_name: str) -> NodeProxy:
-        return self._add("K2Node_CallDelegate", member_name=dispatcher_name)
+    def call_dispatcher(self, dispatcher_name: str, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_CallDelegate", member_name=dispatcher_name, pos=pos)
 
-    def func_entry(self) -> NodeProxy:
-        return self._add("K2Node_FunctionEntry")
+    def func_entry(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_FunctionEntry", pos=pos)
 
     def entry(self) -> NodeProxy:
         return self.func_entry()
 
-    def func_result(self) -> NodeProxy:
-        return self._add("K2Node_FunctionResult")
+    def func_result(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_FunctionResult", pos=pos)
 
     def result(self) -> NodeProxy:
         return self.func_result()
 
-    def macro_entry(self) -> NodeProxy:
-        return self._add("K2Node_Tunnel", tunnel_type="entry")
+    def macro_entry(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_Tunnel", tunnel_type="entry", pos=pos)
 
-    def macro_result(self) -> NodeProxy:
-        return self._add("K2Node_Tunnel", tunnel_type="exit")
+    def macro_result(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_Tunnel", tunnel_type="exit", pos=pos)
 
-    def timeline_node(self, timeline_name: str) -> NodeProxy:
-        return self._add("K2Node_Timeline", member_name=timeline_name)
+    def timeline_node(self, timeline_name: str, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_Timeline", member_name=timeline_name, pos=pos)
 
-    def select(self) -> NodeProxy:
-        return self._add("K2Node_Select")
+    def select(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_Select", pos=pos)
 
-    def switch_enum(self, enum_type: str = "") -> NodeProxy:
-        return self._add("K2Node_SwitchEnum", target_type=enum_type)
+    def switch_enum(self, enum_type: str = "", *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_SwitchEnum", target_type=enum_type, pos=pos)
 
-    def switch_int(self) -> NodeProxy:
-        return self._add("K2Node_SwitchInteger")
+    def switch_int(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_SwitchInteger", pos=pos)
 
-    def make_array(self) -> NodeProxy:
-        return self._add("K2Node_MakeArray")
+    def make_array(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_MakeArray", pos=pos)
 
-    def make_struct(self, struct_type: str = "") -> NodeProxy:
-        return self._add("K2Node_MakeStruct", target_type=struct_type)
+    def make_struct(self, struct_type: str = "", *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_MakeStruct", target_type=struct_type, pos=pos)
 
-    def break_struct(self, struct_type: str = "") -> NodeProxy:
-        return self._add("K2Node_BreakStruct", target_type=struct_type)
+    def break_struct(self, struct_type: str = "", *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_BreakStruct", target_type=struct_type, pos=pos)
 
-    def set_fields(self, struct_type: str = "") -> NodeProxy:
+    def set_fields(self, struct_type: str = "", *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
         extra_props: Dict[str, Any] = {}
         if struct_type:
             extra_props["StructType"] = struct_type
-        return self._add("K2Node_SetFieldsInStruct", target_type=struct_type, extra_props=extra_props)
+        return self._add("K2Node_SetFieldsInStruct", target_type=struct_type, extra_props=extra_props, pos=pos)
 
-    def self_ref(self) -> NodeProxy:
-        return self._add("K2Node_Self")
+    def self_ref(self, *, pos: Optional[Tuple[float, float]] = None) -> NodeProxy:
+        return self._add("K2Node_Self", pos=pos)
 
     def node(self, *, type: str, name: str = "", class_name: str = "",
              pos: Optional[Tuple[float, float]] = None,

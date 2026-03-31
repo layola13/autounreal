@@ -8700,17 +8700,9 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleImportBlueprintPy
                         FString::Printf(TEXT("Target blueprint already exists: %s"), *TargetAssetRef));
                 }
 
-                if (bOverwrite && ExistingBlueprint)
-                {
-                    const FString ExistingAssetPath = FPackageName::ObjectPathToPackageName(ExistingBlueprint->GetPathName());
-                    if (!ExistingAssetPath.IsEmpty() &&
-                        UEditorAssetLibrary::DoesAssetExist(ExistingAssetPath) &&
-                        !UEditorAssetLibrary::DeleteAsset(ExistingAssetPath))
-                    {
-                        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
-                            FString::Printf(TEXT("Failed to delete existing blueprint before bpy import: %s"), *ExistingAssetPath));
-                    }
-                }
+                // Keep the existing Blueprint asset in place and let the importer update it.
+                // Deleting and recreating the asset breaks external class references such as
+                // GameMode DefaultPawnClass, which then falls back to None until manually restored.
             }
 
             TSharedPtr<IPlugin> ExportBpyPlugin = IPluginManager::Get().FindPlugin(TEXT("ExportBpy"));

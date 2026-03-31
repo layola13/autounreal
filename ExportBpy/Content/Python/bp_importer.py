@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -230,6 +231,8 @@ def _import_blueprint_object_with_details(
             "asset_path": asset_path,
             "import_mode": "bpy_directory",
             "compiled": bool(compile_blueprint),
+            "validation_ok": True,
+            "validation_summary": {"ok": True, "warnings": ["dry-run"]},
         }
 
     ok, err = _call_cpp_importer(json_str, asset_path, compile_blueprint=False)
@@ -248,6 +251,8 @@ def _import_blueprint_object_with_details(
         if repair_ok:
             _save_asset_if_possible(bridge_asset_path)
 
+    validation_summary = _validate_imported_blueprint(bridge_asset_path, payload) if ok else {}
+    validation_ok = bool(validation_summary.get("ok", False)) if validation_summary else False
     success = bool(ok and repair_ok and (compiled_ok if compile_blueprint else True))
     error_parts = [part for part in (err, repair_err, compile_err) if part]
     return {
@@ -256,6 +261,8 @@ def _import_blueprint_object_with_details(
         "asset_path": asset_path,
         "import_mode": "bpy_directory",
         "compiled": bool(success and compile_blueprint),
+        "validation_ok": validation_ok,
+        "validation_summary": validation_summary,
     }
 
 
@@ -325,6 +332,8 @@ def _error_details(message: str) -> Dict[str, Any]:
         "asset_path": "",
         "import_mode": "bpy_directory",
         "compiled": False,
+        "validation_ok": False,
+        "validation_summary": {},
     }
 
 
@@ -641,6 +650,310 @@ def _normalize_bridge_blueprint_path(asset_path: str) -> str:
 
     head = asset_path[: -len(leaf)]
     return f"{head}{asset_name}"
+
+
+def _camel_to_snake(name: str) -> str:
+    if not name:
+        return ""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _component_name_candidates(name: str) -> Set[str]:
+    raw_name = str(name or "")
+    candidates = {raw_name}
+    stripped = re.sub(r"_[0-9A-Fa-f-]+$", "", raw_name)
+    if stripped:
+        candidates.add(stripped)
+
+    aliases = {
+        "CollisionCylinder": ("CapsuleComponent",),
+        "CapsuleComponent": ("CollisionCylinder",),
+        "CharMoveComp": ("CharacterMovement",),
+        "CharacterMovement": ("CharMoveComp",),
+        "CharacterMesh0": ("Mesh", "CharacterMesh"),
+        "CharacterMesh": ("Mesh", "CharacterMesh0"),
+        "Mesh": ("CharacterMesh0", "CharacterMesh"),
+    }
+    for candidate in list(candidates):
+        for alias in aliases.get(candidate, ()):
+            candidates.add(alias)
+
+    return {candidate.lower() for candidate in candidates if candidate}
+
+
+def _component_name_matches(expected: str, actual: str) -> bool:
+    if not expected or not actual:
+        return False
+    return bool(_component_name_candidates(expected).intersection(_component_name_candidates(actual)))
+
+
+def _get_generated_class(blueprint: Any):
+    if blueprint is None:
+        return None
+
+    try:
+        generated_class = blueprint.generated_class()
+    except Exception:
+        generated_class = None
+    if generated_class is not None:
+        return generated_class
+
+    try:
+        generated_class = getattr(blueprint, "generated_class")
+    except Exception:
+        generated_class = None
+    return generated_class
+
+
+def _get_default_object(target: Any):
+    if not _HAS_UNREAL or target is None:
+        return None
+    try:
+        return unreal.get_default_object(target)
+    except Exception:
+        return None
+
+
+def _iter_actor_components(actor: Any) -> List[Any]:
+    if actor is None:
+        return []
+    components: List[Any] = []
+    try:
+        actor.get_components(components)
+        return list(components)
+    except Exception:
+        return []
+
+
+def _find_component_on_actor(actor: Any, component_name: str):
+    for component in _iter_actor_components(actor):
+        actual_names: List[str] = []
+        try:
+            actual_names.append(str(component.get_name() or ""))
+        except Exception:
+            pass
+        try:
+            actual_names.append(str(component.get_fname() or ""))
+        except Exception:
+            pass
+        for actual_name in actual_names:
+            if _component_name_matches(component_name, actual_name):
+                return component
+    return None
+
+
+def _get_component_parent_name(component: Any) -> str:
+    if component is None or not hasattr(component, "get_attach_parent"):
+        return ""
+    try:
+        parent = component.get_attach_parent()
+    except Exception:
+        parent = None
+    if parent is None:
+        return ""
+    try:
+        return str(parent.get_name() or "")
+    except Exception:
+        return ""
+
+
+def _get_component_attach_socket_name(component: Any) -> str:
+    if component is None or not hasattr(component, "get_attach_socket_name"):
+        return ""
+    try:
+        return str(component.get_attach_socket_name() or "")
+    except Exception:
+        return ""
+
+
+def _normalize_compare_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _values_equivalent(expected: Any, actual: Any) -> bool:
+    normalized_expected = _normalize_compare_value(expected)
+    normalized_actual = _normalize_compare_value(actual)
+    if isinstance(normalized_expected, float) and isinstance(normalized_actual, float):
+        return math.isclose(normalized_expected, normalized_actual, rel_tol=1e-6, abs_tol=1e-6)
+    return normalized_expected == normalized_actual
+
+
+def _read_editor_property_flex(target: Any, property_name: str) -> Tuple[bool, Any]:
+    if target is None or not property_name:
+        return False, None
+
+    names_to_try: List[str] = []
+    for candidate in (property_name, _camel_to_snake(property_name)):
+        if candidate and candidate not in names_to_try:
+            names_to_try.append(candidate)
+
+    for candidate in names_to_try:
+        try:
+            return True, target.get_editor_property(candidate)
+        except Exception:
+            pass
+        try:
+            return True, getattr(target, candidate)
+        except Exception:
+            pass
+
+    return False, None
+
+
+def _normalize_mobility_value(value: Any) -> str:
+    text = str(value or "")
+    if "." in text:
+        text = text.split(".")[-1]
+    return text.strip().lower()
+
+
+def _validate_imported_blueprint(asset_path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "ok": True,
+        "missing_components": [],
+        "component_parent_mismatches": [],
+        "component_socket_mismatches": [],
+        "inherited_component_mobility_mismatches": [],
+        "class_default_mismatches": [],
+        "warnings": [],
+    }
+
+    if not _HAS_UNREAL or not isinstance(payload, dict):
+        return summary
+
+    blueprint = _load_blueprint_asset_for_repair(asset_path)
+    generated_class = _get_generated_class(blueprint)
+    cdo = _get_default_object(generated_class)
+    parent_class = getattr(blueprint, "parent_class", None) if blueprint is not None else None
+    parent_cdo = _get_default_object(parent_class)
+
+    if blueprint is None or cdo is None:
+        summary["warnings"].append(f"Unable to load imported blueprint for validation: {asset_path}")
+        summary["ok"] = False
+        return summary
+
+    components = payload.get("components", [])
+    if isinstance(components, list):
+        for component_data in components:
+            if not isinstance(component_data, dict):
+                continue
+
+            component_name = str(component_data.get("name", "") or "")
+            if not component_name:
+                continue
+
+            live_component = _find_component_on_actor(cdo, component_name)
+            if live_component is None:
+                summary["missing_components"].append(component_name)
+                continue
+
+            expected_parent = str(component_data.get("parent", "") or "")
+            if expected_parent:
+                actual_parent = _get_component_parent_name(live_component)
+                if not _component_name_matches(expected_parent, actual_parent):
+                    summary["component_parent_mismatches"].append(
+                        {
+                            "component": component_name,
+                            "expected_parent": expected_parent,
+                            "actual_parent": actual_parent,
+                        }
+                    )
+
+            expected_socket = str(component_data.get("attach_to_name", "") or "")
+            if expected_socket:
+                actual_socket = _get_component_attach_socket_name(live_component)
+                if actual_socket != expected_socket:
+                    summary["component_socket_mismatches"].append(
+                        {
+                            "component": component_name,
+                            "expected_socket": expected_socket,
+                            "actual_socket": actual_socket,
+                        }
+                    )
+
+    inherited_components = payload.get("inherited_components", [])
+    if isinstance(inherited_components, list) and parent_cdo is not None:
+        for component_data in inherited_components:
+            if not isinstance(component_data, dict):
+                continue
+
+            component_name = str(component_data.get("name", "") or "")
+            properties = component_data.get("properties", {})
+            if not component_name or not isinstance(properties, dict) or "Mobility" in properties:
+                continue
+
+            target_component = _find_component_on_actor(cdo, component_name)
+            parent_component = _find_component_on_actor(parent_cdo, component_name)
+            if target_component is None or parent_component is None:
+                continue
+
+            target_ok, target_mobility = _read_editor_property_flex(target_component, "Mobility")
+            parent_ok, parent_mobility = _read_editor_property_flex(parent_component, "Mobility")
+            if not target_ok or not parent_ok:
+                continue
+
+            normalized_target = _normalize_mobility_value(target_mobility)
+            normalized_parent = _normalize_mobility_value(parent_mobility)
+            if normalized_target and normalized_parent and normalized_target != normalized_parent:
+                summary["inherited_component_mobility_mismatches"].append(
+                    {
+                        "component": component_name,
+                        "expected_mobility": normalized_parent,
+                        "actual_mobility": normalized_target,
+                    }
+                )
+
+    class_defaults = payload.get("class_defaults", [])
+    if isinstance(class_defaults, list):
+        for default_entry in class_defaults:
+            if not isinstance(default_entry, dict):
+                continue
+
+            property_name = str(default_entry.get("name", "") or "")
+            if not property_name:
+                continue
+
+            expected_value = default_entry.get("value")
+            if not isinstance(expected_value, (bool, int, float, str)):
+                continue
+
+            found, actual_value = _read_editor_property_flex(cdo, property_name)
+            if not found:
+                continue
+            if not _values_equivalent(expected_value, actual_value):
+                summary["class_default_mismatches"].append(
+                    {
+                        "property": property_name,
+                        "expected": expected_value,
+                        "actual": actual_value,
+                    }
+                )
+
+    summary["ok"] = not any(
+        summary[key]
+        for key in (
+            "missing_components",
+            "component_parent_mismatches",
+            "component_socket_mismatches",
+            "inherited_component_mobility_mismatches",
+            "class_default_mismatches",
+        )
+    )
+
+    if not summary["ok"]:
+        try:
+            unreal.log_warning("[ExportBpy] Import validation reported structural mismatches")
+            unreal.log_warning(json.dumps(summary, ensure_ascii=False))
+        except Exception:
+            pass
+
+    return summary
 
 
 def _load_blueprint_asset_for_repair(asset_path: str):

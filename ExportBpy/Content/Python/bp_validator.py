@@ -23,6 +23,16 @@ def _is_graph_dsl_file(file_name: str) -> bool:
     return any(file_name.startswith(prefix) for prefix in GRAPH_PREFIXES)
 
 
+def _is_allowed_auxiliary_bp_file(directory: str, file_name: str) -> bool:
+    if not file_name.endswith(".bp.py") or file_name == MAIN_BP_FILE:
+        return False
+    if _is_graph_dsl_file(file_name):
+        return False
+
+    expected_name = os.path.basename(os.path.normpath(directory)) + ".bp.py"
+    return file_name == expected_name
+
+
 def validate_path(path: str) -> Tuple[bool, List[str]]:
     if os.path.isdir(path):
         return validate(path)
@@ -51,7 +61,11 @@ def validate(directory: str) -> Tuple[bool, List[str]]:
     for fname in sorted(os.listdir(directory)):
         if not _is_graph_dsl_file(fname):
             if fname.endswith(".bp.py") and fname != MAIN_BP_FILE:
-                errors.append(f"Unknown graph file prefix: {fname}")
+                fpath = os.path.join(directory, fname)
+                if _is_allowed_auxiliary_bp_file(directory, fname):
+                    _check_python_file(fpath, errors)
+                else:
+                    errors.append(f"Unknown graph file prefix: {fname}")
             continue
 
         fpath = os.path.join(directory, fname)

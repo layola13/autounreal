@@ -8,6 +8,7 @@ from .api import (
     compile_to_bpy_package,
     ensure_plugin_python_path,
     import_bpy_package,
+    roundtrip_bpy_package,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "compile_and_import",
     "ensure_plugin_python_path",
     "import_bpy_package",
+    "roundtrip_bpy_package",
 ]

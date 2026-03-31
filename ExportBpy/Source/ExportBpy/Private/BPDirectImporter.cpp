@@ -41,6 +41,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
+#include "HAL/PlatformMisc.h"
 #include "Engine/EngineTypes.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
@@ -3255,12 +3256,21 @@ bool ApplyPinIds_ImportBpy(UEdGraphNode* Node, const TSharedPtr<FJsonObject>& No
 		}
 		if (!Pin)
 		{
-			UE_LOG(
-				LogTemp,
-				Warning,
-				TEXT("BPDirectImporter: skipping pin id for unresolved pin '%s' on node %s"),
-				*RequestedPinName,
-				*DescribeNode_ImportBpy(Node));
+			static const FString LogPinIdSkipsEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("EXPORTBPY_LOG_PIN_ID_SKIPS"));
+			const bool bLogPinIdSkips =
+				LogPinIdSkipsEnv.Equals(TEXT("1"), ESearchCase::IgnoreCase) ||
+				LogPinIdSkipsEnv.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
+				LogPinIdSkipsEnv.Equals(TEXT("yes"), ESearchCase::IgnoreCase) ||
+				LogPinIdSkipsEnv.Equals(TEXT("on"), ESearchCase::IgnoreCase);
+			if (bLogPinIdSkips)
+			{
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("BPDirectImporter: skipping pin id for unresolved pin '%s' on node %s"),
+					*RequestedPinName,
+					*DescribeNode_ImportBpy(Node));
+			}
 			continue;
 		}
 

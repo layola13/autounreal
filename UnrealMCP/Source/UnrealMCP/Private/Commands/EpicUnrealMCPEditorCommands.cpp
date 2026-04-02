@@ -52,6 +52,7 @@
 #include "Commands/EpicUnrealMCPBlueprintCommands.h"
 #include "UObject/StructOnScope.h"
 #include "UObject/UObjectIterator.h"
+#include "PoseSearch/PoseSearchDatabase.h"
 
 namespace
 {
@@ -2232,6 +2233,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     {
         return HandleSpawnBlueprintActor(Params);
     }
+    else if (CommandType == TEXT("add_animations_to_pose_search_database"))
+    {
+        return HandleAddAnimationsToPoseSearchDatabase(Params);
+    }
     
     return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown editor command: %s"), *CommandType));
 }
@@ -3825,4 +3830,102 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleSpawnBlueprintActor(
     // This function will now correctly call the implementation in BlueprintCommands
     FEpicUnrealMCPBlueprintCommands BlueprintCommands;
     return BlueprintCommands.HandleCommand(TEXT("spawn_blueprint_actor"), Params);
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleAddAnimationsToPoseSearchDatabase(const TSharedPtr<FJsonObject>& Params)
+{
+    FString PsdPath;
+    if (!TryGetNonEmptyStringField(Params, TEXT("psd_path"), PsdPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'psd_path' parameter"));
+    }
+
+    UPoseSearchDatabase* Psd = LoadEditorAsset<UPoseSearchDatabase>(PsdPath);
+    if (!Psd)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("PoseSearchDatabase not found: %s"), *PsdPath));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> AnimationAssets;
+    if (!TryGetJsonArrayFieldFlexible(Params, TEXT("animation_assets"), AnimationAssets) || AnimationAssets.Num() == 0)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing or empty 'animation_assets' parameter"));
+    }
+
+    Psd->Modify();
+
+    int32 AddedCount = 0;
+    TArray<TSharedPtr<FJsonValue>> AddedResults;
+    TArray<TSharedPtr<FJsonValue>> Errors;
+
+    for (int32 Index = 0; Index < AnimationAssets.Num(); ++Index)
+    {
+        const TSharedPtr<FJsonValue>& AssetValue = AnimationAssets[Index];
+        if (!AssetValue.IsValid() || AssetValue->Type != EJson::Object)
+        {
+            Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("animation_assets[%d] must be an object"), Index)));
+            continue;
+        }
+
+        const TSharedPtr<FJsonObject> AssetObject = AssetValue->AsObject();
+        FString AnimAssetPath;
+        if (!TryGetNonEmptyStringField(AssetObject, TEXT("anim_asset"), AnimAssetPath))
+        {
+            Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("animation_assets[%d]: missing 'anim_asset'"), Index)));
+            continue;
+        }
+
+        UObject* AnimAsset = LoadEditorAsset<UObject>(AnimAssetPath);
+        if (!AnimAsset)
+        {
+            Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("animation_assets[%d]: asset not found: %s"), Index, *AnimAssetPath)));
+            continue;
+        }
+
+        FPoseSearchDatabaseAnimationAsset DbAsset;
+        DbAsset.AnimAsset = AnimAsset;
+
+        bool bUseSingleSample = false;
+        if (AssetObject->TryGetBoolField(TEXT("b_use_single_sample"), bUseSingleSample))
+        {
+            DbAsset.bUseSingleSample = bUseSingleSample;
+        }
+
+        TSharedPtr<FJsonObject> SamplingRangeObj;
+        if (TryGetJsonObjectFieldFlexible(AssetObject, TEXT("sampling_range"), SamplingRangeObj))
+        {
+            float MinVal = 0.f, MaxVal = 0.f;
+            SamplingRangeObj->TryGetNumberField(TEXT("min"), MinVal);
+            SamplingRangeObj->TryGetNumberField(TEXT("max"), MaxVal);
+            DbAsset.SamplingRange = FFloatInterval(MinVal, MaxVal);
+        }
+
+        Psd->AddAnimationAsset(DbAsset);
+        AddedCount++;
+
+        TSharedPtr<FJsonObject> ResultItem = MakeShared<FJsonObject>();
+        ResultItem->SetStringField(TEXT("anim_asset"), AnimAssetPath);
+        ResultItem->SetNumberField(TEXT("index"), AddedCount - 1);
+        AddedResults.Add(MakeShared<FJsonValueObject>(ResultItem));
+    }
+
+    if (AddedCount > 0)
+    {
+        if (UPackage* Package = Psd->GetOutermost())
+        {
+            Package->MarkPackageDirty();
+        }
+        UEditorAssetLibrary::SaveLoadedAsset(Psd);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), AddedCount > 0);
+    ResultObj->SetStringField(TEXT("psd_path"), PsdPath);
+    ResultObj->SetNumberField(TEXT("added_count"), AddedCount);
+    ResultObj->SetArrayField(TEXT("added"), AddedResults);
+    if (Errors.Num() > 0)
+    {
+        ResultObj->SetArrayField(TEXT("errors"), Errors);
+    }
+    return ResultObj;
 }

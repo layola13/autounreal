@@ -527,6 +527,11 @@ def _asset_name_from_path(asset_path: str) -> str:
     if token.lower() in {"__bp__.bp.py", "__upper__.py"}:
         parent = normalized.rsplit("/", 1)[0]
         return parent.split("/")[-1] or "package"
+    if token.endswith(".bp.py") and "/" in normalized:
+        parent = normalized.rsplit("/", 1)[0]
+        parent_name = parent.split("/")[-1]
+        if token == f"{parent_name}.bp.py":
+            return parent_name or "package"
     if "." in token:
         token = token.split(".")[-1] or token.split(".")[0]
     return token or "package"

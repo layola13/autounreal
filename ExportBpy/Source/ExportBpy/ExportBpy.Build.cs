@@ -43,6 +43,9 @@ public class ExportBpy : ModuleRules
 			"AnimGraph",
 			"AnimGraphRuntime",
 			"EnhancedInput",
+			"ControlRigDeveloper",
+			"PoseSearchEditor",
+			"ChooserUncooked",
 
 			// JSON
 			"Json",
@@ -52,9 +55,10 @@ public class ExportBpy : ModuleRules
 			"EditorScriptingUtilities",
 			"BlueprintEditorLibrary",
 
-			// Control Rig (optional — remove if not needed)
-			// "ControlRig",
-			// "ControlRigDeveloper",
+			// Control Rig / Motion Matching / Chooser anim graph nodes
+			"ControlRig",
+			"PoseSearch",
+			"Chooser",
 		});
 
 		// Only build in editor

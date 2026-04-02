@@ -216,13 +216,30 @@ def _apply_asset_meta(asset_path: str, meta: Dict[str, Any]) -> Tuple[bool, str]
         return True, ""
 
     try:
-        result = unreal.BPDirectImporter.import_standalone_asset_from_json(
-            asset_path, meta_json
-        )
+        importer = unreal.BPDirectImporter
+        if hasattr(importer, "import_standalone_asset_from_json_detailed"):
+            detailed_result = importer.import_standalone_asset_from_json_detailed(
+                asset_path, meta_json
+            )
+            if isinstance(detailed_result, str):
+                parsed = _parse_detailed_result_json(detailed_result)
+                if parsed is not None:
+                    return parsed
+        result = importer.import_standalone_asset_from_json(asset_path, meta_json)
     except Exception as exc:
         return False, str(exc)
 
     return _normalize_result(result, asset_path)
+
+
+def _parse_detailed_result_json(result_text: str) -> Optional[Tuple[bool, str]]:
+    try:
+        payload = json.loads(result_text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or "success" not in payload:
+        return None
+    return bool(payload.get("success", False)), str(payload.get("error", ""))
 
 
 def _normalize_result(result, asset_path: str) -> Tuple[bool, str]:

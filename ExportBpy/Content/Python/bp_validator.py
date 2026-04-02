@@ -33,6 +33,18 @@ def _is_allowed_auxiliary_bp_file(directory: str, file_name: str) -> bool:
     return file_name == expected_name
 
 
+def _is_directory_entry_file(path: str) -> bool:
+    file_name = os.path.basename(path)
+    if file_name == MAIN_BP_FILE:
+        return True
+    if not file_name.endswith(".bp.py") or file_name.endswith("_meta.py"):
+        return False
+    if _is_graph_dsl_file(file_name):
+        return False
+    expected_name = os.path.basename(os.path.dirname(os.path.normpath(path))) + ".bp.py"
+    return file_name == expected_name
+
+
 def validate_path(path: str) -> Tuple[bool, List[str]]:
     if os.path.isdir(path):
         return validate(path)
@@ -99,6 +111,8 @@ def validate_file(path: str) -> Tuple[bool, List[str]]:
         return False, [f"File does not exist: {path}"]
     if not path.endswith(".bp.py"):
         return False, [f"Only .bp.py files are supported: {path}"]
+    if _is_directory_entry_file(path):
+        return validate(os.path.dirname(path))
 
     _check_python_file(path, errors)
 

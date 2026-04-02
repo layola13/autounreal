@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "1.0",
-	"FriendlyName": "Export Blueprint to Python DSL",
-	"Description": "Exports Unreal Blueprints to a multi-file Python DSL hall and can re-import them.",
+	"Version": 2,
+	"VersionName": "1.1",
+	"FriendlyName": "Export Blueprint to Python DSL Packages",
+	"Description": "Exports Unreal Blueprints as Python DSL packages rooted at __bp__.bp.py with graph modules and supports round-trip re-import.",
 	"Category": "Editor",
 	"CreatedBy": "sonygodx@gmail.com",
 	"CreatedByURL": "",
@@ -26,6 +26,18 @@
 		},
 		{
 			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "ControlRig",
+			"Enabled": true
+		},
+		{
+			"Name": "PoseSearch",
+			"Enabled": true
+		},
+		{
+			"Name": "Chooser",
 			"Enabled": true
 		}
 	],

@@ -122,7 +122,8 @@ EMCPCommandGroup GetCommandGroup(const FString& CanonicalCommand)
         TEXT("add_fab_asset_to_project"),
         TEXT("save_project"),
         TEXT("save_all"),
-        TEXT("spawn_blueprint_actor")
+        TEXT("spawn_blueprint_actor"),
+        TEXT("add_animations_to_pose_search_database")
     };
 
     static const TSet<FString> BlueprintCommands = {

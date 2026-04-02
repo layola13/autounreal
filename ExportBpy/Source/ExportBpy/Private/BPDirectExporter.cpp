@@ -5,6 +5,7 @@
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "Animation/AnimBlueprint.h"
+#include "Engine/SkeletalMesh.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
@@ -41,6 +42,7 @@
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "InputAction.h"
+#include "Engine/UserDefinedEnum.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "UObject/UObjectGlobals.h"
@@ -55,10 +57,38 @@
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 #include "UObject/UnrealType.h"
+#include "StructUtils/InstancedStruct.h"
 #include "EditorAssetLibrary.h"
 
 namespace
 {
+void AddNodePropertyTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info, const TCHAR* PropertyName)
+{
+	if (!Node || !PropertyName)
+	{
+		return;
+	}
+
+	FProperty* Property = Node->GetClass()->FindPropertyByName(FName(PropertyName));
+	if (!Property)
+	{
+		return;
+	}
+
+	void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Node);
+	if (!ValuePtr)
+	{
+		return;
+	}
+
+	FString ExportedValue;
+	Property->ExportTextItem_Direct(ExportedValue, ValuePtr, nullptr, Node, PPF_None);
+	if (!ExportedValue.IsEmpty())
+	{
+		Info.NodeProps.Add(PropertyName, ExportedValue);
+	}
+}
+
 UBlueprint* LoadBlueprintAsset_ExportBpy(const FString& BlueprintPath, FString& OutError)
 {
 	UBlueprint* BP = Cast<UBlueprint>(
@@ -576,6 +606,167 @@ TArray<TSharedPtr<FJsonValue>> SerializeStandaloneSubobjects_ExportBpy(UObject* 
 	return Results;
 }
 
+TArray<TSharedPtr<FJsonValue>> SerializeUserDefinedEnumEntries_ExportBpy(const UUserDefinedEnum* UserDefinedEnum)
+{
+	TArray<TSharedPtr<FJsonValue>> Results;
+	if (!UserDefinedEnum)
+	{
+		return Results;
+	}
+
+	for (int32 Index = 0; Index < UserDefinedEnum->NumEnums(); ++Index)
+	{
+		const FString EnumName = UserDefinedEnum->GetNameStringByIndex(Index);
+		if (EnumName.EndsWith(TEXT("_MAX"), ESearchCase::CaseSensitive))
+		{
+			continue;
+		}
+
+		if (UserDefinedEnum->HasMetaData(TEXT("Hidden"), Index))
+		{
+			continue;
+		}
+
+		TSharedPtr<FJsonObject> EntryJson = MakeShared<FJsonObject>();
+		EntryJson->SetStringField(TEXT("name"), EnumName);
+		EntryJson->SetNumberField(TEXT("value"), static_cast<double>(UserDefinedEnum->GetValueByIndex(Index)));
+		EntryJson->SetStringField(TEXT("display_name"), UserDefinedEnum->GetDisplayNameTextByIndex(Index).ToString());
+		Results.Add(MakeShared<FJsonValueObject>(EntryJson));
+	}
+
+	return Results;
+}
+
+bool IsChooserTableAsset_ExportBpy(const UObject* Asset)
+{
+	return Asset &&
+		Asset->GetClass() &&
+		Asset->GetClass()->GetPathName().Equals(TEXT("/Script/Chooser.ChooserTable"), ESearchCase::CaseSensitive);
+}
+
+FString ExtractChooserAssetReferenceFromInstancedStruct_ExportBpy(const FInstancedStruct& StructValue)
+{
+	if (!StructValue.IsValid())
+	{
+		return FString();
+	}
+
+	const UScriptStruct* ScriptStruct = StructValue.GetScriptStruct();
+	const uint8* StructMemory = StructValue.GetMemory();
+	if (!ScriptStruct || !StructMemory)
+	{
+		return FString();
+	}
+
+	const FProperty* AssetProperty = ScriptStruct->FindPropertyByName(TEXT("Asset"));
+	if (!AssetProperty)
+	{
+		return FString();
+	}
+
+	const void* ValuePtr = AssetProperty->ContainerPtrToValuePtr<void>(StructMemory);
+	if (!ValuePtr)
+	{
+		return FString();
+	}
+
+	if (const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(AssetProperty))
+	{
+		if (const UObject* ReferencedObject = ObjectProperty->GetObjectPropertyValue(ValuePtr))
+		{
+			return ReferencedObject->GetPathName();
+		}
+		return FString();
+	}
+
+	if (const FSoftObjectProperty* SoftObjectProperty = CastField<FSoftObjectProperty>(AssetProperty))
+	{
+		if (const FSoftObjectPtr* SoftObjectValue = SoftObjectProperty->ContainerPtrToValuePtr<FSoftObjectPtr>(StructMemory))
+		{
+			const FSoftObjectPath SoftPath = SoftObjectValue->ToSoftObjectPath();
+			if (SoftPath.IsValid())
+			{
+				return SoftPath.ToString();
+			}
+		}
+	}
+
+	return FString();
+}
+
+void AppendChooserStandaloneMeta_ExportBpy(UObject* Asset, const TSharedPtr<FJsonObject>& Meta)
+{
+	if (!Meta.IsValid() || !IsChooserTableAsset_ExportBpy(Asset))
+	{
+		return;
+	}
+
+	if (const FProperty* ResultTypeProperty = FindFProperty<FProperty>(Asset->GetClass(), TEXT("ResultType")))
+	{
+		const void* ValuePtr = ResultTypeProperty->ContainerPtrToValuePtr<void>(Asset);
+		FString ResultTypeText;
+		ResultTypeProperty->ExportTextItem_Direct(ResultTypeText, ValuePtr, nullptr, Asset, PPF_None);
+		Meta->SetStringField(TEXT("chooser_result_type"), ResultTypeText);
+	}
+
+	if (const FObjectPropertyBase* OutputObjectTypeProperty = FindFProperty<FObjectPropertyBase>(Asset->GetClass(), TEXT("OutputObjectType")))
+	{
+		const void* ValuePtr = OutputObjectTypeProperty->ContainerPtrToValuePtr<void>(Asset);
+		if (const UClass* OutputClass = Cast<UClass>(OutputObjectTypeProperty->GetObjectPropertyValue(ValuePtr)))
+		{
+			Meta->SetStringField(TEXT("chooser_output_object_type"), OutputClass->GetPathName());
+		}
+		else
+		{
+			Meta->SetStringField(TEXT("chooser_output_object_type"), TEXT(""));
+		}
+	}
+
+	if (const FStructProperty* FallbackProperty = FindFProperty<FStructProperty>(Asset->GetClass(), TEXT("FallbackResult")))
+	{
+		if (FallbackProperty->Struct == FInstancedStruct::StaticStruct())
+		{
+			if (const FInstancedStruct* FallbackStruct = FallbackProperty->ContainerPtrToValuePtr<FInstancedStruct>(Asset))
+			{
+				Meta->SetStringField(
+					TEXT("chooser_fallback_asset"),
+					ExtractChooserAssetReferenceFromInstancedStruct_ExportBpy(*FallbackStruct));
+			}
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ResultAssetsJson;
+	if (const FArrayProperty* ResultsProperty = FindFProperty<FArrayProperty>(Asset->GetClass(), TEXT("ResultsStructs")))
+	{
+		const FStructProperty* InnerStructProperty = CastField<FStructProperty>(ResultsProperty->Inner);
+		if (InnerStructProperty && InnerStructProperty->Struct == FInstancedStruct::StaticStruct())
+		{
+			FScriptArrayHelper ResultsArrayHelper(
+				ResultsProperty,
+				ResultsProperty->ContainerPtrToValuePtr<void>(Asset));
+
+			for (int32 Index = 0; Index < ResultsArrayHelper.Num(); ++Index)
+			{
+				const FInstancedStruct* ResultStruct =
+					reinterpret_cast<const FInstancedStruct*>(ResultsArrayHelper.GetRawPtr(Index));
+				if (!ResultStruct)
+				{
+					continue;
+				}
+
+				const FString AssetPath =
+					ExtractChooserAssetReferenceFromInstancedStruct_ExportBpy(*ResultStruct);
+				if (!AssetPath.IsEmpty())
+				{
+					ResultAssetsJson.Add(MakeShared<FJsonValueString>(AssetPath));
+				}
+			}
+		}
+	}
+
+	Meta->SetArrayField(TEXT("chooser_result_assets"), ResultAssetsJson);
+}
+
 TSharedPtr<FJsonObject> BuildStandaloneAssetMeta_ExportBpy(UObject* Asset)
 {
 	TSharedPtr<FJsonObject> Meta = MakeShared<FJsonObject>();
@@ -587,7 +778,15 @@ TSharedPtr<FJsonObject> BuildStandaloneAssetMeta_ExportBpy(UObject* Asset)
 	Meta->SetStringField(TEXT("kind"), TEXT("standalone_asset"));
 	Meta->SetStringField(TEXT("asset"), Asset->GetPathName());
 	Meta->SetStringField(TEXT("asset_class"), Asset->GetClass()->GetPathName());
-	Meta->SetStringField(TEXT("export_type"), TEXT("generic_object"));
+	if (const UUserDefinedEnum* UserDefinedEnum = Cast<UUserDefinedEnum>(Asset))
+	{
+		Meta->SetStringField(TEXT("export_type"), TEXT("user_defined_enum"));
+		Meta->SetArrayField(TEXT("enum_entries"), SerializeUserDefinedEnumEntries_ExportBpy(UserDefinedEnum));
+	}
+	else
+	{
+		Meta->SetStringField(TEXT("export_type"), TEXT("generic_object"));
+	}
 	Meta->SetStringField(TEXT("outer"), Asset->GetOuter() ? Asset->GetOuter()->GetPathName() : TEXT(""));
 	Meta->SetStringField(TEXT("package"), Asset->GetOutermost() ? Asset->GetOutermost()->GetName() : TEXT(""));
 	TSharedPtr<FJsonObject> PropertiesJson =
@@ -597,6 +796,7 @@ TSharedPtr<FJsonObject> BuildStandaloneAssetMeta_ExportBpy(UObject* Asset)
 		TEXT("properties"),
 		PropertiesJson);
 	Meta->SetArrayField(TEXT("subobjects"), SerializeStandaloneSubobjects_ExportBpy(Asset));
+	AppendChooserStandaloneMeta_ExportBpy(Asset, Meta);
 	return Meta;
 }
 
@@ -933,6 +1133,32 @@ FString BuildModuleName_ExportBpy(const FString& Prefix, const FString& GraphNam
 	return Prefix + SanitizePythonIdentifier_ExportBpy(GraphName, TEXT("graph"));
 }
 
+void CollectGraphModuleNames_ExportBpy(UBlueprint* BP, TArray<FString>& OutGraphModules)
+{
+	OutGraphModules.Reset();
+	if (!BP)
+	{
+		return;
+	}
+
+	auto Collect = [&OutGraphModules](const TArray<UEdGraph*>& Graphs, const FString& Prefix)
+	{
+		for (UEdGraph* Graph : Graphs)
+		{
+			if (!Graph)
+			{
+				continue;
+			}
+
+			OutGraphModules.Add(BuildModuleName_ExportBpy(Prefix, Graph->GetName()));
+		}
+	};
+
+	Collect(BP->FunctionGraphs, TEXT("fn_"));
+	Collect(BP->MacroGraphs, TEXT("macro_"));
+	Collect(BP->UbergraphPages, TEXT("evt_"));
+}
+
 FString BuildPinRefFallback_ExportBpy(const FString& NodeVar, const FString& RawPinName)
 {
 	return FString::Printf(TEXT("%s[%s]"), *NodeVar, *MakePythonStringLiteral_ExportBpy(RawPinName));
@@ -1109,6 +1335,7 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 	else if (const UK2Node_VariableGet* VG = Cast<UK2Node_VariableGet>(Node))
 	{
 		Info.FunctionName = VG->VariableReference.GetMemberName().ToString();
+		Info.NodeProps.Add(TEXT("VariableGetIsPure"), VG->IsNodePure() ? TEXT("true") : TEXT("false"));
 	}
 	else if (const UK2Node_VariableSet* VS = Cast<UK2Node_VariableSet>(Node))
 	{
@@ -1283,6 +1510,13 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		{
 			Info.DefaultValues.Add(LogicalPinName.IsEmpty() ? RawPinName : LogicalPinName, PinDefaultValue);
 		}
+	}
+
+	if (Info.NodeType.StartsWith(TEXT("AnimGraphNode_")))
+	{
+		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
+		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("ShowPinForProperties"));
+		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("CustomPinProperties"));
 	}
 
 	return Info;
@@ -1584,39 +1818,56 @@ bool UBPDirectExporter::ReadBlueprintToBpyText(
 		return false;
 	}
 
-	const TSharedPtr<FJsonObject> Root = SerializeBlueprintToJson(BP);
-	if (!Root.IsValid())
+	TArray<FString> GraphModules;
+	CollectGraphModuleNames_ExportBpy(BP, GraphModules);
+
+	FString ParentClass = TEXT("/Script/Engine.Actor");
+	if (BP->ParentClass)
 	{
-		OutError = FString::Printf(TEXT("Failed to serialize blueprint: %s"), *BlueprintPath);
-		return false;
+		ParentClass = BP->ParentClass->GetPathName();
 	}
 
-	const FString PrettyJson = SerializeJsonPretty_ExportBpy(Root);
-	const FString BlueprintAssetPath = GetJsonStringField_ExportBpy(Root, TEXT("path"), BP->GetPathName());
-	const FString Parent = GetJsonStringField_ExportBpy(Root, TEXT("parent"), BP->ParentClass ? BP->ParentClass->GetPathName() : TEXT(""));
-	const FString BlueprintType = GetJsonStringField_ExportBpy(Root, TEXT("bp_type"), BP->IsA<UAnimBlueprint>() ? TEXT("AnimBlueprint") : TEXT("Normal"));
+	const FString BlueprintAssetPath = BP->GetPathName();
+	const FString BlueprintType = BP->IsA<UAnimBlueprint>() ? TEXT("AnimBlueprint") : TEXT("Normal");
 
-	TArray<FString> Lines;
-	Lines.Add(TEXT("# -*- coding: utf-8 -*-"));
-	Lines.Add(TEXT("\"\"\""));
-	Lines.Add(TEXT("UE Blueprint Export"));
-	Lines.Add(FString::Printf(TEXT("path:    %s"), *BlueprintAssetPath));
-	Lines.Add(FString::Printf(TEXT("Parent:  %s"), *Parent));
-	Lines.Add(FString::Printf(TEXT("Type:    %s"), *BlueprintType));
-	Lines.Add(TEXT("Schema:  1"));
-	Lines.Add(TEXT("\"\"\""));
-	Lines.Add(TEXT("import json"));
-	Lines.Add(TEXT(""));
-	Lines.Add(TEXT("# bp contains the full Blueprint structure in a single LLM-readable Python file."));
-	Lines.Add(FString::Printf(TEXT("bp = json.loads(%s)"), *MakePythonMultilineStringLiteral_ExportBpy(PrettyJson)));
-	Lines.Add(TEXT(""));
-	Lines.Add(TEXT("def get_blueprint_data():"));
-	Lines.Add(TEXT("    return json.loads(json.dumps(bp))"));
-	Lines.Add(TEXT(""));
-	Lines.Add(TEXT("if __name__ == \"__main__\":"));
-	Lines.Add(TEXT("    print(json.dumps(bp, ensure_ascii=False, indent=2))"));
+	FString Content;
+	Content += TEXT("# Auto-generated by ExportBpy\n");
+	Content += TEXT("import importlib.util\n");
+	Content += TEXT("import os\n");
+	Content += TEXT("from ue_bp_dsl import Blueprint\n");
+	Content += TEXT("\n");
+	Content += TEXT("def _load_graph_module(stem):\n");
+	Content += TEXT("    file_path = os.path.join(os.path.dirname(__file__), f\"{stem}.bp.py\")\n");
+	Content += TEXT("    spec = importlib.util.spec_from_file_location(f\"_exportbpy_graph_{stem}\", file_path)\n");
+	Content += TEXT("    if spec is None or spec.loader is None:\n");
+	Content += TEXT("        raise ImportError(f\"Cannot load graph module: {file_path}\")\n");
+	Content += TEXT("    module = importlib.util.module_from_spec(spec)\n");
+	Content += TEXT("    spec.loader.exec_module(module)\n");
+	Content += TEXT("    return module\n\n");
+	Content += TEXT("_GRAPH_MODULES = [\n");
+	for (const FString& ModuleName : GraphModules)
+	{
+		Content += FString::Printf(TEXT("    _load_graph_module(%s),\n"), *MakePythonStringLiteral_ExportBpy(ModuleName));
+	}
+	Content += TEXT("]\n\n");
 
-	OutBpyText = FString::Join(Lines, TEXT("\n"));
+	Content += FString::Printf(
+		TEXT("bp = Blueprint(\n    path=%s,\n    parent=%s,\n    bp_type=%s,\n)\n\n"),
+		*MakePythonStringLiteral_ExportBpy(BlueprintAssetPath),
+		*MakePythonStringLiteral_ExportBpy(ParentClass),
+		*MakePythonStringLiteral_ExportBpy(BlueprintType));
+
+	Content += GenerateVariablesSection(BP);
+	Content += GenerateClassDefaultsSection(BP);
+	Content += GenerateInheritedComponentDefaultsSection(BP);
+	Content += GenerateComponentsSection(BP);
+	Content += GenerateInterfacesSection(BP);
+	Content += GenerateDispatchersSection(BP);
+	Content += TEXT("bp.build()\n");
+	Content += TEXT("for _graph_module in _GRAPH_MODULES:\n");
+	Content += TEXT("    _graph_module.register(bp)\n");
+
+	OutBpyText = MoveTemp(Content);
 	return true;
 }
 
@@ -1885,6 +2136,27 @@ FString UBPDirectExporter::GenerateClassDefaultsSection(UBlueprint* BP)
 			*MakePythonStringLiteral_ExportBpy(Prop->GetName()),
 			*PyValue);
 		bHadAny = true;
+	}
+
+	if (const UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(BP))
+	{
+		if (AnimBP->TargetSkeleton)
+		{
+			Out += FString::Printf(
+				TEXT("bp.default(%s, %s)\n"),
+				*MakePythonStringLiteral_ExportBpy(TEXT("TargetSkeleton")),
+				*MakePythonStringLiteral_ExportBpy(AnimBP->TargetSkeleton->GetPathName()));
+			bHadAny = true;
+		}
+
+		if (USkeletalMesh* PreviewMesh = AnimBP->GetPreviewMesh())
+		{
+			Out += FString::Printf(
+				TEXT("bp.default(%s, %s)\n"),
+				*MakePythonStringLiteral_ExportBpy(TEXT("PreviewSkeletalMesh")),
+				*MakePythonStringLiteral_ExportBpy(PreviewMesh->GetPathName()));
+			bHadAny = true;
+		}
 	}
 
 	Out += TEXT("\n");

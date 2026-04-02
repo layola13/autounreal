@@ -5,7 +5,7 @@ bp_importer.py — 从 Python DSL 导入蓝图到 Unreal
 
 支持两种输入：
   1. 目录模式（推荐）：目录内包含 __bp__.bp.py + evt_/fn_/macro_/tl_*.bp.py + *_meta.py
-  2. 单文件模式：单个低层 .bp.py 文件
+  2. 单文件模式：单个低层 .bp.py 文件，或目录级入口 <BlueprintName>.bp.py
 """
 
 from __future__ import annotations
@@ -31,6 +31,15 @@ GRAPH_PREFIXES = ("evt_", "fn_", "macro_", "tl_")
 MAIN_BP_FILE = "__bp__.bp.py"
 
 
+def _exec_pin_variants(pin_name: str) -> Tuple[str, ...]:
+    normalized = str(pin_name or "")
+    if normalized == "exec":
+        return ("exec", "execute")
+    if normalized == "execute":
+        return ("execute", "exec")
+    return (normalized,)
+
+
 def _graph_module_stem(file_name: str) -> str:
     if file_name.endswith(".bp.py"):
         return file_name[:-6]
@@ -51,6 +60,18 @@ def _graph_meta_path(dir_path: str, file_name: str) -> str:
     return os.path.join(dir_path, _graph_module_stem(file_name) + "_meta.py")
 
 
+def _is_directory_entry_file(py_path: str) -> bool:
+    file_name = os.path.basename(py_path)
+    if file_name == MAIN_BP_FILE:
+        return True
+    if not file_name.endswith(".bp.py") or file_name.endswith("_meta.py"):
+        return False
+    if _is_graph_dsl_file(file_name):
+        return False
+    directory_name = os.path.basename(os.path.dirname(py_path.rstrip("\\/")))
+    return bool(directory_name) and file_name == f"{directory_name}.bp.py"
+
+
 def _load_meta_dict(meta_path: str) -> Optional[Dict[str, Any]]:
     if not os.path.isfile(meta_path):
         return None
@@ -66,6 +87,140 @@ def _load_meta_dict(meta_path: str) -> Optional[Dict[str, Any]]:
                 value = ast.literal_eval(stmt.value)
                 return value if isinstance(value, dict) else None
     return None
+
+
+def _find_legacy_variable_export_path(source_path: str, blueprint_name: str) -> Optional[str]:
+    if not blueprint_name:
+        return None
+
+    base_dir = source_path if os.path.isdir(source_path) else os.path.dirname(source_path)
+    if not base_dir:
+        return None
+
+    cursor = os.path.abspath(base_dir)
+    search_roots: List[str] = []
+    for _ in range(6):
+        search_roots.append(cursor)
+        parent = os.path.dirname(cursor)
+        if not parent or parent == cursor:
+            break
+        cursor = parent
+
+    file_name = f"{blueprint_name}.yaml"
+    for root in search_roots:
+        for candidate in (
+            os.path.join(root, "variables", file_name),
+            os.path.join(root, "ExportedBlueprints", "variables", file_name),
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _extract_legacy_controlrig_dest_properties(node_text: str) -> List[str]:
+    match = re.search(r"DestPropertyNames=\((.*?)\)", node_text)
+    if match is None:
+        return []
+
+    seen: Set[str] = set()
+    result: List[str] = []
+    for value in re.findall(r'"([^\"]+)"', match.group(1)):
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def _build_legacy_controlrig_custom_pin_properties(dest_properties: List[str]) -> str:
+    entries = [
+        f'(PropertyName="{name}",bShowPin=True,bCanToggleVisibility=True,bIsOverrideEnabled=False)'
+        for name in dest_properties
+        if name
+    ]
+    if not entries:
+        return ""
+    return "(" + ",".join(entries) + ")"
+
+
+def _load_legacy_anim_node_props(variable_export_path: str) -> Dict[str, Dict[str, Any]]:
+    if not os.path.isfile(variable_export_path):
+        return {}
+
+    node_props: Dict[str, Dict[str, Any]] = {}
+    current_name = ""
+    current_cpp_type = ""
+    with open(variable_export_path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if line.startswith("name: "):
+                try:
+                    current_name = str(ast.literal_eval(line.split(":", 1)[1].strip()))
+                except Exception:
+                    current_name = line.split(":", 1)[1].strip().strip("\"'")
+                continue
+
+            if line.startswith("cpp_type: "):
+                try:
+                    current_cpp_type = str(ast.literal_eval(line.split(":", 1)[1].strip()))
+                except Exception:
+                    current_cpp_type = line.split(":", 1)[1].strip().strip("\"'")
+                continue
+
+            if not line.startswith("default_value: ") or not current_name or not current_cpp_type:
+                continue
+
+            try:
+                default_value = str(ast.literal_eval(line.split(":", 1)[1].strip()))
+            except Exception:
+                default_value = line.split(":", 1)[1].strip().strip("\"'")
+
+            if current_name.startswith("AnimGraphNode_") and current_cpp_type.startswith("FAnimNode_"):
+                props: Dict[str, Any] = {"Node": default_value}
+                if current_cpp_type == "FAnimNode_ControlRig":
+                    custom_pin_props = _build_legacy_controlrig_custom_pin_properties(
+                        _extract_legacy_controlrig_dest_properties(default_value)
+                    )
+                    if custom_pin_props:
+                        props["CustomPinProperties"] = custom_pin_props
+                node_props[current_name] = props
+
+            current_name = ""
+            current_cpp_type = ""
+
+    return node_props
+
+
+def _augment_legacy_animgraph_node_props(bp: Any, source_path: str) -> None:
+    blueprint_name = str(getattr(bp, "_name", "") or "").strip()
+    if not blueprint_name:
+        blueprint_name = os.path.basename(source_path.rstrip("\\/"))
+        if blueprint_name.endswith(".bp.py"):
+            blueprint_name = blueprint_name[:-6]
+
+    variable_export_path = _find_legacy_variable_export_path(source_path, blueprint_name)
+    if not variable_export_path:
+        return
+
+    legacy_node_props = _load_legacy_anim_node_props(variable_export_path)
+    if not legacy_node_props:
+        return
+
+    for graph in getattr(bp, "_graphs", []):
+        if str(getattr(graph, "name", "") or "") != "AnimGraph":
+            continue
+
+        for node in getattr(graph, "nodes", []):
+            readable_name = str(getattr(node, "readable_name", "") or "")
+            props = legacy_node_props.get(readable_name)
+            if not props:
+                continue
+
+            extra_props = getattr(node, "extra_props", None)
+            if not isinstance(extra_props, dict):
+                continue
+
+            for key, value in props.items():
+                extra_props.setdefault(key, value)
 
 
 def import_directory(
@@ -127,7 +282,7 @@ def import_file_with_details(
     if not os.path.isfile(py_path):
         return _error_details(f"文件不存在: {py_path}")
 
-    if os.path.basename(py_path) == MAIN_BP_FILE:
+    if _is_directory_entry_file(py_path):
         return import_directory_with_details(
             os.path.dirname(py_path),
             target_path=target_path,
@@ -303,6 +458,7 @@ def _exec_directory_dsl(dir_path: str):
             for info in graph_infos:
                 _apply_graph_source_info(bp, info, graph_meta, used_graph_indexes)
 
+        _augment_legacy_animgraph_node_props(bp, dir_path)
         return bp
     finally:
         stale_keys = [key for key in sys.modules if key == package_name or key.startswith(package_name + ".")]
@@ -380,6 +536,7 @@ def _exec_file_dsl(py_path: str):
     for info in graph_infos:
         _apply_graph_source_info(bp, info, meta, used_graph_indexes)
 
+    _augment_legacy_animgraph_node_props(bp, py_path)
     return bp
 
 
@@ -532,7 +689,9 @@ def _apply_graph_source_info(
         readable_name, pin_name = alias_key.split(".", 1)
         node = node_by_name.get(readable_name)
         if node is not None:
-            node.pin_aliases[pin_name] = str(full_pin_name)
+            alias_value = str(full_pin_name)
+            for pin_variant in _exec_pin_variants(pin_name):
+                node.pin_aliases[pin_variant] = alias_value
 
     for pin_key, pin_id in pin_id_map.items():
         if "." not in pin_key:
@@ -540,7 +699,9 @@ def _apply_graph_source_info(
         readable_name, pin_name = pin_key.split(".", 1)
         node = node_by_name.get(readable_name)
         if node is not None:
-            node.pin_ids[pin_name] = str(pin_id)
+            pin_id_value = str(pin_id)
+            for pin_variant in _exec_pin_variants(pin_name):
+                node.pin_ids[pin_variant] = pin_id_value
 
 
 _MISSING_NODE_RE = re.compile(

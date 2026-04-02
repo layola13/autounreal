@@ -19,7 +19,6 @@
 #include "UObject/UObjectIterator.h"
 #include "Engine/Selection.h"
 #include "EditorAssetLibrary.h"
-#include "AssetRegistry/AssetRegistryModule.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "BlueprintNodeSpawner.h"
 #include "BlueprintActionDatabase.h"
@@ -126,21 +125,6 @@ bool TryLoadBlueprintFromReference(const FString& BlueprintReference, UBlueprint
     return false;
 }
 
-bool TryLoadBlueprintFromAssetData(const FAssetData& AssetData, UBlueprint*& OutBlueprint)
-{
-    if (!AssetData.IsValid())
-    {
-        return false;
-    }
-
-    if (UBlueprint* Blueprint = Cast<UBlueprint>(AssetData.GetAsset()))
-    {
-        OutBlueprint = Blueprint;
-        return true;
-    }
-
-    return false;
-}
 }
 
 // JSON Utilities
@@ -300,75 +284,67 @@ UBlueprint* FEpicUnrealMCPCommonUtils::FindBlueprintByName(const FString& Bluepr
         }
     }
 
-    FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-    for (const FString& CandidateReference : CandidateReferences)
-    {
-        FAssetData AssetData = AssetRegistryModule.Get().GetAssetByObjectPath(FSoftObjectPath(NormalizeBlueprintReference(CandidateReference)));
-        if (TryLoadBlueprintFromAssetData(AssetData, Blueprint))
-        {
-            return Blueprint;
-        }
-    }
-
     const FString TargetAssetName = GetBlueprintAssetName(NormalizedBlueprintName);
     if (!TargetAssetName.IsEmpty())
     {
-        TArray<FAssetData> AssetsUnderGame;
-        AssetRegistryModule.Get().GetAssetsByPath(FName(TEXT("/Game")), AssetsUnderGame, true);
-
-        TArray<FAssetData> MatchingBlueprintAssets;
-        for (const FAssetData& AssetData : AssetsUnderGame)
+        TArray<FString> MatchingAssetPaths;
+        for (const FString& AssetPath : UEditorAssetLibrary::ListAssets(TEXT("/Game"), true, false))
         {
-            if (!AssetData.AssetName.ToString().Equals(TargetAssetName, ESearchCase::IgnoreCase))
+            if (!FPackageName::GetLongPackageAssetName(AssetPath).Equals(TargetAssetName, ESearchCase::IgnoreCase))
             {
                 continue;
             }
 
-            MatchingBlueprintAssets.Add(AssetData);
+            if (!UEditorAssetLibrary::DoesAssetExist(AssetPath))
+            {
+                continue;
+            }
+
+            MatchingAssetPaths.Add(AssetPath);
         }
 
-        if (MatchingBlueprintAssets.Num() > 0)
+        if (MatchingAssetPaths.Num() > 0)
         {
-            MatchingBlueprintAssets.Sort([](const FAssetData& A, const FAssetData& B)
+            MatchingAssetPaths.Sort([](const FString& A, const FString& B)
             {
-                return A.GetObjectPathString() < B.GetObjectPathString();
+                return A < B;
             });
 
             int32 PreferredIndex = 0;
-            for (int32 Index = 0; Index < MatchingBlueprintAssets.Num(); ++Index)
+            for (int32 Index = 0; Index < MatchingAssetPaths.Num(); ++Index)
             {
-                if (MatchingBlueprintAssets[Index].GetObjectPathString().Contains(TEXT("/Blueprints/")))
+                if (MatchingAssetPaths[Index].Contains(TEXT("/Blueprints/")))
                 {
                     PreferredIndex = Index;
                     break;
                 }
             }
 
-            if (MatchingBlueprintAssets.Num() > 1)
+            if (MatchingAssetPaths.Num() > 1)
             {
                 UE_LOG(
                     LogTemp,
                     Warning,
                     TEXT("FindBlueprintByName: Multiple blueprints matched '%s'. Using '%s'"),
                     *BlueprintName,
-                    *MatchingBlueprintAssets[PreferredIndex].GetObjectPathString());
+                    *MatchingAssetPaths[PreferredIndex]);
             }
 
-            if (TryLoadBlueprintFromAssetData(MatchingBlueprintAssets[PreferredIndex], Blueprint))
+            if (UBlueprint* EditorLoadedBlueprint = Cast<UBlueprint>(UEditorAssetLibrary::LoadAsset(MatchingAssetPaths[PreferredIndex])))
             {
-                return Blueprint;
+                return EditorLoadedBlueprint;
             }
 
-            for (int32 Index = 0; Index < MatchingBlueprintAssets.Num(); ++Index)
+            for (int32 Index = 0; Index < MatchingAssetPaths.Num(); ++Index)
             {
                 if (Index == PreferredIndex)
                 {
                     continue;
                 }
 
-                if (TryLoadBlueprintFromAssetData(MatchingBlueprintAssets[Index], Blueprint))
+                if (UBlueprint* EditorLoadedBlueprint = Cast<UBlueprint>(UEditorAssetLibrary::LoadAsset(MatchingAssetPaths[Index])))
                 {
-                    return Blueprint;
+                    return EditorLoadedBlueprint;
                 }
             }
         }

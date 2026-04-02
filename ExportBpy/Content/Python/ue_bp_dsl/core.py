@@ -256,7 +256,8 @@ class NodeProxy:
     @property
     def exec(self) -> PinRef:
         """输入执行 Pin（接收执行流）。"""
-        return PinRef(self._node, self._graph, "execute", "input")
+        pin_name = "exec" if self._node.node_class == "K2Node_MacroInstance" else "execute"
+        return PinRef(self._node, self._graph, pin_name, "input")
 
     @property
     def then(self) -> PinRef:
@@ -464,7 +465,16 @@ class GraphContext:
         """
         通用 fallback 工厂，用于兼容旧导出器和未语义化节点。
         """
-        node_class = type if type.startswith("K2Node_") else f"K2Node_{type}"
+        if (
+            type.startswith("K2Node_")
+            or type.startswith("AnimGraphNode_")
+            or type.startswith("EdGraphNode_")
+            or type.startswith("/")
+            or "." in type
+        ):
+            node_class = type
+        else:
+            node_class = f"K2Node_{type}"
         resolved_target = target_type or struct_type or enum_type
 
         kwargs: Dict[str, Any] = {"pos": pos}
@@ -695,6 +705,42 @@ class Blueprint:
 
 def _serialize_graph(g: _Graph) -> Dict[str, Any]:
     node_by_uid = {n.uid: n for n in g.nodes}
+    exec_like_var_get_pins = {"exec", "execute", "then", "else"}
+
+    def _normalize_var_get_metadata(node: _Node) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, str]]:
+        node_props = dict(node.extra_props)
+        pin_aliases = dict(node.pin_aliases)
+        pin_ids = dict(node.pin_ids)
+
+        if node.node_class != "K2Node_VariableGet":
+            return node_props, pin_aliases, pin_ids
+
+        has_exec_flow = any(
+            (connection.src_node_uid == node.uid and connection.src_pin in exec_like_var_get_pins)
+            or (connection.dst_node_uid == node.uid and connection.dst_pin in exec_like_var_get_pins)
+            for connection in g.connections
+        )
+
+        if has_exec_flow:
+            node_props["VariableGetIsPure"] = "false"
+            return node_props, pin_aliases, pin_ids
+
+        # Manual `.bp.py` edits commonly collapse validated gets back to a plain
+        # `g.get_var(...)` while leaving stale exec-related meta behind. Treat the
+        # actual graph connections as authoritative so old meta cannot recreate an
+        # impure get with an unconnected exec pin during import.
+        node_props["VariableGetIsPure"] = "true"
+        pin_aliases = {
+            pin_name: full_pin_name
+            for pin_name, full_pin_name in pin_aliases.items()
+            if pin_name not in exec_like_var_get_pins
+        }
+        pin_ids = {
+            pin_name: pin_id
+            for pin_name, pin_id in pin_ids.items()
+            if pin_name not in exec_like_var_get_pins
+        }
+        return node_props, pin_aliases, pin_ids
 
     return {
         "name":       g.name,
@@ -720,9 +766,9 @@ def _serialize_graph(g: _Graph) -> Dict[str, Any]:
                 "pos_y":        n.pos_y,
                 "readable_name": n.readable_name,
                 "node_guid":    n.node_guid,
-                "node_props":   n.extra_props,
-                "pin_aliases":  n.pin_aliases,
-                "pin_ids":      n.pin_ids,
+                "node_props":   _normalize_var_get_metadata(n)[0],
+                "pin_aliases":  _normalize_var_get_metadata(n)[1],
+                "pin_ids":      _normalize_var_get_metadata(n)[2],
             }
             for n in g.nodes
         ],

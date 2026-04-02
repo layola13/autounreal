@@ -44,4 +44,7 @@ private:
 
     // Blueprint actor spawning
     TSharedPtr<FJsonObject> HandleSpawnBlueprintActor(const TSharedPtr<FJsonObject>& Params);
+
+    // Pose Search Database
+    TSharedPtr<FJsonObject> HandleAddAnimationsToPoseSearchDatabase(const TSharedPtr<FJsonObject>& Params);
 }; 

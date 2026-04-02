@@ -61,7 +61,8 @@ public:
 		FString& OutError);
 
 	/**
-	 * 读取 Blueprint 并返回单文件、LLM 可读的 Python bpy 文本。
+	 * 读取 Blueprint 并返回包入口形式的 Python DSL bpy 文本。
+	 * 该文本与 __bp__.bp.py 保持同构，会引用同目录下的 event/function 图文件。
 	 *
 	 * @param BlueprintPath  Unreal 软对象路径
 	 * @param OutBpyText     返回生成的 bpy 文本
@@ -75,7 +76,8 @@ public:
 		FString& OutError);
 
 	/**
-	 * 导出 Blueprint 到单文件 bpy。
+	 * 导出 Blueprint 包入口到 .bp.py。
+	 * 输出文件是合法 Python DSL 入口脚本，不再嵌入 JSON。
 	 *
 	 * @param BlueprintPath  Unreal 软对象路径
 	 * @param OutputPath     输出文件的绝对路径或目录

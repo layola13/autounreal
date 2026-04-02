@@ -4,6 +4,11 @@
 
 #include "Engine/Blueprint.h"
 #include "Animation/AnimBlueprint.h"
+#include "Animation/AnimBlueprintGeneratedClass.h"
+#include "Animation/AnimInstance.h"
+#include "Animation/Skeleton.h"
+#include "AnimationGraph.h"
+#include "AnimationGraphSchema.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
@@ -59,12 +64,30 @@
 #include "EditorAssetLibrary.h"
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectIterator.h"
+#include "StructUtils/InstancedStruct.h"
+#include "Engine/UserDefinedEnum.h"
+#include "Kismet2/EnumEditorUtils.h"
+
+#if PLATFORM_WINDOWS
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include <Windows.h>
+#include "Windows/HideWindowsPlatformTypes.h"
+#endif
 
 namespace
 {
 USCS_Node* FindComponentNodeByName_ImportBpy(UBlueprint* BP, const FString& ComponentName);
 FString GetNodePropString_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson, const TCHAR* Key);
 UClass* ResolveNodeClass_ImportBpy(const FString& NodeClassName);
+bool RestoreVariableGetPurity_ImportBpy(UK2Node_VariableGet* Node, bool bIsPure);
+bool ShouldRestoreImpureVariableGet_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson);
+FBPVariableDescription* FindBlueprintVariableDescription_ImportBpy(UBlueprint* BP, const FName& VariableName);
+bool CanSafelyOverwritePackageFile_ImportBpy(const FString& PackageFileName, FString& OutError);
+bool SyncBlueprintVariableDescriptionFromJson_ImportBpy(
+	FBPVariableDescription& Variable,
+	const TSharedPtr<FJsonObject>& VarJson,
+	const FEdGraphPinType& PinType,
+	const FString& DefaultValue);
 
 template <typename TObject>
 TObject* ResolveNamedObject_ImportBpy(const FString& Name)
@@ -132,6 +155,330 @@ TObject* ResolveNamedObject_ImportBpy(const FString& Name)
 	}
 
 	return nullptr;
+}
+
+USkeleton* ResolveAnimBlueprintTargetSkeletonFromAssetRegistry_ImportBpy(const FString& BlueprintPath)
+{
+	if (BlueprintPath.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	FString ObjectPath = BlueprintPath;
+	if (BlueprintPath.StartsWith(TEXT("/")) && !BlueprintPath.Contains(TEXT(".")))
+	{
+		const FString AssetName = FPackageName::GetLongPackageAssetName(BlueprintPath);
+		if (!AssetName.IsEmpty())
+		{
+			ObjectPath = FString::Printf(TEXT("%s.%s"), *BlueprintPath, *AssetName);
+		}
+	}
+
+	FAssetRegistryModule& AssetRegistryModule =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	const FAssetData AssetData =
+		AssetRegistryModule.Get().GetAssetByObjectPath(FSoftObjectPath(ObjectPath));
+	if (!AssetData.IsValid())
+	{
+		return nullptr;
+	}
+
+	if (const FAssetDataTagMapSharedView::FFindTagResult TargetSkeletonTag =
+			AssetData.TagsAndValues.FindTag(TEXT("TargetSkeleton"));
+		TargetSkeletonTag.IsSet())
+	{
+		return ResolveNamedObject_ImportBpy<USkeleton>(FString(TargetSkeletonTag.GetValue()));
+	}
+
+	TArray<FName> Dependencies;
+	const FString PackageName = FPackageName::ObjectPathToPackageName(ObjectPath);
+	AssetRegistryModule.Get().GetDependencies(
+		FName(*PackageName),
+		Dependencies,
+		UE::AssetRegistry::EDependencyCategory::Package,
+		UE::AssetRegistry::EDependencyQuery::Hard);
+
+	for (const FName& Dependency : Dependencies)
+	{
+		if (USkeleton* Skeleton = ResolveNamedObject_ImportBpy<USkeleton>(Dependency.ToString()))
+		{
+			return Skeleton;
+		}
+	}
+
+	return nullptr;
+}
+
+bool RestoreVariableGetPurity_ImportBpy(UK2Node_VariableGet* Node, bool bIsPure)
+{
+	if (!Node)
+	{
+		return false;
+	}
+
+	EGetNodeVariation DesiredVariation = EGetNodeVariation::Pure;
+	if (!bIsPure)
+	{
+		if (const UEdGraphPin* ValuePin = Node->GetValuePin())
+		{
+			const FEdGraphPinType& PinType = ValuePin->PinType;
+			if (!PinType.IsContainer())
+			{
+				if (PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean)
+				{
+					DesiredVariation = EGetNodeVariation::Branch;
+				}
+				else if (
+					PinType.PinCategory == UEdGraphSchema_K2::PC_Object ||
+					PinType.PinCategory == UEdGraphSchema_K2::PC_Class ||
+					PinType.PinCategory == UEdGraphSchema_K2::PC_SoftObject ||
+					PinType.PinCategory == UEdGraphSchema_K2::PC_SoftClass)
+				{
+					DesiredVariation = EGetNodeVariation::ValidatedObject;
+				}
+			}
+		}
+	}
+
+	FProperty* VariationProperty = FindFProperty<FProperty>(UK2Node_VariableGet::StaticClass(), TEXT("CurrentVariation"));
+	if (!VariationProperty)
+	{
+		return false;
+	}
+
+	if (FEnumProperty* EnumProperty = CastField<FEnumProperty>(VariationProperty))
+	{
+		if (FNumericProperty* UnderlyingProperty = EnumProperty->GetUnderlyingProperty())
+		{
+			UnderlyingProperty->SetIntPropertyValue(EnumProperty->ContainerPtrToValuePtr<void>(Node), static_cast<uint64>(DesiredVariation));
+		}
+		else
+		{
+			return false;
+		}
+	}
+	else if (FByteProperty* ByteProperty = CastField<FByteProperty>(VariationProperty))
+	{
+		ByteProperty->SetPropertyValue_InContainer(Node, static_cast<uint8>(DesiredVariation));
+	}
+	else
+	{
+		return false;
+	}
+
+	Node->Modify();
+	Node->ReconstructNode();
+	return true;
+}
+
+FBPVariableDescription* FindBlueprintVariableDescription_ImportBpy(UBlueprint* BP, const FName& VariableName)
+{
+	if (!BP)
+	{
+		return nullptr;
+	}
+
+	for (FBPVariableDescription& Variable : BP->NewVariables)
+	{
+		if (Variable.VarName == VariableName)
+		{
+			return &Variable;
+		}
+	}
+
+	return nullptr;
+}
+
+bool SyncBlueprintVariableDescriptionFromJson_ImportBpy(
+	FBPVariableDescription& Variable,
+	const TSharedPtr<FJsonObject>& VarJson,
+	const FEdGraphPinType& PinType,
+	const FString& DefaultValue)
+{
+	bool bChanged = false;
+
+	if (Variable.VarType != PinType)
+	{
+		Variable.VarType = PinType;
+		bChanged = true;
+	}
+
+	if (Variable.DefaultValue != DefaultValue)
+	{
+		Variable.DefaultValue = DefaultValue;
+		bChanged = true;
+	}
+
+	FString Category;
+	if (VarJson->TryGetStringField(TEXT("category"), Category))
+	{
+		const FText CategoryText = FText::FromString(Category);
+		if (!Variable.Category.EqualTo(CategoryText))
+		{
+			Variable.Category = CategoryText;
+			bChanged = true;
+		}
+	}
+
+	FString Tooltip;
+	if (VarJson->TryGetStringField(TEXT("tooltip"), Tooltip))
+	{
+		const FString ExistingTooltip =
+			Variable.HasMetaData(FBlueprintMetadata::MD_Tooltip)
+				? Variable.GetMetaData(FBlueprintMetadata::MD_Tooltip)
+				: FString();
+
+		if (Tooltip.IsEmpty())
+		{
+			if (Variable.HasMetaData(FBlueprintMetadata::MD_Tooltip))
+			{
+				Variable.RemoveMetaData(FBlueprintMetadata::MD_Tooltip);
+				bChanged = true;
+			}
+		}
+		else if (ExistingTooltip != Tooltip)
+		{
+			Variable.SetMetaData(FBlueprintMetadata::MD_Tooltip, Tooltip);
+			bChanged = true;
+		}
+	}
+
+	bool bReplicated = false;
+	if (VarJson->TryGetBoolField(TEXT("replicated"), bReplicated))
+	{
+		const bool bWasReplicated = (Variable.PropertyFlags & CPF_Net) != 0;
+		if (bWasReplicated != bReplicated)
+		{
+			if (bReplicated)
+			{
+				Variable.PropertyFlags |= CPF_Net;
+			}
+			else
+			{
+				Variable.PropertyFlags &= ~CPF_Net;
+			}
+			bChanged = true;
+		}
+	}
+
+	FString RepNotify;
+	if (VarJson->TryGetStringField(TEXT("rep_notify"), RepNotify))
+	{
+		const FName RepNotifyName(*RepNotify);
+		if (Variable.RepNotifyFunc != RepNotifyName)
+		{
+			Variable.RepNotifyFunc = RepNotifyName;
+			bChanged = true;
+		}
+	}
+
+	bool bInstanceEditable = false;
+	if (VarJson->TryGetBoolField(TEXT("instance_editable"), bInstanceEditable))
+	{
+		const bool bWasInstanceEditable = (Variable.PropertyFlags & CPF_Edit) != 0;
+		if (bWasInstanceEditable != bInstanceEditable)
+		{
+			if (bInstanceEditable)
+			{
+				Variable.PropertyFlags |= CPF_Edit;
+			}
+			else
+			{
+				Variable.PropertyFlags &= ~CPF_Edit;
+			}
+			bChanged = true;
+		}
+	}
+
+	return bChanged;
+}
+
+bool CanSafelyOverwritePackageFile_ImportBpy(const FString& PackageFileName, FString& OutError)
+{
+	if (PackageFileName.IsEmpty() || !FPaths::FileExists(PackageFileName))
+	{
+		return true;
+	}
+
+#if PLATFORM_WINDOWS
+	const HANDLE FileHandle = ::CreateFileW(
+		*PackageFileName,
+		GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_READ,
+		nullptr,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+
+	if (FileHandle == INVALID_HANDLE_VALUE)
+	{
+		const DWORD LastError = ::GetLastError();
+		if (LastError == ERROR_SHARING_VIOLATION || LastError == ERROR_ACCESS_DENIED)
+		{
+			OutError = FString::Printf(
+				TEXT("Package file is locked by another process and cannot be overwritten right now: %s"),
+				*PackageFileName);
+			return false;
+		}
+
+		OutError = FString::Printf(
+			TEXT("Cannot open package file for overwrite preflight (Win32 error %lu): %s"),
+			static_cast<uint32>(LastError),
+			*PackageFileName);
+		return false;
+	}
+
+	::CloseHandle(FileHandle);
+#endif
+
+	return true;
+}
+
+static bool HasExplicitExecVariationPins_ImportBpy(const TSharedPtr<FJsonObject>& JsonObject)
+{
+	if (!JsonObject.IsValid())
+	{
+		return false;
+	}
+
+	return
+		JsonObject->HasField(TEXT("execute")) ||
+		JsonObject->HasField(TEXT("then")) ||
+		JsonObject->HasField(TEXT("else"));
+}
+
+bool ShouldRestoreImpureVariableGet_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson)
+{
+	if (!NodeJson.IsValid())
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* PinIdsObj = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("pin_ids"), PinIdsObj) && PinIdsObj && HasExplicitExecVariationPins_ImportBpy(*PinIdsObj))
+	{
+		return true;
+	}
+
+	const TSharedPtr<FJsonObject>* PinAliasesObj = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("pin_aliases"), PinAliasesObj) && PinAliasesObj && HasExplicitExecVariationPins_ImportBpy(*PinAliasesObj))
+	{
+		return true;
+	}
+
+	// `VariableGetIsPure=false` inside meta is not sufficient on its own.
+	// When users patch `.bp.py` by hand, the code can intentionally collapse a
+	// validated get back to a plain `g.get_var(...)` while the stale meta still
+	// says "impure". Recreating the validated get in that case manufactures an
+	// exec pin with no execution flow and produces the compiler warning:
+	// "Get was pruned because its Exec pin is not connected".
+	//
+	// Treat the graph DSL / compiled JSON as the source of truth for node shape.
+	// We only restore an impure get when the imported node explicitly exposes
+	// exec-like pins (`execute` / `then` / `else`), which covers real validated
+	// get and branch variations while ignoring stale metadata.
+
+	return false;
 }
 
 UBlueprint* LoadBlueprintAsset_ImportBpy(const FString& AssetPath)
@@ -556,19 +903,45 @@ UClass* ResolveNodeClass_ImportBpy(const FString& NodeClassName)
 		return NodeClass;
 	}
 
-	if (NodeClassName.StartsWith(TEXT("K2Node_")))
+	if (!NodeClassName.Contains(TEXT("/")) && !NodeClassName.Contains(TEXT(".")))
 	{
-		static const TCHAR* ScriptModules[] = {
-			TEXT("BlueprintGraph"),
-			TEXT("InputBlueprintNodes"),
-		};
+		const FString NormalizedClassName = NodeClassName.StartsWith(TEXT("U"))
+			? NodeClassName.RightChop(1)
+			: NodeClassName;
+
+		TArray<const TCHAR*> ScriptModules;
+		if (NormalizedClassName.StartsWith(TEXT("K2Node_")))
+		{
+			ScriptModules = {
+				TEXT("BlueprintGraph"),
+				TEXT("InputBlueprintNodes"),
+			};
+		}
+		else if (NormalizedClassName.StartsWith(TEXT("AnimGraphNode_")))
+		{
+			ScriptModules = {
+				TEXT("AnimGraph"),
+				TEXT("ControlRigDeveloper"),
+				TEXT("PoseSearchEditor"),
+				TEXT("ChooserUncooked"),
+			};
+		}
 
 		for (const TCHAR* ModuleName : ScriptModules)
 		{
 			if (UClass* NodeClass = ResolveNamedObject_ImportBpy<UClass>(
-				FString::Printf(TEXT("/Script/%s.%s"), ModuleName, *NodeClassName)))
+				FString::Printf(TEXT("/Script/%s.%s"), ModuleName, *NormalizedClassName)))
 			{
 				return NodeClass;
+			}
+		}
+
+		for (TObjectIterator<UClass> It; It; ++It)
+		{
+			if (It->GetName().Equals(NormalizedClassName, ESearchCase::CaseSensitive)
+				|| It->GetName().Equals(NodeClassName, ESearchCase::CaseSensitive))
+			{
+				return *It;
 			}
 		}
 	}
@@ -636,15 +1009,42 @@ bool CreateOrReplaceStandaloneAsset_ImportBpy(
 		return false;
 	}
 
-	if (!bReplaceExisting)
+	UClass* AssetClass = ResolveNamedObject_ImportBpy<UClass>(AssetClassPath);
+	if (!AssetClass)
 	{
-		if (UObject* ExistingAsset = LoadStandaloneAsset_ImportBpy(ObjectPath))
+		OutError = FString::Printf(TEXT("Cannot load asset class: %s"), *AssetClassPath);
+		return false;
+	}
+
+	if (UObject* ExistingAsset = LoadStandaloneAsset_ImportBpy(ObjectPath))
+	{
+		// Prefer in-place update when the existing asset class is compatible.
+		// This avoids force-delete failures for assets referenced by async systems.
+		if (ExistingAsset->GetClass() == AssetClass ||
+			ExistingAsset->GetClass()->IsChildOf(AssetClass) ||
+			AssetClass->IsChildOf(ExistingAsset->GetClass()))
 		{
 			OutAsset = ExistingAsset;
 			return true;
 		}
+
+		if (!bReplaceExisting)
+		{
+			OutError = FString::Printf(
+				TEXT("Existing asset class mismatch and replace is disabled: %s (existing=%s, requested=%s)"),
+				*ObjectPath,
+				*ExistingAsset->GetClass()->GetPathName(),
+				*AssetClass->GetPathName());
+			return false;
+		}
 	}
-	else if (UEditorAssetLibrary::DoesAssetExist(PackagePath))
+	else if (!bReplaceExisting)
+	{
+		OutError = FString::Printf(TEXT("Target asset does not exist and replace is disabled: %s"), *ObjectPath);
+		return false;
+	}
+
+	if (bReplaceExisting && UEditorAssetLibrary::DoesAssetExist(PackagePath))
 	{
 		if (UPackage* ExistingPackage = FindPackage(nullptr, *PackagePath))
 		{
@@ -659,13 +1059,6 @@ bool CreateOrReplaceStandaloneAsset_ImportBpy(
 			OutError = FString::Printf(TEXT("Failed to delete existing asset before import: %s"), *PackagePath);
 			return false;
 		}
-	}
-
-	UClass* AssetClass = ResolveNamedObject_ImportBpy<UClass>(AssetClassPath);
-	if (!AssetClass)
-	{
-		OutError = FString::Printf(TEXT("Cannot load asset class: %s"), *AssetClassPath);
-		return false;
 	}
 
 	UPackage* Package = CreatePackage(*PackagePath);
@@ -687,7 +1080,18 @@ bool CreateOrReplaceStandaloneAsset_ImportBpy(
 		}
 	}
 
-	OutAsset = NewObject<UObject>(Package, AssetClass, *AssetName, RF_Public | RF_Standalone);
+	if (AssetClass->IsChildOf(UUserDefinedEnum::StaticClass()))
+	{
+		OutAsset = FEnumEditorUtils::CreateUserDefinedEnum(
+			Package,
+			*AssetName,
+			RF_Public | RF_Standalone | RF_Transactional);
+	}
+	else
+	{
+		OutAsset = NewObject<UObject>(Package, AssetClass, *AssetName, RF_Public | RF_Standalone);
+	}
+
 	if (!OutAsset)
 	{
 		OutError = FString::Printf(TEXT("Failed to create asset: %s (%s)"), *ObjectPath, *AssetClassPath);
@@ -1225,6 +1629,317 @@ bool RestoreInputActionInstancedRefs_ImportBpy(
 			}
 
 			InputAction->Modifiers.Add(Modifier);
+		}
+	}
+
+	return true;
+}
+
+bool IsChooserTableAsset_ImportBpy(const UObject* Asset)
+{
+	return Asset &&
+		Asset->GetClass() &&
+		Asset->GetClass()->GetPathName().Equals(TEXT("/Script/Chooser.ChooserTable"), ESearchCase::CaseSensitive);
+}
+
+UScriptStruct* ResolveChooserAssetChooserStruct_ImportBpy()
+{
+	static const TCHAR* Candidates[] = {
+		TEXT("/Script/Chooser.AssetChooser"),
+		TEXT("AssetChooser"),
+		TEXT("FAssetChooser"),
+	};
+
+	for (const TCHAR* Candidate : Candidates)
+	{
+		if (UScriptStruct* StructObject = FindObject<UScriptStruct>(nullptr, Candidate))
+		{
+			return StructObject;
+		}
+		if (UScriptStruct* StructObject = FindFirstObjectSafe<UScriptStruct>(Candidate))
+		{
+			return StructObject;
+		}
+	}
+
+	return nullptr;
+}
+
+bool SetChooserAssetReferenceInInstancedStruct_ImportBpy(
+	FInstancedStruct& StructValue,
+	UObject* ReferencedAsset,
+	FString& OutError)
+{
+	UScriptStruct* AssetChooserStruct = ResolveChooserAssetChooserStruct_ImportBpy();
+	if (!AssetChooserStruct)
+	{
+		OutError = TEXT("Cannot resolve chooser struct: /Script/Chooser.AssetChooser");
+		return false;
+	}
+
+	StructValue.InitializeAs(AssetChooserStruct);
+	void* StructMemory = StructValue.GetMutableMemory();
+	if (!StructMemory)
+	{
+		OutError = TEXT("Failed to allocate chooser instanced struct memory.");
+		return false;
+	}
+
+	FProperty* AssetProperty = AssetChooserStruct->FindPropertyByName(TEXT("Asset"));
+	if (!AssetProperty)
+	{
+		OutError = TEXT("Chooser asset struct is missing Asset property.");
+		return false;
+	}
+
+	if (FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(AssetProperty))
+	{
+		void* ValuePtr = ObjectProperty->ContainerPtrToValuePtr<void>(StructMemory);
+		ObjectProperty->SetObjectPropertyValue(ValuePtr, ReferencedAsset);
+		return true;
+	}
+
+	if (FSoftObjectProperty* SoftObjectProperty = CastField<FSoftObjectProperty>(AssetProperty))
+	{
+		if (FSoftObjectPtr* SoftObjectPtr = SoftObjectProperty->ContainerPtrToValuePtr<FSoftObjectPtr>(StructMemory))
+		{
+			*SoftObjectPtr = ReferencedAsset ? FSoftObjectPtr(ReferencedAsset) : FSoftObjectPtr();
+			return true;
+		}
+	}
+
+	OutError = FString::Printf(
+		TEXT("Unsupported chooser asset property type on struct: %s"),
+		*AssetChooserStruct->GetPathName());
+	return false;
+}
+
+bool PopulateChooserResultsFromAssetPaths_ImportBpy(
+	UObject* Asset,
+	const TArray<FString>& ResultAssetPaths,
+	FString& OutError)
+{
+	if (!Asset)
+	{
+		OutError = TEXT("PopulateChooserResultsFromAssetPaths called with null asset.");
+		return false;
+	}
+
+	FArrayProperty* ResultsProperty = FindFProperty<FArrayProperty>(Asset->GetClass(), TEXT("ResultsStructs"));
+	if (!ResultsProperty)
+	{
+		// In non-editor builds ResultsStructs may not exist. Ignore silently.
+		return true;
+	}
+
+	FStructProperty* InnerStructProperty = CastField<FStructProperty>(ResultsProperty->Inner);
+	if (!InnerStructProperty || InnerStructProperty->Struct != FInstancedStruct::StaticStruct())
+	{
+		OutError = TEXT("Chooser ResultsStructs has unexpected inner type.");
+		return false;
+	}
+
+	FScriptArrayHelper ResultsArrayHelper(
+		ResultsProperty,
+		ResultsProperty->ContainerPtrToValuePtr<void>(Asset));
+	ResultsArrayHelper.EmptyValues();
+
+	for (const FString& AssetPath : ResultAssetPaths)
+	{
+		UObject* ReferencedAsset = ResolveNamedObject_ImportBpy<UObject>(AssetPath);
+		if (!ReferencedAsset)
+		{
+			OutError = FString::Printf(
+				TEXT("Failed to resolve chooser result asset: %s"),
+				*AssetPath);
+			return false;
+		}
+
+		const int32 NewIndex = ResultsArrayHelper.AddValue();
+		FInstancedStruct* RowStruct = reinterpret_cast<FInstancedStruct*>(ResultsArrayHelper.GetRawPtr(NewIndex));
+		if (!RowStruct)
+		{
+			OutError = TEXT("Failed to allocate chooser ResultsStructs row.");
+			return false;
+		}
+
+		if (!SetChooserAssetReferenceInInstancedStruct_ImportBpy(*RowStruct, ReferencedAsset, OutError))
+		{
+			return false;
+		}
+	}
+
+	if (FArrayProperty* ColumnsProperty = FindFProperty<FArrayProperty>(Asset->GetClass(), TEXT("ColumnsStructs")))
+	{
+		FScriptArrayHelper ColumnsArrayHelper(
+			ColumnsProperty,
+			ColumnsProperty->ContainerPtrToValuePtr<void>(Asset));
+		ColumnsArrayHelper.EmptyValues();
+	}
+
+	if (FArrayProperty* DisabledRowsProperty = FindFProperty<FArrayProperty>(Asset->GetClass(), TEXT("DisabledRows")))
+	{
+		if (FBoolProperty* DisabledRowsInner = CastField<FBoolProperty>(DisabledRowsProperty->Inner))
+		{
+			FScriptArrayHelper DisabledRowsHelper(
+				DisabledRowsProperty,
+				DisabledRowsProperty->ContainerPtrToValuePtr<void>(Asset));
+			DisabledRowsHelper.EmptyValues();
+			DisabledRowsHelper.AddValues(ResultAssetPaths.Num());
+			for (int32 Index = 0; Index < ResultAssetPaths.Num(); ++Index)
+			{
+				DisabledRowsInner->SetPropertyValue(DisabledRowsHelper.GetRawPtr(Index), false);
+			}
+		}
+	}
+
+	return true;
+}
+
+bool RestoreChooserTableData_ImportBpy(
+	UObject* Asset,
+	const TSharedPtr<FJsonObject>& StandaloneMetaJson,
+	FString& OutError)
+{
+	if (!IsChooserTableAsset_ImportBpy(Asset) || !StandaloneMetaJson.IsValid())
+	{
+		return true;
+	}
+
+	const bool bHasResultType = StandaloneMetaJson->HasField(TEXT("chooser_result_type"));
+	const bool bHasOutputClass = StandaloneMetaJson->HasField(TEXT("chooser_output_object_type"));
+	const bool bHasFallbackAsset = StandaloneMetaJson->HasField(TEXT("chooser_fallback_asset"));
+	const bool bHasResultAssets = StandaloneMetaJson->HasField(TEXT("chooser_result_assets"));
+	if (!bHasResultType && !bHasOutputClass && !bHasFallbackAsset && !bHasResultAssets)
+	{
+		return true;
+	}
+
+	if (bHasResultType)
+	{
+		FString ResultTypeText;
+		if (!StandaloneMetaJson->TryGetStringField(TEXT("chooser_result_type"), ResultTypeText))
+		{
+			OutError = TEXT("chooser_result_type must be a string.");
+			return false;
+		}
+
+		if (FProperty* ResultTypeProperty = FindFProperty<FProperty>(Asset->GetClass(), TEXT("ResultType")))
+		{
+			void* ValuePtr = ResultTypeProperty->ContainerPtrToValuePtr<void>(Asset);
+			if (!ResultTypeProperty->ImportText_Direct(*ResultTypeText, ValuePtr, Asset, PPF_None))
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to import chooser_result_type '%s' on %s"),
+					*ResultTypeText,
+					*Asset->GetPathName());
+				return false;
+			}
+		}
+	}
+
+	if (bHasOutputClass)
+	{
+		FString OutputClassPath;
+		if (!StandaloneMetaJson->TryGetStringField(TEXT("chooser_output_object_type"), OutputClassPath))
+		{
+			OutError = TEXT("chooser_output_object_type must be a string.");
+			return false;
+		}
+
+		UClass* OutputClass = nullptr;
+		if (!OutputClassPath.IsEmpty())
+		{
+			OutputClass = ResolveNamedObject_ImportBpy<UClass>(OutputClassPath);
+			if (!OutputClass)
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to resolve chooser_output_object_type class: %s"),
+					*OutputClassPath);
+				return false;
+			}
+		}
+
+		if (FClassProperty* OutputClassProperty = FindFProperty<FClassProperty>(Asset->GetClass(), TEXT("OutputObjectType")))
+		{
+			OutputClassProperty->SetPropertyValue_InContainer(Asset, OutputClass);
+		}
+	}
+
+	if (bHasFallbackAsset)
+	{
+		FString FallbackAssetPath;
+		if (!StandaloneMetaJson->TryGetStringField(TEXT("chooser_fallback_asset"), FallbackAssetPath))
+		{
+			OutError = TEXT("chooser_fallback_asset must be a string.");
+			return false;
+		}
+
+		FStructProperty* FallbackProperty = FindFProperty<FStructProperty>(Asset->GetClass(), TEXT("FallbackResult"));
+		if (!FallbackProperty || FallbackProperty->Struct != FInstancedStruct::StaticStruct())
+		{
+			OutError = TEXT("Chooser FallbackResult property is missing or has unexpected type.");
+			return false;
+		}
+
+		FInstancedStruct* FallbackStruct = FallbackProperty->ContainerPtrToValuePtr<FInstancedStruct>(Asset);
+		if (!FallbackStruct)
+		{
+			OutError = TEXT("Failed to access chooser FallbackResult.");
+			return false;
+		}
+
+		if (FallbackAssetPath.IsEmpty())
+		{
+			FallbackStruct->Reset();
+		}
+		else
+		{
+			UObject* FallbackAsset = ResolveNamedObject_ImportBpy<UObject>(FallbackAssetPath);
+			if (!FallbackAsset)
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to resolve chooser_fallback_asset: %s"),
+					*FallbackAssetPath);
+				return false;
+			}
+
+			if (!SetChooserAssetReferenceInInstancedStruct_ImportBpy(*FallbackStruct, FallbackAsset, OutError))
+			{
+				return false;
+			}
+		}
+	}
+
+	if (bHasResultAssets)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* ResultAssetValues = nullptr;
+		if (!StandaloneMetaJson->TryGetArrayField(TEXT("chooser_result_assets"), ResultAssetValues) || !ResultAssetValues)
+		{
+			OutError = TEXT("chooser_result_assets must be an array.");
+			return false;
+		}
+
+		TArray<FString> ResultAssetPaths;
+		ResultAssetPaths.Reserve(ResultAssetValues->Num());
+		for (const TSharedPtr<FJsonValue>& Value : *ResultAssetValues)
+		{
+			if (!Value.IsValid() || Value->Type != EJson::String)
+			{
+				OutError = TEXT("chooser_result_assets entries must be strings.");
+				return false;
+			}
+
+			const FString AssetPath = Value->AsString().TrimStartAndEnd();
+			if (!AssetPath.IsEmpty())
+			{
+				ResultAssetPaths.Add(AssetPath);
+			}
+		}
+
+		if (!PopulateChooserResultsFromAssetPaths_ImportBpy(Asset, ResultAssetPaths, OutError))
+		{
+			return false;
 		}
 	}
 
@@ -1775,6 +2490,25 @@ int32 GetGraphImportPriority_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson)
 	return 3;
 }
 
+bool IsAnimBlueprintFunctionGraph_ImportBpy(
+	UBlueprint* BP,
+	UEdGraph* Graph,
+	const FString& GraphType,
+	const FString& GraphName)
+{
+	if (GraphType != TEXT("function") || !Cast<UAnimBlueprint>(BP))
+	{
+		return false;
+	}
+
+	if (Graph && (Graph->IsA<UAnimationGraph>() || (Graph->GetSchema() && Graph->GetSchema()->IsA<UAnimationGraphSchema>())))
+	{
+		return true;
+	}
+
+	return GraphName.Equals(UEdGraphSchema_K2::GN_AnimGraph.ToString(), ESearchCase::CaseSensitive);
+}
+
 bool EnsureGraphExists_ImportBpy(
 	UBlueprint* BP,
 	const TSharedPtr<FJsonObject>& GraphJson,
@@ -1793,7 +2527,23 @@ bool EnsureGraphExists_ImportBpy(
 		return false;
 	}
 
-	if (OutGraphType == TEXT("function"))
+	if (IsAnimBlueprintFunctionGraph_ImportBpy(BP, nullptr, OutGraphType, OutGraphName))
+	{
+		UEdGraph* Existing = FindObject<UEdGraph>(BP, *OutGraphName);
+		if (!Existing)
+		{
+			OutGraph = FBlueprintEditorUtils::CreateNewGraph(
+				BP, FName(*OutGraphName),
+				UAnimationGraph::StaticClass(),
+				UAnimationGraphSchema::StaticClass());
+			FBlueprintEditorUtils::AddDomainSpecificGraph(BP, OutGraph);
+		}
+		else
+		{
+			OutGraph = Existing;
+		}
+	}
+	else if (OutGraphType == TEXT("function"))
 	{
 		UEdGraph* Existing = FindObject<UEdGraph>(BP, *OutGraphName);
 		if (!Existing)
@@ -1847,7 +2597,11 @@ bool EnsureGraphExists_ImportBpy(
 		return false;
 	}
 
-	if (OutGraphType == TEXT("function"))
+	const bool bTreatAsRegularFunctionGraph =
+		(OutGraphType == TEXT("function")) &&
+		!IsAnimBlueprintFunctionGraph_ImportBpy(BP, OutGraph, OutGraphType, OutGraphName);
+
+	if (bTreatAsRegularFunctionGraph)
 	{
 		TArray<TPair<FString, FEdGraphPinType>> GraphInputs;
 		TArray<TPair<FString, FEdGraphPinType>> GraphOutputs;
@@ -2121,6 +2875,18 @@ FString NormalizeRequestedPinName_ImportBpy(UEdGraphNode* Node, const FString& R
 	if (!Node)
 	{
 		return RequestedPinName;
+	}
+
+	if (Node->IsA<UK2Node_MacroInstance>())
+	{
+		if (RequestedPinName.Equals(TEXT("execute"), ESearchCase::IgnoreCase))
+		{
+			return TEXT("exec");
+		}
+	}
+	else if (RequestedPinName.Equals(TEXT("exec"), ESearchCase::IgnoreCase))
+	{
+		return TEXT("execute");
 	}
 
 	if (RequestedPinName == TEXT("self_"))
@@ -2480,6 +3246,14 @@ bool ShouldSkipStandaloneAssetProperty_ImportBpy(const UObject* Asset, const FSt
 		return false;
 	}
 
+	if (IsChooserTableAsset_ImportBpy(Asset))
+	{
+		return PropertyName == TEXT("FallbackResult") ||
+			PropertyName == TEXT("ResultsStructs") ||
+			PropertyName == TEXT("ColumnsStructs") ||
+			PropertyName == TEXT("DisabledRows");
+	}
+
 	if (Asset->IsA(UInputMappingContext::StaticClass()))
 	{
 		return PropertyName == TEXT("DefaultKeyMappings") ||
@@ -2527,6 +3301,19 @@ bool RecreateStandaloneAssetSubobjects_ImportBpy(
 		return true;
 	}
 
+	struct FStandaloneSubobjectImport_ImportBpy
+	{
+		FString Name;
+		UClass* Class = nullptr;
+		TSharedPtr<FJsonObject> Json;
+	};
+
+	TArray<FStandaloneSubobjectImport_ImportBpy> ParsedSubobjects;
+	ParsedSubobjects.Reserve(SubobjectValues->Num());
+
+	TSet<FString> DesiredSubobjectNames;
+	TSet<UClass*> DesiredSubobjectClasses;
+
 	for (const TSharedPtr<FJsonValue>& SubobjectValue : *SubobjectValues)
 	{
 		if (!SubobjectValue.IsValid() || SubobjectValue->Type != EJson::Object)
@@ -2553,21 +3340,359 @@ bool RecreateStandaloneAssetSubobjects_ImportBpy(
 			return false;
 		}
 
-		UObject* Subobject = NewObject<UObject>(Asset, SubobjectClass, *SubobjectName, RF_Public | RF_Transactional);
+		FStandaloneSubobjectImport_ImportBpy& Parsed = ParsedSubobjects.AddDefaulted_GetRef();
+		Parsed.Name = SubobjectName;
+		Parsed.Class = SubobjectClass;
+		Parsed.Json = SubobjectJson;
+
+		DesiredSubobjectNames.Add(SubobjectName);
+		DesiredSubobjectClasses.Add(SubobjectClass);
+	}
+
+	// Clean up stale import-managed subobjects of the same classes that are no
+	// longer present in the desired set (common after repeated round-trips).
+	TArray<UObject*> ExistingSubobjects;
+	GetObjectsWithOuter(Asset, ExistingSubobjects, /*bIncludeNestedObjects=*/false);
+	for (UObject* ExistingSubobject : ExistingSubobjects)
+	{
+		if (!ExistingSubobject ||
+			ExistingSubobject->HasAnyFlags(RF_Transient | RF_ClassDefaultObject))
+		{
+			continue;
+		}
+
+		if (DesiredSubobjectNames.Contains(ExistingSubobject->GetName()))
+		{
+			continue;
+		}
+
+		if (!DesiredSubobjectClasses.Contains(ExistingSubobject->GetClass()))
+		{
+			continue;
+		}
+
+		ExistingSubobject->Rename(
+			nullptr,
+			GetTransientPackage(),
+			REN_DontCreateRedirectors | REN_NonTransactional);
+	}
+
+	for (const FStandaloneSubobjectImport_ImportBpy& ParsedSubobject : ParsedSubobjects)
+	{
+		UObject* Subobject = FindObject<UObject>(Asset, *ParsedSubobject.Name);
+		if (Subobject && !Subobject->IsA(ParsedSubobject.Class))
+		{
+			// Name collision with a different class: move the old object aside and recreate.
+			Subobject->Rename(
+				nullptr,
+				GetTransientPackage(),
+				REN_DontCreateRedirectors | REN_NonTransactional);
+			Subobject = nullptr;
+		}
+
 		if (!Subobject)
 		{
-			OutError = FString::Printf(TEXT("Failed to create standalone subobject: %s"), *SubobjectName);
+			Subobject = NewObject<UObject>(Asset, ParsedSubobject.Class, *ParsedSubobject.Name, RF_Public | RF_Transactional);
+		}
+		if (!Subobject)
+		{
+			OutError = FString::Printf(TEXT("Failed to create standalone subobject: %s"), *ParsedSubobject.Name);
 			return false;
 		}
 
 		const TSharedPtr<FJsonObject>* PropertiesJson = nullptr;
-		if (SubobjectJson->TryGetObjectField(TEXT("properties"), PropertiesJson) && PropertiesJson && PropertiesJson->IsValid())
+		if (ParsedSubobject.Json->TryGetObjectField(TEXT("properties"), PropertiesJson) && PropertiesJson && PropertiesJson->IsValid())
 		{
 			ApplyJsonObjectToObject_ImportBpy(Subobject, *PropertiesJson);
 		}
 
 		Subobject->Modify();
 		Subobject->PostEditChange();
+	}
+
+	return true;
+}
+
+bool CleanupUnexpectedStandaloneSubobjects_ImportBpy(
+	UObject* Asset,
+	const TArray<TSharedPtr<FJsonValue>>* SubobjectValues,
+	FString& OutError)
+{
+	if (!Asset || !SubobjectValues)
+	{
+		return true;
+	}
+
+	TSet<FString> DesiredSubobjectNames;
+	TSet<UClass*> DesiredSubobjectClasses;
+	for (const TSharedPtr<FJsonValue>& SubobjectValue : *SubobjectValues)
+	{
+		if (!SubobjectValue.IsValid() || SubobjectValue->Type != EJson::Object)
+		{
+			OutError = TEXT("Standalone asset subobject entry must be an object");
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject> SubobjectJson = SubobjectValue->AsObject();
+		FString SubobjectName;
+		FString SubobjectClassPath;
+		SubobjectJson->TryGetStringField(TEXT("name"), SubobjectName);
+		SubobjectJson->TryGetStringField(TEXT("class"), SubobjectClassPath);
+		if (SubobjectName.IsEmpty() || SubobjectClassPath.IsEmpty())
+		{
+			OutError = TEXT("Standalone asset subobject entry is missing name or class");
+			return false;
+		}
+
+		UClass* SubobjectClass = ResolveNamedObject_ImportBpy<UClass>(SubobjectClassPath);
+		if (!SubobjectClass)
+		{
+			OutError = FString::Printf(TEXT("Cannot load standalone subobject class: %s"), *SubobjectClassPath);
+			return false;
+		}
+
+		DesiredSubobjectNames.Add(SubobjectName);
+		DesiredSubobjectClasses.Add(SubobjectClass);
+	}
+
+	TArray<UObject*> ExistingSubobjects;
+	GetObjectsWithOuter(Asset, ExistingSubobjects, /*bIncludeNestedObjects=*/false);
+	for (UObject* ExistingSubobject : ExistingSubobjects)
+	{
+		if (!ExistingSubobject ||
+			ExistingSubobject->HasAnyFlags(RF_Transient | RF_ClassDefaultObject))
+		{
+			continue;
+		}
+
+		if (DesiredSubobjectNames.Contains(ExistingSubobject->GetName()))
+		{
+			continue;
+		}
+
+		if (!DesiredSubobjectClasses.Contains(ExistingSubobject->GetClass()))
+		{
+			continue;
+		}
+
+		ExistingSubobject->Rename(
+			nullptr,
+			GetTransientPackage(),
+			REN_DontCreateRedirectors | REN_NonTransactional);
+	}
+
+	return true;
+}
+
+FString SanitizeImportedUserDefinedEnumShortName_ImportBpy(const FString& RawName, int32 EntryIndex)
+{
+	FString WorkingName = RawName;
+	WorkingName.TrimStartAndEndInline();
+
+	const int32 ScopeSeparatorIndex =
+		WorkingName.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (ScopeSeparatorIndex != INDEX_NONE)
+	{
+		WorkingName = WorkingName.Mid(ScopeSeparatorIndex + 2);
+	}
+
+	if (WorkingName.IsEmpty())
+	{
+		WorkingName = FString::Printf(TEXT("NewEnumerator%d"), EntryIndex);
+	}
+
+	FString SanitizedName;
+	SanitizedName.Reserve(WorkingName.Len());
+	for (const TCHAR Character : WorkingName)
+	{
+		const bool bAllowedCharacter = FChar::IsAlnum(Character) || (Character == TEXT('_'));
+		SanitizedName.AppendChar(bAllowedCharacter ? Character : TEXT('_'));
+	}
+
+	while (SanitizedName.ReplaceInline(TEXT("__"), TEXT("_")) > 0)
+	{
+	}
+
+	SanitizedName.TrimStartAndEndInline();
+	if (SanitizedName.IsEmpty())
+	{
+		SanitizedName = FString::Printf(TEXT("NewEnumerator%d"), EntryIndex);
+	}
+
+	if (FChar::IsDigit(SanitizedName[0]))
+	{
+		SanitizedName = FString::Printf(TEXT("Enum_%s"), *SanitizedName);
+	}
+
+	if (SanitizedName.EndsWith(TEXT("_MAX"), ESearchCase::IgnoreCase))
+	{
+		SanitizedName += TEXT("_Entry");
+	}
+
+	if (!FName(*SanitizedName).IsValidXName(INVALID_OBJECTNAME_CHARACTERS))
+	{
+		SanitizedName = FString::Printf(TEXT("NewEnumerator%d"), EntryIndex);
+	}
+
+	return SanitizedName;
+}
+
+bool RestoreUserDefinedEnumEntries_ImportBpy(
+	UObject* Asset,
+	const TSharedPtr<FJsonObject>& StandaloneMetaJson,
+	FString& OutError)
+{
+	UUserDefinedEnum* const UserDefinedEnum = Cast<UUserDefinedEnum>(Asset);
+	if (!UserDefinedEnum || !StandaloneMetaJson.IsValid())
+	{
+		return true;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* EnumEntries = nullptr;
+	if (!StandaloneMetaJson->TryGetArrayField(TEXT("enum_entries"), EnumEntries) || !EnumEntries)
+	{
+		return true;
+	}
+
+	TArray<TPair<FName, int64>> DesiredEnums;
+	TArray<FString> DesiredShortNames;
+	TArray<FText> DesiredDisplayNames;
+	TSet<FName> UsedNames;
+	TSet<FString> UsedDisplayNames;
+	DesiredEnums.Reserve(EnumEntries->Num());
+	DesiredShortNames.Reserve(EnumEntries->Num());
+	DesiredDisplayNames.Reserve(EnumEntries->Num());
+
+	UserDefinedEnum->Modify();
+
+	int32 EntryIndex = 0;
+	for (const TSharedPtr<FJsonValue>& EntryValue : *EnumEntries)
+	{
+		if (!EntryValue.IsValid() || EntryValue->Type != EJson::Object)
+		{
+			OutError = TEXT("enum_entries entry must be an object");
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject> EntryObject = EntryValue->AsObject();
+		FString EnumName;
+		EntryObject->TryGetStringField(TEXT("name"), EnumName);
+		const FString BaseName = SanitizeImportedUserDefinedEnumShortName_ImportBpy(EnumName, EntryIndex);
+
+		FString CandidateName = BaseName;
+		int32 Suffix = 0;
+		while (UsedNames.Contains(FName(*CandidateName)))
+		{
+			++Suffix;
+			CandidateName = FString::Printf(TEXT("%s_%d"), *BaseName, Suffix);
+		}
+
+		const FName FinalName(*CandidateName);
+		if (!FinalName.IsValidXName(INVALID_OBJECTNAME_CHARACTERS))
+		{
+			OutError = FString::Printf(
+				TEXT("enum_entries name is invalid after sanitization: %s (asset=%s)"),
+				*CandidateName,
+				*UserDefinedEnum->GetPathName());
+			return false;
+		}
+		UsedNames.Add(FinalName);
+
+		double NumericValue = static_cast<double>(EntryIndex);
+		EntryObject->TryGetNumberField(TEXT("value"), NumericValue);
+		if (!FMath::IsFinite(NumericValue))
+		{
+			OutError = FString::Printf(
+				TEXT("enum_entries value is not finite for %s in %s"),
+				*CandidateName,
+				*UserDefinedEnum->GetPathName());
+			return false;
+		}
+
+		const FString FullEnumName = FString::Printf(TEXT("%s::%s"), *UserDefinedEnum->GetName(), *CandidateName);
+		DesiredEnums.Emplace(FName(*FullEnumName), static_cast<int64>(NumericValue));
+		DesiredShortNames.Add(CandidateName);
+
+		FString DisplayName;
+		EntryObject->TryGetStringField(TEXT("display_name"), DisplayName);
+		DisplayName.TrimStartAndEndInline();
+		if (DisplayName.IsEmpty())
+		{
+			DisplayName = CandidateName;
+		}
+		if (UsedDisplayNames.Contains(DisplayName))
+		{
+			OutError = FString::Printf(
+				TEXT("Duplicate enum_entries display_name is not allowed: %s (asset=%s)"),
+				*DisplayName,
+				*UserDefinedEnum->GetPathName());
+			return false;
+		}
+		UsedDisplayNames.Add(DisplayName);
+		DesiredDisplayNames.Add(FText::FromString(DisplayName));
+		++EntryIndex;
+	}
+
+	if (DesiredEnums.Num() == 0)
+	{
+		// Allow round-trip of intentionally empty/corrupted enum exports without
+		// failing the entire import. In this case we leave current enum data as-is.
+		return true;
+	}
+
+	if (!UserDefinedEnum->SetEnums(DesiredEnums, UEnum::ECppForm::Namespaced, EEnumFlags::None, true))
+	{
+		OutError = FString::Printf(
+			TEXT("Failed to set enum entries for UserDefinedEnum: %s"),
+			*UserDefinedEnum->GetPathName());
+		return false;
+	}
+
+	const int32 NumUserEntries = FMath::Max(0, UserDefinedEnum->NumEnums() - 1);
+	if (NumUserEntries != DesiredDisplayNames.Num())
+	{
+		OutError = FString::Printf(
+			TEXT("UserDefinedEnum entry count mismatch after SetEnums: expected=%d actual=%d (%s)"),
+			DesiredDisplayNames.Num(),
+			NumUserEntries,
+			*UserDefinedEnum->GetPathName());
+		return false;
+	}
+
+	UserDefinedEnum->DisplayNameMap.Empty(NumUserEntries);
+	for (int32 Index = 0; Index < NumUserEntries; ++Index)
+	{
+		const FName EnumEntryName(*UserDefinedEnum->GetNameStringByIndex(Index));
+		UserDefinedEnum->DisplayNameMap.Add(EnumEntryName, DesiredDisplayNames[Index]);
+	}
+	FEnumEditorUtils::EnsureAllDisplayNamesExist(UserDefinedEnum);
+
+	for (int32 Index = 0; Index < NumUserEntries; ++Index)
+	{
+		const FString ActualShortName = UserDefinedEnum->GetNameStringByIndex(Index);
+		if (!ActualShortName.Equals(DesiredShortNames[Index], ESearchCase::CaseSensitive))
+		{
+			OutError = FString::Printf(
+				TEXT("UserDefinedEnum short name mismatch at index %d: expected=%s actual=%s (%s)"),
+				Index,
+				*DesiredShortNames[Index],
+				*ActualShortName,
+				*UserDefinedEnum->GetPathName());
+			return false;
+		}
+
+		const FString ActualDisplayName = UserDefinedEnum->GetDisplayNameTextByIndex(Index).ToString();
+		const FString ExpectedDisplayName = DesiredDisplayNames[Index].ToString();
+		if (!ActualDisplayName.Equals(ExpectedDisplayName, ESearchCase::CaseSensitive))
+		{
+			OutError = FString::Printf(
+				TEXT("UserDefinedEnum display_name mismatch at index %d: expected=%s actual=%s (%s)"),
+				Index,
+				*ExpectedDisplayName,
+				*ActualDisplayName,
+				*UserDefinedEnum->GetPathName());
+			return false;
+		}
 	}
 
 	return true;
@@ -3372,7 +4497,9 @@ void ClearGraphNodes_ImportBpy(UBlueprint* BP, UEdGraph* Graph)
 		return;
 	}
 
-	const bool bIsFunctionGraph = BP->FunctionGraphs.Contains(Graph);
+	const bool bIsFunctionGraph =
+		BP->FunctionGraphs.Contains(Graph) &&
+		!IsAnimBlueprintFunctionGraph_ImportBpy(BP, Graph, TEXT("function"), Graph->GetName());
 	const bool bIsMacroGraph = BP->MacroGraphs.Contains(Graph);
 
 	TArray<UEdGraphNode*> ExistingNodes = Graph->Nodes;
@@ -3432,12 +4559,37 @@ void ImportInterfaces_ImportBpy(UBlueprint* BP, const TArray<TSharedPtr<FJsonVal
 	}
 }
 
-void ImportClassDefaults_ImportBpy(UBlueprint* BP, const TArray<TSharedPtr<FJsonValue>>& DefaultsArr)
+void ImportClassDefaults_ImportBpy(
+	UBlueprint* BP,
+	const TArray<TSharedPtr<FJsonValue>>& DefaultsArr,
+	const FString& SourceBlueprintPath)
 {
-	if (!BP || !BP->GeneratedClass) return;
+	if (!BP)
+	{
+		return;
+	}
 
-	UObject* CDO = BP->GeneratedClass->GetDefaultObject(false);
-	if (!CDO) return;
+	UObject* CDO = BP->GeneratedClass ? BP->GeneratedClass->GetDefaultObject(false) : nullptr;
+	TSet<FString> ImportedPropertyNames;
+	bool bModifiedBlueprintAsset = false;
+
+	auto ApplyDefaultToObject = [&ImportedPropertyNames](UObject* TargetObject, const FString& PropName, const TSharedPtr<FJsonValue>& PropValue) -> bool
+	{
+		if (!TargetObject || PropName.IsEmpty() || !PropValue.IsValid())
+		{
+			return false;
+		}
+
+		if (FProperty* Property = FindPropertyByNameOrAlias_ImportBpy(TargetObject, PropName))
+		{
+			TargetObject->Modify();
+			ApplyJsonValueToProperty_ImportBpy(TargetObject, Property, PropValue);
+			ImportedPropertyNames.Add(PropName);
+			return true;
+		}
+
+		return false;
+	};
 
 	for (const TSharedPtr<FJsonValue>& Val : DefaultsArr)
 	{
@@ -3450,10 +4602,51 @@ void ImportClassDefaults_ImportBpy(UBlueprint* BP, const TArray<TSharedPtr<FJson
 		const TSharedPtr<FJsonValue>* PropValue = (*EntryObj)->Values.Find(TEXT("value"));
 		if (!PropValue || !PropValue->IsValid()) continue;
 
-		FProperty* Property = CDO->GetClass()->FindPropertyByName(FName(*PropName));
-		if (!Property) continue;
+		if (ApplyDefaultToObject(CDO, PropName, *PropValue))
+		{
+			continue;
+		}
 
-		ApplyJsonValueToProperty_ImportBpy(CDO, Property, *PropValue);
+		if (ApplyDefaultToObject(BP, PropName, *PropValue))
+		{
+			bModifiedBlueprintAsset = true;
+		}
+	}
+
+	if (UAnimBlueprint* AnimBlueprint = Cast<UAnimBlueprint>(BP))
+	{
+		const bool bNeedsTargetSkeleton =
+			!ImportedPropertyNames.Contains(TEXT("TargetSkeleton")) &&
+			AnimBlueprint->TargetSkeleton == nullptr;
+		const bool bNeedsPreviewMesh =
+			!ImportedPropertyNames.Contains(TEXT("PreviewSkeletalMesh")) &&
+			AnimBlueprint->GetPreviewMesh(false) == nullptr;
+
+		if (bNeedsTargetSkeleton)
+		{
+			if (USkeleton* SourceTargetSkeleton =
+					ResolveAnimBlueprintTargetSkeletonFromAssetRegistry_ImportBpy(SourceBlueprintPath))
+			{
+				AnimBlueprint->Modify();
+				AnimBlueprint->TargetSkeleton = SourceTargetSkeleton;
+				bModifiedBlueprintAsset = true;
+			}
+		}
+
+		if (bNeedsPreviewMesh && AnimBlueprint->TargetSkeleton)
+		{
+			if (USkeletalMesh* SourcePreviewMesh = AnimBlueprint->TargetSkeleton->GetPreviewMesh(true))
+			{
+				AnimBlueprint->Modify();
+				AnimBlueprint->SetPreviewMesh(SourcePreviewMesh, false);
+				bModifiedBlueprintAsset = true;
+			}
+		}
+	}
+
+	if (bModifiedBlueprintAsset)
+	{
+		BP->MarkPackageDirty();
 	}
 }
 
@@ -3567,7 +4760,11 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	const TArray<TSharedPtr<FJsonValue>>* ClassDefaultsArr = nullptr;
 	if (Root->TryGetArrayField(TEXT("class_defaults"), ClassDefaultsArr) && ClassDefaultsArr)
 	{
-		ImportClassDefaults_ImportBpy(BP, *ClassDefaultsArr);
+		const FString SourceBlueprintPath =
+			Root->HasTypedField<EJson::String>(TEXT("path"))
+				? Root->GetStringField(TEXT("path"))
+				: FString();
+		ImportClassDefaults_ImportBpy(BP, *ClassDefaultsArr, SourceBlueprintPath);
 	}
 
 	// Inherited Component Defaults
@@ -3646,6 +4843,24 @@ FString UBPDirectImporter::ImportBlueprintFromJsonDetailed(
 	return ResultJson;
 }
 
+FString UBPDirectImporter::ImportStandaloneAssetFromJsonDetailed(
+	const FString& AssetPath,
+	const FString& PropertiesJson)
+{
+	FString OutError;
+	const bool bSuccess = ImportStandaloneAssetFromJson(AssetPath, PropertiesJson, OutError);
+
+	TSharedRef<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetBoolField(TEXT("success"), bSuccess);
+	ResultObj->SetStringField(TEXT("error"), OutError);
+	ResultObj->SetStringField(TEXT("asset_path"), AssetPath);
+
+	FString ResultJson;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ResultJson);
+	FJsonSerializer::Serialize(ResultObj, Writer);
+	return ResultJson;
+}
+
 // ─── CreateBlueprintAsset ─────────────────────────────────────────────────────
 
 UBlueprint* UBPDirectImporter::CreateBlueprintAsset(
@@ -3678,8 +4893,12 @@ UBlueprint* UBPDirectImporter::CreateBlueprintAsset(
 		Package,
 		*AssetName,
 		BPTYPE_Normal,
-		UBlueprint::StaticClass(),
-		UBlueprintGeneratedClass::StaticClass());
+		(ParentClass && ParentClass->IsChildOf(UAnimInstance::StaticClass()))
+			? UAnimBlueprint::StaticClass()
+			: UBlueprint::StaticClass(),
+		(ParentClass && ParentClass->IsChildOf(UAnimInstance::StaticClass()))
+			? UAnimBlueprintGeneratedClass::StaticClass()
+			: UBlueprintGeneratedClass::StaticClass());
 
 	if (!BP)
 	{
@@ -3722,7 +4941,39 @@ void UBPDirectImporter::CreateVariable(
 		PinType.ContainerType = EPinContainerType::Map;
 	}
 
-	FBlueprintEditorUtils::AddMemberVariable(BP, FName(*VarName), PinType, DefaultVal);
+	const FName VariableFName(*VarName);
+
+	if (FBPVariableDescription* ExistingVariable =
+			FindBlueprintVariableDescription_ImportBpy(BP, VariableFName))
+	{
+		BP->Modify();
+		if (SyncBlueprintVariableDescriptionFromJson_ImportBpy(
+				*ExistingVariable,
+				VarJson,
+				PinType,
+				DefaultVal))
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+			BP->MarkPackageDirty();
+		}
+		return;
+	}
+
+	if (FBlueprintEditorUtils::AddMemberVariable(BP, VariableFName, PinType, DefaultVal))
+	{
+		if (FBPVariableDescription* CreatedVariable =
+				FindBlueprintVariableDescription_ImportBpy(BP, VariableFName))
+		{
+			SyncBlueprintVariableDescriptionFromJson_ImportBpy(
+				*CreatedVariable,
+				VarJson,
+				PinType,
+				DefaultVal);
+		}
+
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+		BP->MarkPackageDirty();
+	}
 }
 
 // ─── CreateGraph ─────────────────────────────────────────────────────────────
@@ -3741,6 +4992,10 @@ bool UBPDirectImporter::CreateGraph(
 	{
 		return false;
 	}
+
+	const bool bTreatAsRegularFunctionGraph =
+		(GraphType == TEXT("function")) &&
+		!IsAnimBlueprintFunctionGraph_ImportBpy(BP, Graph, GraphType, GraphName);
 
 	// Import is authoritative for a graph. Clear pre-existing/default nodes first so
 	// re-imports do not accumulate stale nodes such as the template Event Tick.
@@ -3778,7 +5033,7 @@ bool UBPDirectImporter::CreateGraph(
 		}
 	};
 
-	if (GraphType == TEXT("function"))
+	if (bTreatAsRegularFunctionGraph)
 	{
 		ParsePinArray(GraphJson, TEXT("inputs"), GraphInputs);
 		ParsePinArray(GraphJson, TEXT("outputs"), GraphOutputs);
@@ -3813,7 +5068,7 @@ bool UBPDirectImporter::CreateGraph(
 		}
 	}
 
-	if (GraphType == TEXT("function"))
+	if (bTreatAsRegularFunctionGraph)
 	{
 		const TArray<TSharedPtr<FJsonValue>>* PreNodesArr = nullptr;
 		if (GraphJson->TryGetArrayField(TEXT("nodes"), PreNodesArr))
@@ -3888,7 +5143,7 @@ bool UBPDirectImporter::CreateGraph(
 	TMap<FString, UEdGraphNode*> NodeMap; // uid → node
 	int32 ReusableResultNodeIndex = 0;
 	TArray<UK2Node_FunctionResult*> ExistingResultNodes;
-	if (GraphType == TEXT("function"))
+	if (bTreatAsRegularFunctionGraph)
 	{
 		Graph->GetNodesOfClass(ExistingResultNodes);
 	}
@@ -3939,7 +5194,7 @@ bool UBPDirectImporter::CreateGraph(
 
 			UEdGraphNode* Node = nullptr;
 			const FString NodeClass = NodeObj->GetStringField(TEXT("node_class"));
-			if (NodeClass == TEXT("K2Node_FunctionEntry") && GraphType == TEXT("function"))
+			if (NodeClass == TEXT("K2Node_FunctionEntry") && bTreatAsRegularFunctionGraph)
 			{
 				TArray<UK2Node_FunctionEntry*> EntryNodes;
 				Graph->GetNodesOfClass(EntryNodes);
@@ -3949,7 +5204,7 @@ bool UBPDirectImporter::CreateGraph(
 					return false;
 				}
 			}
-			else if (NodeClass == TEXT("K2Node_FunctionResult") && GraphType == TEXT("function"))
+			else if (NodeClass == TEXT("K2Node_FunctionResult") && bTreatAsRegularFunctionGraph)
 			{
 				if (ReusableResultNodeIndex < ExistingResultNodes.Num())
 				{
@@ -4226,8 +5481,12 @@ UEdGraphNode* UBPDirectImporter::CreateNode(
 		}
 		CastNode->CreateNewGuid();
 		CastNode->PostPlacedNewNode();
-		CastNode->AllocateDefaultPins();
 		Graph->AddNode(CastNode, false, false);
+		CastNode->AllocateDefaultPins();
+		if (CastNode->TargetType)
+		{
+			CastNode->ReconstructNode();
+		}
 		Result = CastNode;
 	}
 	// ── Select ───────────────────────────────────────────────────────
@@ -4667,6 +5926,12 @@ UEdGraphNode* UBPDirectImporter::CreateVariableNode(
 		Node->PostPlacedNewNode();
 		Node->AllocateDefaultPins();
 		Graph->AddNode(Node, false, false);
+
+		if (ShouldRestoreImpureVariableGet_ImportBpy(NodeJson))
+		{
+			RestoreVariableGetPurity_ImportBpy(Node, false);
+		}
+
 		return Node;
 	}
 	else
@@ -4809,6 +6074,11 @@ bool UBPDirectImporter::SaveBlueprint(UBlueprint* BP, FString& OutError)
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 	SaveArgs.SaveFlags = SAVE_None;
 
+	if (!CanSafelyOverwritePackageFile_ImportBpy(PackageFileName, OutError))
+	{
+		return false;
+	}
+
 	if (!UPackage::SavePackage(Package, BP, *PackageFileName, SaveArgs))
 	{
 		OutError = FString::Printf(TEXT("Failed to save Blueprint package: %s"), *PackageFileName);
@@ -4825,6 +6095,15 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 	const FString& PropertiesJson,
 	FString& OutError)
 {
+	auto FailStandaloneStep = [&OutError](const TCHAR* StepName) -> bool
+	{
+		if (OutError.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("Standalone import failed at step: %s"), StepName ? StepName : TEXT("Unknown"));
+		}
+		return false;
+	};
+
 	TSharedPtr<FJsonObject> PropsObj;
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PropertiesJson);
 	if (!FJsonSerializer::Deserialize(Reader, PropsObj) || !PropsObj.IsValid())
@@ -4873,13 +6152,18 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 			Asset,
 			OutError))
 		{
-			return false;
+			return FailStandaloneStep(TEXT("CreateOrReplaceStandaloneAsset"));
 		}
 
 		Asset->Modify();
 		if (!RecreateStandaloneAssetSubobjects_ImportBpy(Asset, StandaloneSubobjects, OutError))
 		{
-			return false;
+			return FailStandaloneStep(TEXT("RecreateStandaloneAssetSubobjects"));
+		}
+
+		if (!RestoreUserDefinedEnumEntries_ImportBpy(Asset, PropsObj, OutError))
+		{
+			return FailStandaloneStep(TEXT("RestoreUserDefinedEnumEntries"));
 		}
 
 		if (StandalonePropertiesObj && StandalonePropertiesObj->IsValid())
@@ -4887,12 +6171,22 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 			ApplyStandaloneAssetProperties_ImportBpy(Asset, *StandalonePropertiesObj);
 			if (!RestoreInputMappingInstancedRefs_ImportBpy(Asset, StandalonePropertiesObj, OutError))
 			{
-				return false;
+				return FailStandaloneStep(TEXT("RestoreInputMappingInstancedRefs"));
 			}
 			if (!RestoreInputActionInstancedRefs_ImportBpy(Asset, StandalonePropertiesObj, OutError))
 			{
-				return false;
+				return FailStandaloneStep(TEXT("RestoreInputActionInstancedRefs"));
 			}
+		}
+
+		if (!RestoreChooserTableData_ImportBpy(Asset, PropsObj, OutError))
+		{
+			return FailStandaloneStep(TEXT("RestoreChooserTableData"));
+		}
+
+		if (!CleanupUnexpectedStandaloneSubobjects_ImportBpy(Asset, StandaloneSubobjects, OutError))
+		{
+			return FailStandaloneStep(TEXT("CleanupUnexpectedStandaloneSubobjects"));
 		}
 	}
 	else
@@ -4936,6 +6230,11 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 	FSavePackageArgs SaveArgs;
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 	SaveArgs.SaveFlags     = SAVE_None;
+
+	if (!CanSafelyOverwritePackageFile_ImportBpy(PackageFileName, OutError))
+	{
+		return false;
+	}
 
 	if (!UPackage::SavePackage(Package, Asset, *PackageFileName, SaveArgs))
 	{

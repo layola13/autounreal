@@ -63,6 +63,11 @@ public:
 		const FString& PropertiesJson,
 		FString& OutError);
 
+	UFUNCTION(BlueprintCallable, Category = "ExportBpy")
+	static FString ImportStandaloneAssetFromJsonDetailed(
+		const FString& AssetPath,
+		const FString& PropertiesJson);
+
 private:
 	// ── Asset management ─────────────────────────────────────────────────────
 

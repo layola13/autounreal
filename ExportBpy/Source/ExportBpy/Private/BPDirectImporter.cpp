@@ -466,17 +466,30 @@ bool ShouldRestoreImpureVariableGet_ImportBpy(const TSharedPtr<FJsonObject>& Nod
 		return true;
 	}
 
-	// `VariableGetIsPure=false` inside meta is not sufficient on its own.
-	// When users patch `.bp.py` by hand, the code can intentionally collapse a
-	// validated get back to a plain `g.get_var(...)` while the stale meta still
-	// says "impure". Recreating the validated get in that case manufactures an
-	// exec pin with no execution flow and produces the compiler warning:
-	// "Get was pruned because its Exec pin is not connected".
-	//
-	// Treat the graph DSL / compiled JSON as the source of truth for node shape.
-	// We only restore an impure get when the imported node explicitly exposes
-	// exec-like pins (`execute` / `then` / `else`), which covers real validated
-	// get and branch variations while ignoring stale metadata.
+	const TSharedPtr<FJsonObject>* NodePropsObj = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("node_props"), NodePropsObj) && NodePropsObj && (*NodePropsObj).IsValid())
+	{
+		bool bBoolValue = true;
+		if ((*NodePropsObj)->TryGetBoolField(TEXT("VariableGetIsPure"), bBoolValue))
+		{
+			return !bBoolValue;
+		}
+
+		FString StringValue;
+		if ((*NodePropsObj)->TryGetStringField(TEXT("VariableGetIsPure"), StringValue))
+		{
+			StringValue.TrimStartAndEndInline();
+			return
+				StringValue.Equals(TEXT("false"), ESearchCase::IgnoreCase) ||
+				StringValue.Equals(TEXT("0"), ESearchCase::IgnoreCase) ||
+				StringValue.Equals(TEXT("no"), ESearchCase::IgnoreCase) ||
+				StringValue.Equals(TEXT("off"), ESearchCase::IgnoreCase);
+		}
+	}
+
+	// The compiled graph payload normalizes VariableGetIsPure from actual exec
+	// connections, so node_props is safe to trust. When none of pin_ids,
+	// pin_aliases, or node_props indicate an impure variation, keep the node pure.
 
 	return false;
 }
@@ -1796,6 +1809,69 @@ bool PopulateChooserResultsFromAssetPaths_ImportBpy(
 	return true;
 }
 
+bool ImportChooserPropertyTextField_ImportBpy(
+	UObject* Asset,
+	const TSharedPtr<FJsonObject>& StandaloneMetaJson,
+	const TCHAR* JsonFieldName,
+	const TCHAR* PropertyName,
+	FString& OutError)
+{
+	if (!Asset || !StandaloneMetaJson.IsValid() || !JsonFieldName || !PropertyName)
+	{
+		return true;
+	}
+
+	if (!StandaloneMetaJson->HasField(JsonFieldName))
+	{
+		return true;
+	}
+
+	FString TextValue;
+	if (!StandaloneMetaJson->TryGetStringField(JsonFieldName, TextValue))
+	{
+		OutError = FString::Printf(TEXT("%s must be a string."), JsonFieldName);
+		return false;
+	}
+
+	FProperty* Property = FindFProperty<FProperty>(Asset->GetClass(), PropertyName);
+	if (!Property)
+	{
+		OutError = FString::Printf(
+			TEXT("Chooser property %s is missing on %s."),
+			PropertyName,
+			*Asset->GetPathName());
+		return false;
+	}
+
+	void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Asset);
+	if (!ValuePtr)
+	{
+		OutError = FString::Printf(
+			TEXT("Failed to access chooser property %s on %s."),
+			PropertyName,
+			*Asset->GetPathName());
+		return false;
+	}
+
+	if (TextValue.IsEmpty())
+	{
+		Property->ClearValue_InContainer(Asset);
+		return true;
+	}
+
+	if (!Property->ImportText_Direct(*TextValue, ValuePtr, Asset, PPF_None))
+	{
+		OutError = FString::Printf(
+			TEXT("Failed to import chooser field %s into property %s on %s."),
+			JsonFieldName,
+			PropertyName,
+			*Asset->GetPathName());
+		return false;
+	}
+
+	return true;
+}
+
 bool RestoreChooserTableData_ImportBpy(
 	UObject* Asset,
 	const TSharedPtr<FJsonObject>& StandaloneMetaJson,
@@ -1810,7 +1886,18 @@ bool RestoreChooserTableData_ImportBpy(
 	const bool bHasOutputClass = StandaloneMetaJson->HasField(TEXT("chooser_output_object_type"));
 	const bool bHasFallbackAsset = StandaloneMetaJson->HasField(TEXT("chooser_fallback_asset"));
 	const bool bHasResultAssets = StandaloneMetaJson->HasField(TEXT("chooser_result_assets"));
-	if (!bHasResultType && !bHasOutputClass && !bHasFallbackAsset && !bHasResultAssets)
+	const bool bHasFallbackStructText = StandaloneMetaJson->HasField(TEXT("chooser_fallback_result_text"));
+	const bool bHasResultsStructsText = StandaloneMetaJson->HasField(TEXT("chooser_results_structs_text"));
+	const bool bHasColumnsStructsText = StandaloneMetaJson->HasField(TEXT("chooser_columns_structs_text"));
+	const bool bHasDisabledRowsText = StandaloneMetaJson->HasField(TEXT("chooser_disabled_rows_text"));
+	const bool bHasAnyStructuredText =
+		bHasFallbackStructText || bHasResultsStructsText || bHasColumnsStructsText || bHasDisabledRowsText;
+
+	if (!bHasResultType &&
+		!bHasOutputClass &&
+		!bHasFallbackAsset &&
+		!bHasResultAssets &&
+		!bHasAnyStructuredText)
 	{
 		return true;
 	}
@@ -1866,7 +1953,7 @@ bool RestoreChooserTableData_ImportBpy(
 		}
 	}
 
-	if (bHasFallbackAsset)
+	if (!bHasAnyStructuredText && bHasFallbackAsset)
 	{
 		FString FallbackAssetPath;
 		if (!StandaloneMetaJson->TryGetStringField(TEXT("chooser_fallback_asset"), FallbackAssetPath))
@@ -1911,7 +1998,49 @@ bool RestoreChooserTableData_ImportBpy(
 		}
 	}
 
-	if (bHasResultAssets)
+	if (bHasAnyStructuredText)
+	{
+		if (!ImportChooserPropertyTextField_ImportBpy(
+				Asset,
+				StandaloneMetaJson,
+				TEXT("chooser_fallback_result_text"),
+				TEXT("FallbackResult"),
+				OutError))
+		{
+			return false;
+		}
+		if (!ImportChooserPropertyTextField_ImportBpy(
+				Asset,
+				StandaloneMetaJson,
+				TEXT("chooser_results_structs_text"),
+				TEXT("ResultsStructs"),
+				OutError))
+		{
+			return false;
+		}
+		if (!ImportChooserPropertyTextField_ImportBpy(
+				Asset,
+				StandaloneMetaJson,
+				TEXT("chooser_columns_structs_text"),
+				TEXT("ColumnsStructs"),
+				OutError))
+		{
+			return false;
+		}
+		if (!ImportChooserPropertyTextField_ImportBpy(
+				Asset,
+				StandaloneMetaJson,
+				TEXT("chooser_disabled_rows_text"),
+				TEXT("DisabledRows"),
+				OutError))
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	if (!bHasAnyStructuredText && bHasResultAssets)
 	{
 		const TArray<TSharedPtr<FJsonValue>>* ResultAssetValues = nullptr;
 		if (!StandaloneMetaJson->TryGetArrayField(TEXT("chooser_result_assets"), ResultAssetValues) || !ResultAssetValues)
@@ -6074,11 +6203,9 @@ bool UBPDirectImporter::SaveBlueprint(UBlueprint* BP, FString& OutError)
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 	SaveArgs.SaveFlags = SAVE_None;
 
-	if (!CanSafelyOverwritePackageFile_ImportBpy(PackageFileName, OutError))
-	{
-		return false;
-	}
-
+	// Windows overwrite preflight can report a false external lock when the
+	// current editor process already has the package loaded. SavePackage is the
+	// authoritative check, so rely on its result instead.
 	if (!UPackage::SavePackage(Package, BP, *PackageFileName, SaveArgs))
 	{
 		OutError = FString::Printf(TEXT("Failed to save Blueprint package: %s"), *PackageFileName);
@@ -6231,11 +6358,9 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 	SaveArgs.SaveFlags     = SAVE_None;
 
-	if (!CanSafelyOverwritePackageFile_ImportBpy(PackageFileName, OutError))
-	{
-		return false;
-	}
-
+	// Windows overwrite preflight can report a false external lock when the
+	// current editor process already has the package loaded. SavePackage is the
+	// authoritative check, so rely on its result instead.
 	if (!UPackage::SavePackage(Package, Asset, *PackageFileName, SaveArgs))
 	{
 		OutError = FString::Printf(TEXT("Failed to save asset package: %s"), *PackageFileName);

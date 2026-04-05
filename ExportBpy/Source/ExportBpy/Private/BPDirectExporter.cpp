@@ -694,6 +694,30 @@ FString ExtractChooserAssetReferenceFromInstancedStruct_ExportBpy(const FInstanc
 	return FString();
 }
 
+bool ExportChooserPropertyText_ExportBpy(UObject* Asset, const TCHAR* PropertyName, FString& OutText)
+{
+	OutText.Reset();
+	if (!Asset || !PropertyName)
+	{
+		return false;
+	}
+
+	const FProperty* Property = FindFProperty<FProperty>(Asset->GetClass(), PropertyName);
+	if (!Property)
+	{
+		return false;
+	}
+
+	const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Asset);
+	if (!ValuePtr)
+	{
+		return false;
+	}
+
+	Property->ExportTextItem_Direct(OutText, ValuePtr, nullptr, Asset, PPF_None);
+	return true;
+}
+
 void AppendChooserStandaloneMeta_ExportBpy(UObject* Asset, const TSharedPtr<FJsonObject>& Meta)
 {
 	if (!Meta.IsValid() || !IsChooserTableAsset_ExportBpy(Asset))
@@ -765,6 +789,25 @@ void AppendChooserStandaloneMeta_ExportBpy(UObject* Asset, const TSharedPtr<FJso
 	}
 
 	Meta->SetArrayField(TEXT("chooser_result_assets"), ResultAssetsJson);
+
+	FString PropertyText;
+	if (ExportChooserPropertyText_ExportBpy(Asset, TEXT("FallbackResult"), PropertyText))
+	{
+		Meta->SetStringField(TEXT("chooser_fallback_result_text"), PropertyText);
+	}
+	if (ExportChooserPropertyText_ExportBpy(Asset, TEXT("ResultsStructs"), PropertyText))
+	{
+		Meta->SetStringField(TEXT("chooser_results_structs_text"), PropertyText);
+	}
+	if (ExportChooserPropertyText_ExportBpy(Asset, TEXT("ColumnsStructs"), PropertyText))
+	{
+		Meta->SetStringField(TEXT("chooser_columns_structs_text"), PropertyText);
+	}
+	if (ExportChooserPropertyText_ExportBpy(Asset, TEXT("DisabledRows"), PropertyText))
+	{
+		Meta->SetStringField(TEXT("chooser_disabled_rows_text"), PropertyText);
+	}
+	Meta->SetNumberField(TEXT("chooser_structs_export_version"), 1.0);
 }
 
 TSharedPtr<FJsonObject> BuildStandaloneAssetMeta_ExportBpy(UObject* Asset)

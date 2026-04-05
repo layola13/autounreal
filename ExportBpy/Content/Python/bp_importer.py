@@ -928,6 +928,9 @@ def _get_component_attach_socket_name(component: Any) -> str:
 
 
 def _normalize_compare_value(value: Any) -> Any:
+    object_path = _extract_compare_object_path(value)
+    if object_path:
+        return object_path
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -935,6 +938,39 @@ def _normalize_compare_value(value: Any) -> Any:
     if value is None:
         return ""
     return str(value)
+
+
+def _extract_compare_object_path(value: Any) -> str:
+    if value is None:
+        return ""
+
+    try:
+        get_path_name = getattr(value, "get_path_name", None)
+        if callable(get_path_name):
+            path_name = str(get_path_name() or "").strip()
+            if path_name.startswith("/"):
+                return path_name
+    except Exception:
+        pass
+
+    if not isinstance(value, str):
+        return ""
+
+    text = value.strip()
+    if not text:
+        return ""
+
+    if text.startswith("/"):
+        object_ref_match = re.search(r"'(/[^']+)'", text)
+        if object_ref_match:
+            return object_ref_match.group(1)
+        return text
+
+    object_repr_match = re.search(r"'(/[^']+)'", text)
+    if object_repr_match:
+        return object_repr_match.group(1)
+
+    return ""
 
 
 def _values_equivalent(expected: Any, actual: Any) -> bool:

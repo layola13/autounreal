@@ -147,8 +147,11 @@ def _write_graph_file(path: str, graph: Any, *, meta_module_name: str) -> None:
     ]
     indent = "    "
     if graph.graph_type == "function":
+        thread_safe_arg = ""
+        if getattr(graph, "thread_safe", False):
+            thread_safe_arg = ", thread_safe=True"
         lines.append(
-            f"{indent}with bp.function({graph.name!r}, inputs={graph.inputs!r}, outputs={graph.outputs!r}, pure={graph.is_pure!r}) as g:"
+            f"{indent}with bp.function({graph.name!r}, inputs={graph.inputs!r}, outputs={graph.outputs!r}, pure={graph.is_pure!r}{thread_safe_arg}) as g:"
         )
     else:
         lines.append(f"{indent}with bp.event_graph({graph.name!r}) as g:")

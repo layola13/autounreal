@@ -82,6 +82,7 @@ class _Graph:
     inputs:      List[Tuple[str, str]] = field(default_factory=list)
     outputs:     List[Tuple[str, str]] = field(default_factory=list)
     is_pure:     bool  = False
+    thread_safe: bool  = False
     category:    str   = ""
     metadata:    Dict[str, Any] = field(default_factory=dict)
     uid_factory: Any = None
@@ -616,11 +617,12 @@ class Blueprint:
                  inputs:   Optional[List[Tuple[str, str]]] = None,
                  outputs:  Optional[List[Tuple[str, str]]] = None,
                  pure:     bool = False,
+                 thread_safe: bool = False,
                  category: str  = "") -> GraphContext:
         g = _Graph(
             name=name, graph_type="function",
             inputs=inputs or [], outputs=outputs or [],
-            is_pure=pure, category=category,
+            is_pure=pure, thread_safe=thread_safe, category=category,
         )
         return GraphContext(self, g)
 
@@ -748,6 +750,7 @@ def _serialize_graph(g: _Graph) -> Dict[str, Any]:
         "inputs":     [{"name": n, "type": t} for n, t in g.inputs],
         "outputs":    [{"name": n, "type": t} for n, t in g.outputs],
         "is_pure":    g.is_pure,
+        "thread_safe": g.thread_safe,
         "category":   g.category,
         "nodes": [
             {

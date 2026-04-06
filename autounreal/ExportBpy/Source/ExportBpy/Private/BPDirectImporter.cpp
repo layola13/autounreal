@@ -2593,6 +2593,7 @@ bool IsQualifiedFunctionReference_ImportBpy(const FString& FunctionRef)
 
 void EnsureFunctionPins_ImportBpy(UK2Node_FunctionEntry* EntryNode, const TArray<TPair<FString, FEdGraphPinType>>& Inputs);
 void EnsureFunctionPins_ImportBpy(UK2Node_FunctionResult* ResultNode, const TArray<TPair<FString, FEdGraphPinType>>& Outputs);
+void ApplyFunctionGraphMetadata_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson, UK2Node_FunctionEntry* EntryNode);
 void ParsePinTypeString_ImportBpy(const FString& TypeStr, FEdGraphPinType& OutType);
 void ParseGraphPins_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson, const TCHAR* FieldName, TArray<TPair<FString, FEdGraphPinType>>& OutPins);
 
@@ -2749,6 +2750,7 @@ bool EnsureGraphExists_ImportBpy(
 			EntryNodes.Add(Entry);
 		}
 		EnsureFunctionPins_ImportBpy(EntryNodes[0], GraphInputs);
+		ApplyFunctionGraphMetadata_ImportBpy(GraphJson, EntryNodes[0]);
 
 		TArray<UK2Node_FunctionResult*> ResultNodes;
 		OutGraph->GetNodesOfClass(ResultNodes);
@@ -2768,6 +2770,22 @@ bool EnsureGraphExists_ImportBpy(
 	}
 
 	return true;
+}
+
+void ApplyFunctionGraphMetadata_ImportBpy(
+	const TSharedPtr<FJsonObject>& GraphJson,
+	UK2Node_FunctionEntry* EntryNode)
+{
+	if (!GraphJson.IsValid() || !EntryNode)
+	{
+		return;
+	}
+
+	bool bThreadSafe = false;
+	if (GraphJson->TryGetBoolField(TEXT("thread_safe"), bThreadSafe))
+	{
+		EntryNode->MetaData.bThreadSafe = bThreadSafe;
+	}
 }
 
 void ParseGraphPins_ImportBpy(
@@ -2948,11 +2966,27 @@ void ParsePinTypeString_ImportBpy(const FString& TypeStr, FEdGraphPinType& OutTy
 {
 	OutType = FEdGraphPinType();
 
+	TArray<FString> TypeTokens;
+	TypeStr.ParseIntoArray(TypeTokens, TEXT("|"), true);
+	const FString BaseType = TypeTokens.IsEmpty() ? TypeStr : TypeTokens[0];
+	for (int32 TokenIndex = 1; TokenIndex < TypeTokens.Num(); ++TokenIndex)
+	{
+		const FString& Token = TypeTokens[TokenIndex];
+		if (Token.Equals(TEXT("ref"), ESearchCase::IgnoreCase))
+		{
+			OutType.bIsReference = true;
+		}
+		else if (Token.Equals(TEXT("const"), ESearchCase::IgnoreCase))
+		{
+			OutType.bIsConst = true;
+		}
+	}
+
 	FString Category;
 	FString Sub;
-	if (!TypeStr.Split(TEXT("/"), &Category, &Sub))
+	if (!BaseType.Split(TEXT("/"), &Category, &Sub))
 	{
-		OutType.PinCategory = FName(*TypeStr);
+		OutType.PinCategory = FName(*BaseType);
 		return;
 	}
 
@@ -4587,6 +4621,84 @@ bool ApplyNodeJsonToNode_ImportBpy(UEdGraphNode* Node, const TSharedPtr<FJsonObj
 	return true;
 }
 
+static bool SyncFunctionEntryPinTypes_ImportBpy(
+	UK2Node_FunctionEntry* EntryNode,
+	const TArray<TPair<FString, FEdGraphPinType>>& Inputs)
+{
+	if (!EntryNode)
+	{
+		return false;
+	}
+
+	bool bChanged = false;
+	for (const TPair<FString, FEdGraphPinType>& Input : Inputs)
+	{
+		const FName PinName(*Input.Key);
+		for (TSharedPtr<FUserPinInfo>& UserPinInfo : EntryNode->UserDefinedPins)
+		{
+			if (UserPinInfo.IsValid() && UserPinInfo->PinName == PinName)
+			{
+				if (!(UserPinInfo->PinType == Input.Value))
+				{
+					UserPinInfo->PinType = Input.Value;
+					bChanged = true;
+				}
+				break;
+			}
+		}
+
+		if (UEdGraphPin* ExistingPin = FindPinFlexible_ImportBpy(EntryNode, Input.Key, EGPD_Output))
+		{
+			if (!(ExistingPin->PinType == Input.Value))
+			{
+				ExistingPin->PinType = Input.Value;
+				bChanged = true;
+			}
+		}
+	}
+
+	return bChanged;
+}
+
+static bool SyncFunctionResultPinTypes_ImportBpy(
+	UK2Node_FunctionResult* ResultNode,
+	const TArray<TPair<FString, FEdGraphPinType>>& Outputs)
+{
+	if (!ResultNode)
+	{
+		return false;
+	}
+
+	bool bChanged = false;
+	for (const TPair<FString, FEdGraphPinType>& Output : Outputs)
+	{
+		const FName PinName(*Output.Key);
+		for (TSharedPtr<FUserPinInfo>& UserPinInfo : ResultNode->UserDefinedPins)
+		{
+			if (UserPinInfo.IsValid() && UserPinInfo->PinName == PinName)
+			{
+				if (!(UserPinInfo->PinType == Output.Value))
+				{
+					UserPinInfo->PinType = Output.Value;
+					bChanged = true;
+				}
+				break;
+			}
+		}
+
+		if (UEdGraphPin* ExistingPin = FindPinFlexible_ImportBpy(ResultNode, Output.Key, EGPD_Input))
+		{
+			if (!(ExistingPin->PinType == Output.Value))
+			{
+				ExistingPin->PinType = Output.Value;
+				bChanged = true;
+			}
+		}
+	}
+
+	return bChanged;
+}
+
 void EnsureFunctionPins_ImportBpy(UK2Node_FunctionEntry* EntryNode, const TArray<TPair<FString, FEdGraphPinType>>& Inputs)
 {
 	if (!EntryNode)
@@ -4594,13 +4706,22 @@ void EnsureFunctionPins_ImportBpy(UK2Node_FunctionEntry* EntryNode, const TArray
 		return;
 	}
 
+	bool bAddedPins = false;
 	for (const TPair<FString, FEdGraphPinType>& Input : Inputs)
 	{
 		if (!FindPinFlexible_ImportBpy(EntryNode, Input.Key, EGPD_Output))
 		{
 			EntryNode->CreateUserDefinedPin(FName(*Input.Key), Input.Value, EGPD_Output, false);
+			bAddedPins = true;
 		}
 	}
+
+	if (bAddedPins)
+	{
+		EntryNode->ReconstructNode();
+	}
+
+	SyncFunctionEntryPinTypes_ImportBpy(EntryNode, Inputs);
 }
 
 void EnsureFunctionPins_ImportBpy(UK2Node_FunctionResult* ResultNode, const TArray<TPair<FString, FEdGraphPinType>>& Outputs)
@@ -4610,13 +4731,22 @@ void EnsureFunctionPins_ImportBpy(UK2Node_FunctionResult* ResultNode, const TArr
 		return;
 	}
 
+	bool bAddedPins = false;
 	for (const TPair<FString, FEdGraphPinType>& Output : Outputs)
 	{
 		if (!FindPinFlexible_ImportBpy(ResultNode, Output.Key, EGPD_Input))
 		{
 			ResultNode->CreateUserDefinedPin(FName(*Output.Key), Output.Value, EGPD_Input, false);
+			bAddedPins = true;
 		}
 	}
+
+	if (bAddedPins)
+	{
+		ResultNode->ReconstructNode();
+	}
+
+	SyncFunctionResultPinTypes_ImportBpy(ResultNode, Outputs);
 }
 
 void ClearGraphNodes_ImportBpy(UBlueprint* BP, UEdGraph* Graph)
@@ -5179,6 +5309,7 @@ bool UBPDirectImporter::CreateGraph(
 			EntryNodes.Add(Entry);
 		}
 		EnsureFunctionPins_ImportBpy(EntryNodes[0], GraphInputs);
+		ApplyFunctionGraphMetadata_ImportBpy(GraphJson, EntryNodes[0]);
 
 		TArray<UK2Node_FunctionResult*> ResultNodes;
 		Graph->GetNodesOfClass(ResultNodes);

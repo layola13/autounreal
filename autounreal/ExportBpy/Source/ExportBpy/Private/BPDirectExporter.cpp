@@ -89,6 +89,39 @@ void AddNodePropertyTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info, cons
 	}
 }
 
+void AddNodePropertyDeltaTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info, const TCHAR* PropertyName)
+{
+	if (!Node || !PropertyName)
+	{
+		return;
+	}
+
+	FProperty* Property = Node->GetClass()->FindPropertyByName(FName(PropertyName));
+	if (!Property)
+	{
+		return;
+	}
+
+	void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Node);
+	if (!ValuePtr)
+	{
+		return;
+	}
+
+	void* DefaultPtr = nullptr;
+	if (UObject* DefaultObject = Node->GetClass()->GetDefaultObject())
+	{
+		DefaultPtr = Property->ContainerPtrToValuePtr<void>(DefaultObject);
+	}
+
+	FString ExportedValue;
+	Property->ExportTextItem_Direct(ExportedValue, ValuePtr, DefaultPtr, Node, PPF_None);
+	if (!ExportedValue.IsEmpty())
+	{
+		Info.NodeProps.Add(PropertyName, ExportedValue);
+	}
+}
+
 UBlueprint* LoadBlueprintAsset_ExportBpy(const FString& BlueprintPath, FString& OutError)
 {
 	UBlueprint* BP = Cast<UBlueprint>(
@@ -870,6 +903,14 @@ FString NormalizeTypeString_ExportBpy(const FEdGraphPinType& PinType)
 	{
 		TypeStr += TEXT("/") + PinType.PinSubCategory.ToString();
 	}
+	if (PinType.bIsReference)
+	{
+		TypeStr += TEXT("|ref");
+	}
+	if (PinType.bIsConst)
+	{
+		TypeStr += TEXT("|const");
+	}
 	return TypeStr;
 }
 
@@ -1560,6 +1601,10 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("ShowPinForProperties"));
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("CustomPinProperties"));
+		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("InitialUpdateFunction"));
+		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("BecomeRelevantFunction"));
+		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("UpdateFunction"));
+		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("OnMotionMatchingStateUpdatedFunction"));
 	}
 
 	return Info;
@@ -2654,10 +2699,12 @@ bool UBPDirectExporter::GenerateGraphFile(
 	if (bIsFunction)
 	{
 		FString InputsStr, OutputsStr;
+		bool bThreadSafe = false;
 		for (UK2Node* K2 : AllNodes)
 		{
 			if (auto* FE = Cast<UK2Node_FunctionEntry>(K2))
 			{
+				bThreadSafe |= FE->MetaData.bThreadSafe;
 				bool bFirst = true;
 				for (UEdGraphPin* Pin : FE->Pins)
 				{
@@ -2700,6 +2747,8 @@ bool UBPDirectExporter::GenerateGraphFile(
 			Args += FString::Printf(TEXT(", inputs=[%s]"), *InputsStr);
 		if (!OutputsStr.IsEmpty())
 			Args += FString::Printf(TEXT(", outputs=[%s]"), *OutputsStr);
+		if (bThreadSafe)
+			Args += TEXT(", thread_safe=True");
 		CtxHeader = FString::Printf(TEXT("with bp.function(%s) as g:"), *Args);
 	}
 	else if (bIsMacro)
@@ -3462,7 +3511,22 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeGraph(UEdGraph* Graph)
 	GObj->SetArrayField(TEXT("inputs"),   Inputs);
 	GObj->SetArrayField(TEXT("outputs"),  Outputs);
 	GObj->SetBoolField(TEXT("is_pure"),   false);
+	GObj->SetBoolField(TEXT("thread_safe"), false);
 	GObj->SetStringField(TEXT("category"), TEXT(""));
+
+	if (GType == TEXT("function"))
+	{
+		TArray<UK2Node_FunctionEntry*> EntryNodes;
+		Graph->GetNodesOfClass(EntryNodes);
+		for (UK2Node_FunctionEntry* EntryNode : EntryNodes)
+		{
+			if (EntryNode)
+			{
+				GObj->SetBoolField(TEXT("thread_safe"), EntryNode->MetaData.bThreadSafe);
+				break;
+			}
+		}
+	}
 
 	// Nodes
 	TArray<TSharedPtr<FJsonValue>> Nodes;

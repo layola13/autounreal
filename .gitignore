@@ -1,4 +1,4 @@
-# Unreal Engine
+﻿# Unreal Engine
 Binaries/
 DerivedDataCache/
 Intermediate/
@@ -14,19 +14,12 @@ Saved/
 .vscode/
 .vs/
 
-# Content — large/binary assets (uncomment if storing assets externally)
-# Content/
-
-# Derived/generated plugin artifacts
-Plugins/ExportBlueprintToTxt/Content/
-Plugins/ExportBlueprintToTxt/Intermediate/
-Plugins/ExportBlueprintToTxt/Binaries/
-Plugins/ExportBpy/Content/
-Plugins/ExportBpy/Intermediate/
-Plugins/ExportBpy/Binaries/
-Plugins/UnrealMCP/Content/
-Plugins/UnrealMCP/Intermediate/
-Plugins/UnrealMCP/Binaries/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env/
+.venv/
 
 # Claude / editor tooling
 .claude copy/
@@ -36,5 +29,3 @@ opencode.json
 
 # Exported blueprint text (transient output)
 ExportedBlueprints/
-__pycache__/
-*__pycache__*

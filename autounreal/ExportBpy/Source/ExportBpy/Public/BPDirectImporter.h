@@ -68,6 +68,13 @@ public:
 		const FString& AssetPath,
 		const FString& PropertiesJson);
 
+	static bool PopulateGraph(
+		UBlueprint* BP,
+		UEdGraph* Graph,
+		const TSharedPtr<class FJsonObject>& GraphJson,
+		bool bPreserveTunnelNodes,
+		FString& OutError);
+
 private:
 	// ── Asset management ─────────────────────────────────────────────────────
 

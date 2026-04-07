@@ -9,6 +9,7 @@
 
 class UBlueprint;
 class UEdGraph;
+class UEdGraphNode;
 class UEdGraphPin;
 class UK2Node;
 
@@ -130,13 +131,16 @@ private:
 	static FString GenerateInterfacesSection(UBlueprint* BP);
 	static FString GenerateDispatchersSection(UBlueprint* BP);
 
+public:
 	// ── JSON serialisation (for ReadBlueprintToJson) ──────────────────────────
 
 	static TSharedPtr<FJsonObject> SerializeBlueprintToJson(UBlueprint* BP);
 	static TSharedPtr<FJsonObject> SerializeGraph(UEdGraph* Graph);
 	static TSharedPtr<FJsonObject> SerializeNode(UK2Node* Node);
+	static TSharedPtr<FJsonObject> SerializeGenericNode(UEdGraphNode* Node);
 	static TArray<TSharedPtr<FJsonValue>> SerializeConnections(UEdGraph* Graph);
 
+private:
 	// ── Graph file generation ─────────────────────────────────────────────────
 
 	static bool GenerateGraphFile(

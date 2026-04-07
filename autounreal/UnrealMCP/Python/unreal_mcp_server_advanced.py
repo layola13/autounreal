@@ -492,6 +492,18 @@ def _forward_unreal_command(command: str, params: Optional[Dict[str, Any]] = Non
         logger.error(f"{command} error: {e}")
         return {"success": False, "message": str(e)}
 
+
+def _unwrap_forwarded_result(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize bridge envelopes shaped like {'status': 'success', 'result': {...}}."""
+    if not isinstance(response, dict):
+        return {}
+
+    nested = response.get("result")
+    if isinstance(nested, dict) and "success" in nested:
+        return nested
+
+    return response
+
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     """Handle server startup and shutdown."""
@@ -2090,9 +2102,10 @@ def import_blueprint_from_bpy_verified(
         compile_blueprint=compile_blueprint
     )
     import_result = _forward_unreal_command("import_blueprint_from_bpy", import_params)
+    import_payload = _unwrap_forwarded_result(import_result)
 
     response: Dict[str, Any] = {
-        "success": bool(import_result.get("success")),
+        "success": bool(import_payload.get("success")),
         "import_result": import_result
     }
 
@@ -2106,7 +2119,7 @@ def import_blueprint_from_bpy_verified(
     if resolved_asset_path:
         response["asset_path"] = resolved_asset_path
 
-    if not import_result.get("success"):
+    if not import_payload.get("success"):
         return response
 
     if resolved_asset_path:

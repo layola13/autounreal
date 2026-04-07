@@ -8472,21 +8472,78 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleExportBlueprintBp
             Params->TryGetStringField(TEXT("path"), OutputPath);
         }
 
-        if (OutputPath.IsEmpty())
+        bool bExportAsDirectory = OutputPath.IsEmpty();
+        if (!OutputPath.IsEmpty())
         {
-            OutputPath = BuildDefaultBpyExportPath_BP(Blueprint);
-        }
-        else
-        {
-            if (!OutputPath.EndsWith(TEXT(".bp.py"), ESearchCase::IgnoreCase) && FPaths::GetExtension(OutputPath).IsEmpty())
-            {
-                OutputPath = FPaths::Combine(OutputPath, Blueprint->GetName() + TEXT(".bp.py"));
-            }
-
             if (FPaths::IsRelative(OutputPath))
             {
                 OutputPath = FPaths::Combine(FPaths::ProjectDir(), OutputPath);
             }
+
+            const bool bExplicitBpyFile = OutputPath.EndsWith(TEXT(".bp.py"), ESearchCase::IgnoreCase);
+            const bool bHasAnyExtension = !FPaths::GetExtension(OutputPath).IsEmpty();
+            bExportAsDirectory = !bExplicitBpyFile && !bHasAnyExtension;
+        }
+
+        if (bExportAsDirectory)
+        {
+            FString BaseOutputDir = OutputPath;
+            FString ExportDir;
+            if (BaseOutputDir.IsEmpty())
+            {
+                BaseOutputDir = FPaths::Combine(FPaths::ProjectDir(), TEXT("ExportedBlueprints"), TEXT("bpy"));
+                ExportDir = FPaths::Combine(BaseOutputDir, Blueprint->GetName());
+            }
+            else if (FPaths::GetCleanFilename(BaseOutputDir).Equals(Blueprint->GetName(), ESearchCase::IgnoreCase))
+            {
+                ExportDir = BaseOutputDir;
+                BaseOutputDir = FPaths::GetPath(BaseOutputDir);
+            }
+            else
+            {
+                ExportDir = FPaths::Combine(BaseOutputDir, Blueprint->GetName());
+            }
+
+            FString ExportError;
+            if (!UBPDirectExporter::ExportBlueprintToPy(Blueprint->GetPathName(), BaseOutputDir, ExportError))
+            {
+                return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                    ExportError.IsEmpty()
+                        ? FString::Printf(TEXT("Failed to export blueprint bpy directory: %s"), *Blueprint->GetPathName())
+                        : ExportError);
+            }
+
+            const FString MainFilePath = FPaths::Combine(ExportDir, TEXT("__bp__.bp.py"));
+
+            FString MainFileText;
+            FFileHelper::LoadFileToString(MainFileText, *MainFilePath);
+
+            TArray<FString> ExportedFiles;
+            IFileManager::Get().FindFilesRecursive(ExportedFiles, *ExportDir, TEXT("*"), true, false, false);
+            ExportedFiles.Sort();
+
+            TArray<TSharedPtr<FJsonValue>> ExportedFileValues;
+            ExportedFileValues.Reserve(ExportedFiles.Num());
+            for (const FString& FilePath : ExportedFiles)
+            {
+                ExportedFileValues.Add(MakeShared<FJsonValueString>(FilePath));
+            }
+
+            TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+            ResultObj->SetBoolField(TEXT("success"), true);
+            ResultObj->SetStringField(TEXT("asset_path"), Blueprint->GetPathName());
+            ResultObj->SetStringField(TEXT("blueprint_name"), Blueprint->GetName());
+            ResultObj->SetStringField(TEXT("output_dir"), ExportDir);
+            ResultObj->SetStringField(TEXT("output_path"), MainFilePath);
+            ResultObj->SetStringField(TEXT("format"), TEXT("bpy_directory"));
+            ResultObj->SetStringField(TEXT("producer"), TEXT("ExportBpy"));
+            ResultObj->SetArrayField(TEXT("exported_files"), ExportedFileValues);
+            if (!MainFileText.IsEmpty())
+            {
+                ResultObj->SetStringField(TEXT("bpy_text"), MainFileText);
+                ResultObj->SetStringField(TEXT("python_text"), MainFileText);
+            }
+            return ResultObj;
         }
 
         FString ExportError;

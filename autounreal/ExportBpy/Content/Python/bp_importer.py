@@ -31,6 +31,42 @@ GRAPH_PREFIXES = ("evt_", "fn_", "macro_", "tl_")
 MAIN_BP_FILE = "__bp__.bp.py"
 
 
+def _begin_local_python_package_import(package_root: str) -> Tuple[List[str], Dict[str, Any]]:
+    plugin_python_dir = os.path.dirname(os.path.abspath(__file__))
+    original_sys_path = list(sys.path)
+    normalized_plugin_dir = os.path.normcase(os.path.normpath(plugin_python_dir))
+    sys.path[:] = [plugin_python_dir] + [
+        path for path in original_sys_path
+        if os.path.normcase(os.path.normpath(path or "")) != normalized_plugin_dir
+    ]
+
+    saved_modules: Dict[str, Any] = {}
+    stale_keys = [
+        key for key in list(sys.modules)
+        if key == package_root or key.startswith(package_root + ".")
+    ]
+    for key in stale_keys:
+        saved_modules[key] = sys.modules.pop(key)
+
+    return original_sys_path, saved_modules
+
+
+def _end_local_python_package_import(
+    package_root: str,
+    original_sys_path: List[str],
+    saved_modules: Dict[str, Any],
+) -> None:
+    stale_keys = [
+        key for key in list(sys.modules)
+        if key == package_root or key.startswith(package_root + ".")
+    ]
+    for key in stale_keys:
+        sys.modules.pop(key, None)
+
+    sys.path[:] = original_sys_path
+    sys.modules.update(saved_modules)
+
+
 def _exec_pin_variants(pin_name: str) -> Tuple[str, ...]:
     normalized = str(pin_name or "")
     if normalized == "exec":
@@ -373,6 +409,8 @@ def _import_blueprint_object_with_details(
 
     try:
         payload = bp_obj.to_dict()
+        _augment_explicit_variable_type_metadata(payload)
+        _sanitize_problematic_default_strings(payload)
         json_str = json.dumps(payload, ensure_ascii=False, indent=2)
     except Exception as exc:
         return _error_details(f"序列化失败: {exc}")
@@ -406,7 +444,12 @@ def _import_blueprint_object_with_details(
         if repair_ok:
             _save_asset_if_possible(bridge_asset_path)
 
-    validation_summary = _validate_imported_blueprint(bridge_asset_path, payload) if ok else {}
+    validation_summary = _validate_imported_blueprint(asset_path, payload) if ok else {}
+    if ok and validation_summary.get("missing_components"):
+        _save_asset_if_possible(bridge_asset_path)
+        retried_summary = _validate_imported_blueprint(asset_path, payload)
+        if retried_summary:
+            validation_summary = retried_summary
     validation_ok = bool(validation_summary.get("ok", False)) if validation_summary else False
     success = bool(ok and repair_ok and (compiled_ok if compile_blueprint else True))
     error_parts = [part for part in (err, repair_err, compile_err) if part]
@@ -426,14 +469,18 @@ def _exec_directory_dsl(dir_path: str):
     if not os.path.isfile(main_path):
         raise FileNotFoundError(f"目录缺少 {MAIN_BP_FILE}: {dir_path}")
 
+    original_sys_path, saved_dsl_modules = _begin_local_python_package_import("ue_bp_dsl")
     package_name = f"_exportbpy_pkg_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(package_name, main_path)
     if spec is None or spec.loader is None:
+        _end_local_python_package_import("ue_bp_dsl", original_sys_path, saved_dsl_modules)
         raise ImportError(f"无法为 {main_path} 创建 import spec")
 
     module = importlib.util.module_from_spec(spec)
     sys.modules[package_name] = module
 
+    previous_dont_write_bytecode = bool(getattr(sys, "dont_write_bytecode", False))
+    sys.dont_write_bytecode = True
     try:
         spec.loader.exec_module(module)
         bp = getattr(module, "bp", None)
@@ -461,9 +508,11 @@ def _exec_directory_dsl(dir_path: str):
         _augment_legacy_animgraph_node_props(bp, dir_path)
         return bp
     finally:
+        sys.dont_write_bytecode = previous_dont_write_bytecode
         stale_keys = [key for key in sys.modules if key == package_name or key.startswith(package_name + ".")]
         for key in stale_keys:
             sys.modules.pop(key, None)
+        _end_local_python_package_import("ue_bp_dsl", original_sys_path, saved_dsl_modules)
 
 
 def _is_standalone_asset_descriptor(bp_obj: Any) -> bool:
@@ -493,51 +542,123 @@ def _error_details(message: str) -> Dict[str, Any]:
     }
 
 
+def _augment_explicit_variable_type_metadata(payload: Dict[str, Any]) -> None:
+    variables = payload.get("variables", [])
+    if not isinstance(variables, list):
+        return
+
+    for variable in variables:
+        if not isinstance(variable, dict):
+            continue
+
+        type_str = str(variable.get("type", "") or "")
+        if not type_str or "|mapvalue=" not in type_str:
+            continue
+
+        for token in type_str.split("|")[1:]:
+            lowered = token.lower()
+            if lowered.startswith("mapvalue="):
+                variable["map_value_type"] = token[len("mapvalue="):]
+            elif lowered == "mapvalueconst":
+                variable["map_value_const"] = True
+            elif lowered == "mapvalueweak":
+                variable["map_value_weak"] = True
+            elif lowered == "mapvaluewrapper":
+                variable["map_value_wrapper"] = True
+
+
+def _sanitize_empty_container_assignments(text: Any) -> Any:
+    if not isinstance(text, str) or not text.startswith("("):
+        return text
+
+    result: List[str] = []
+    length = len(text)
+    for index, char in enumerate(text):
+        result.append(char)
+        if char == "=" and (index + 1) < length and text[index + 1] in "),":
+            result.extend(["(", ")"])
+    return "".join(result)
+
+
+def _sanitize_problematic_default_strings(payload: Dict[str, Any]) -> None:
+    variables = payload.get("variables", [])
+    if isinstance(variables, list):
+        for variable in variables:
+            if not isinstance(variable, dict):
+                continue
+            variable["default"] = _sanitize_empty_container_assignments(
+                variable.get("default", "")
+            )
+
+    graphs = payload.get("graphs", [])
+    if not isinstance(graphs, list):
+        return
+
+    for graph in graphs:
+        if not isinstance(graph, dict):
+            continue
+        nodes = graph.get("nodes", [])
+        if not isinstance(nodes, list):
+            continue
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            defaults = node.get("defaults")
+            if not isinstance(defaults, dict):
+                continue
+            for pin_name, value in list(defaults.items()):
+                defaults[pin_name] = _sanitize_empty_container_assignments(value)
+
+
 def _exec_file_dsl(py_path: str):
     """
     在隔离命名空间里执行单文件 DSL。
     """
-    from ue_bp_dsl.core import (
-        Blueprint, float_track, vector_track, color_track,
-        event_track, key, asset, soft_ref, class_ref, vec3, struct, enum,
-    )
+    original_sys_path, saved_dsl_modules = _begin_local_python_package_import("ue_bp_dsl")
+    try:
+        from ue_bp_dsl.core import (
+            Blueprint, float_track, vector_track, color_track,
+            event_track, key, asset, soft_ref, class_ref, vec3, struct, enum,
+        )
 
-    ns: Dict[str, Any] = {
-        "__file__": py_path,
-        "__name__": "_bp_importer_exec",
-        "Blueprint": Blueprint,
-        "float_track": float_track,
-        "vector_track": vector_track,
-        "color_track": color_track,
-        "event_track": event_track,
-        "key": key,
-        "asset": asset,
-        "soft_ref": soft_ref,
-        "class_ref": class_ref,
-        "vec3": vec3,
-        "struct": struct,
-        "enum": enum,
-    }
+        ns: Dict[str, Any] = {
+            "__file__": py_path,
+            "__name__": "_bp_importer_exec",
+            "Blueprint": Blueprint,
+            "float_track": float_track,
+            "vector_track": vector_track,
+            "color_track": color_track,
+            "event_track": event_track,
+            "key": key,
+            "asset": asset,
+            "soft_ref": soft_ref,
+            "class_ref": class_ref,
+            "vec3": vec3,
+            "struct": struct,
+            "enum": enum,
+        }
 
-    with open(py_path, "r", encoding="utf-8") as handle:
-        src = handle.read()
+        with open(py_path, "r", encoding="utf-8") as handle:
+            src = handle.read()
 
-    exec(compile(src, py_path, "exec"), ns)  # noqa: S102
+        exec(compile(src, py_path, "exec"), ns)  # noqa: S102
 
-    bp = ns.get("bp")
-    if bp is None:
-        raise ValueError("脚本未定义顶层变量 'bp'（需要 bp = Blueprint(...)）")
-    if not isinstance(bp, Blueprint):
-        raise TypeError(f"'bp' 类型错误: 期望 Blueprint，得到 {type(bp)}")
+        bp = ns.get("bp")
+        if bp is None:
+            raise ValueError("脚本未定义顶层变量 'bp'（需要 bp = Blueprint(...)）")
+        if not isinstance(bp, Blueprint):
+            raise TypeError(f"'bp' 类型错误: 期望 Blueprint，得到 {type(bp)}")
 
-    graph_infos = _parse_graph_source_info(py_path)
-    meta = ns.get("META")
-    used_graph_indexes: Set[int] = set()
-    for info in graph_infos:
-        _apply_graph_source_info(bp, info, meta, used_graph_indexes)
+        graph_infos = _parse_graph_source_info(py_path)
+        meta = ns.get("META")
+        used_graph_indexes: Set[int] = set()
+        for info in graph_infos:
+            _apply_graph_source_info(bp, info, meta, used_graph_indexes)
 
-    _augment_legacy_animgraph_node_props(bp, py_path)
-    return bp
+        _augment_legacy_animgraph_node_props(bp, py_path)
+        return bp
+    finally:
+        _end_local_python_package_import("ue_bp_dsl", original_sys_path, saved_dsl_modules)
 
 
 def _parse_graph_source_info(py_path: str) -> List[Dict[str, Any]]:
@@ -903,6 +1024,73 @@ def _find_component_on_actor(actor: Any, component_name: str):
     return None
 
 
+def _iter_blueprint_component_nodes(blueprint: Any) -> List[Any]:
+    if blueprint is None:
+        return []
+
+    try:
+        scs = getattr(blueprint, "simple_construction_script", None)
+    except Exception:
+        scs = None
+    if scs is None:
+        try:
+            scs = blueprint.get_editor_property("simple_construction_script")
+        except Exception:
+            scs = None
+    if scs is None:
+        return []
+
+    get_all_nodes = getattr(scs, "get_all_nodes", None)
+    if callable(get_all_nodes):
+        try:
+            return list(get_all_nodes() or [])
+        except Exception:
+            return []
+    return []
+
+
+def _get_component_node_name(node: Any) -> str:
+    if node is None:
+        return ""
+
+    try:
+        variable_name = node.get_editor_property("variable_name")
+        text = str(variable_name or "")
+        if text:
+            return text
+    except Exception:
+        pass
+
+    try:
+        get_variable_name = getattr(node, "get_variable_name", None)
+        if callable(get_variable_name):
+            text = str(get_variable_name() or "")
+            if text:
+                return text
+    except Exception:
+        pass
+
+    try:
+        component_template = node.get_editor_property("component_template")
+    except Exception:
+        component_template = None
+    if component_template is not None:
+        try:
+            return str(component_template.get_name() or "")
+        except Exception:
+            return ""
+
+    return ""
+
+
+def _find_component_node_on_blueprint(blueprint: Any, component_name: str):
+    for node in _iter_blueprint_component_nodes(blueprint):
+        actual_name = _get_component_node_name(node)
+        if _component_name_matches(component_name, actual_name):
+            return node
+    return None
+
+
 def _get_component_parent_name(component: Any) -> str:
     if component is None or not hasattr(component, "get_attach_parent"):
         return ""
@@ -1036,7 +1224,14 @@ def _validate_imported_blueprint(asset_path: str, payload: Dict[str, Any]) -> Di
         return summary
 
     components = payload.get("components", [])
-    if isinstance(components, list):
+    component_validation_available = bool(_iter_actor_components(cdo)) or bool(
+        _iter_blueprint_component_nodes(blueprint)
+    )
+    if isinstance(components, list) and not component_validation_available:
+        summary["warnings"].append(
+            "Component validation unavailable in current Unreal Python context; skipped component checks"
+        )
+    elif isinstance(components, list):
         for component_data in components:
             if not isinstance(component_data, dict):
                 continue
@@ -1046,12 +1241,15 @@ def _validate_imported_blueprint(asset_path: str, payload: Dict[str, Any]) -> Di
                 continue
 
             live_component = _find_component_on_actor(cdo, component_name)
+            component_node = None
             if live_component is None:
+                component_node = _find_component_node_on_blueprint(blueprint, component_name)
+            if live_component is None and component_node is None:
                 summary["missing_components"].append(component_name)
                 continue
 
             expected_parent = str(component_data.get("parent", "") or "")
-            if expected_parent:
+            if expected_parent and live_component is not None:
                 actual_parent = _get_component_parent_name(live_component)
                 if not _component_name_matches(expected_parent, actual_parent):
                     summary["component_parent_mismatches"].append(
@@ -1063,7 +1261,7 @@ def _validate_imported_blueprint(asset_path: str, payload: Dict[str, Any]) -> Di
                     )
 
             expected_socket = str(component_data.get("attach_to_name", "") or "")
-            if expected_socket:
+            if expected_socket and live_component is not None:
                 actual_socket = _get_component_attach_socket_name(live_component)
                 if actual_socket != expected_socket:
                     summary["component_socket_mismatches"].append(
@@ -1157,7 +1355,7 @@ def _load_blueprint_asset_for_repair(asset_path: str):
     if not _HAS_UNREAL:
         return None
 
-    candidates = [_normalize_bridge_blueprint_path(asset_path), asset_path]
+    candidates = [asset_path, _normalize_bridge_blueprint_path(asset_path)]
     tried: Set[str] = set()
     for candidate in candidates:
         if not candidate or candidate in tried:

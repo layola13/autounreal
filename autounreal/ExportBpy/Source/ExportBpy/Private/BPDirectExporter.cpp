@@ -715,7 +715,7 @@ TArray<TSharedPtr<FJsonValue>> SerializeStandaloneSubobjects_ExportBpy(UObject* 
 	}
 
 	TArray<UObject*> Subobjects;
-	GetObjectsWithOuter(Asset, Subobjects, false);
+	GetObjectsWithOuter(Asset, Subobjects, /*bIncludeNestedObjects=*/ true);
 	Subobjects.RemoveAll([](const UObject* Object)
 	{
 		return Object == nullptr || Object->HasAnyFlags(RF_Transient | RF_ClassDefaultObject);
@@ -993,6 +993,12 @@ FString MakePythonStringLiteral_ExportBpy(const FString& Text)
 	return FString::Printf(TEXT("\"%s\""), *EscapePythonString_ExportBpy(Text));
 }
 
+FString NormalizeExportedValueText_ExportBpy(FString Text)
+{
+	Text.ReplaceInline(TEXT("-0.000000"), TEXT("0.000000"), ESearchCase::CaseSensitive);
+	return Text;
+}
+
 FString GetExportedSubTypeText_ExportBpy(UObject* SubCategoryObject)
 {
 	if (!SubCategoryObject)
@@ -1132,20 +1138,20 @@ FString GetBlueprintVariableDefaultValue_ExportBpy(UBlueprint* BP, const FBPVari
 	FString DefaultValue = Var.DefaultValue;
 	if (!BP)
 	{
-		return SanitizeEmptyContainerAssignments(DefaultValue);
+		return NormalizeExportedValueText_ExportBpy(SanitizeEmptyContainerAssignments(DefaultValue));
 	}
 
 	UClass* GeneratedClass = BP->GeneratedClass;
 	UObject* GeneratedCDO = GeneratedClass ? GeneratedClass->GetDefaultObject(false) : nullptr;
 	if (!GeneratedCDO)
 	{
-		return SanitizeEmptyContainerAssignments(DefaultValue);
+		return NormalizeExportedValueText_ExportBpy(SanitizeEmptyContainerAssignments(DefaultValue));
 	}
 
 	const FProperty* TargetProperty = FindFProperty<FProperty>(GeneratedCDO->GetClass(), Var.VarName);
 	if (!TargetProperty)
 	{
-		return SanitizeEmptyContainerAssignments(DefaultValue);
+		return NormalizeExportedValueText_ExportBpy(SanitizeEmptyContainerAssignments(DefaultValue));
 	}
 
 	FString ExportedValue;
@@ -1162,10 +1168,10 @@ FString GetBlueprintVariableDefaultValue_ExportBpy(UBlueprint* BP, const FBPVari
 		GeneratedCDO,
 		PortFlags))
 	{
-		return SanitizeEmptyContainerAssignments(ExportedValue);
+		return NormalizeExportedValueText_ExportBpy(SanitizeEmptyContainerAssignments(ExportedValue));
 	}
 
-	return SanitizeEmptyContainerAssignments(DefaultValue);
+	return NormalizeExportedValueText_ExportBpy(SanitizeEmptyContainerAssignments(DefaultValue));
 }
 
 FString GetPinDefaultValue_ExportBpy(const UEdGraphPin* Pin)
@@ -1359,6 +1365,74 @@ FString GetLogicalPinName_ExportBpy(UK2Node* Node, UEdGraphPin* Pin)
 	return RawPinName;
 }
 
+TArray<UEdGraphPin*> GetSyntheticExecPassThroughTargets_ExportBpy(UK2Node* Node, UEdGraphPin* OutputExecPin)
+{
+	TArray<UEdGraphPin*> Targets;
+	if (!Node || !OutputExecPin)
+	{
+		return Targets;
+	}
+
+	if (OutputExecPin->Direction != EGPD_Output ||
+		OutputExecPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec ||
+		!OutputExecPin->LinkedTo.IsEmpty())
+	{
+		return Targets;
+	}
+
+	UEdGraphPin* MatchingInputExecPin = nullptr;
+	for (UEdGraphPin* Pin : Node->Pins)
+	{
+		if (!Pin || Pin == OutputExecPin)
+		{
+			continue;
+		}
+
+		if (Pin->Direction == EGPD_Input &&
+			Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec &&
+			Pin->PinName == OutputExecPin->PinName)
+		{
+			MatchingInputExecPin = Pin;
+			break;
+		}
+	}
+
+	if (!MatchingInputExecPin || MatchingInputExecPin->LinkedTo.Num() < 2)
+	{
+		return Targets;
+	}
+
+	bool bHasUpstreamSource = false;
+	for (UEdGraphPin* LinkedPin : MatchingInputExecPin->LinkedTo)
+	{
+		if (LinkedPin && LinkedPin->GetOwningNode() != Node && LinkedPin->Direction == EGPD_Output)
+		{
+			bHasUpstreamSource = true;
+			break;
+		}
+	}
+
+	if (!bHasUpstreamSource)
+	{
+		return Targets;
+	}
+
+	for (UEdGraphPin* LinkedPin : MatchingInputExecPin->LinkedTo)
+	{
+		if (!LinkedPin || LinkedPin->GetOwningNode() == Node)
+		{
+			continue;
+		}
+
+		if (LinkedPin->Direction == EGPD_Input)
+		{
+			Targets.Add(LinkedPin);
+		}
+	}
+
+	return Targets;
+}
+
 bool CanUseAttributeSyntax_ExportBpy(const FString& PinName)
 {
 	if (PinName.IsEmpty())
@@ -1462,6 +1536,14 @@ FString FormatPythonValueLiteral_ExportBpy(const FString& RawValue)
 		return TEXT("False");
 	}
 
+	for (const TCHAR Ch : Trimmed)
+	{
+		if (FChar::IsWhitespace(Ch))
+		{
+			return MakePythonStringLiteral_ExportBpy(Trimmed);
+		}
+	}
+
 	if (!Trimmed.Contains(TEXT(",")) && LooksLikeStrictPythonNumberLiteral_ExportBpy(Trimmed))
 	{
 		return Trimmed;
@@ -1470,9 +1552,196 @@ FString FormatPythonValueLiteral_ExportBpy(const FString& RawValue)
 	return MakePythonStringLiteral_ExportBpy(Trimmed);
 }
 
+TArray<FString> InlineExtraPropLines_ExportBpy(const FNodeInfo& Info)
+{
+	auto ShouldInlineNodeProp = [&](const FString& Key) -> bool
+	{
+		if (Key == TEXT("Chooser") ||
+			Key == TEXT("Mode") ||
+			Key == TEXT("bReturnSoftObjectReference"))
+		{
+			return true;
+		}
+
+		if (!Info.NodeType.StartsWith(TEXT("AnimGraphNode_")))
+		{
+			return false;
+		}
+
+		return Key == TEXT("Node") ||
+			Key == TEXT("ShowPinForProperties") ||
+			Key == TEXT("CustomPinProperties") ||
+			Key == TEXT("InitialUpdateFunction") ||
+			Key == TEXT("BecomeRelevantFunction") ||
+			Key == TEXT("UpdateFunction") ||
+			Key == TEXT("OnMotionMatchingStateUpdatedFunction");
+	};
+
+	TArray<FString> Keys;
+	Info.NodeProps.GetKeys(Keys);
+	Keys.Sort();
+
+	TArray<FString> Lines;
+	for (const FString& Key : Keys)
+	{
+		if (!ShouldInlineNodeProp(Key))
+		{
+			continue;
+		}
+
+		const FString* Value = Info.NodeProps.Find(Key);
+		if (!Value || Value->IsEmpty())
+		{
+			continue;
+		}
+
+		Lines.Add(FString::Printf(
+			TEXT("%s.set_extra_prop(%s, %s)"),
+			*Info.VarName,
+			*MakePythonStringLiteral_ExportBpy(Key),
+			*FormatPythonValueLiteral_ExportBpy(*Value)));
+	}
+
+	return Lines;
+}
+
 FString BuildModuleName_ExportBpy(const FString& Prefix, const FString& GraphName)
 {
 	return Prefix + SanitizePythonIdentifier_ExportBpy(GraphName, TEXT("graph"));
+}
+
+enum class ERootGraphKind_ExportBpy : uint8
+{
+	Macro = 0,
+	Function = 1,
+	Event = 2
+};
+
+ERootGraphKind_ExportBpy ClassifyRootGraphKind_ExportBpy(UBlueprint* BP, UEdGraph* Graph)
+{
+	if (!Graph)
+	{
+		return ERootGraphKind_ExportBpy::Event;
+	}
+
+	if (BP)
+	{
+		if (BP->MacroGraphs.Contains(Graph))
+		{
+			return ERootGraphKind_ExportBpy::Macro;
+		}
+		if (BP->FunctionGraphs.Contains(Graph))
+		{
+			return ERootGraphKind_ExportBpy::Function;
+		}
+		if (BP->UbergraphPages.Contains(Graph))
+		{
+			return ERootGraphKind_ExportBpy::Event;
+		}
+	}
+
+	TArray<UK2Node_FunctionEntry*> EntryNodes;
+	Graph->GetNodesOfClass(EntryNodes);
+	if (EntryNodes.Num() > 0)
+	{
+		return ERootGraphKind_ExportBpy::Function;
+	}
+
+	TArray<UK2Node_Tunnel*> TunnelNodes;
+	Graph->GetNodesOfClass(TunnelNodes);
+	if (TunnelNodes.Num() > 0)
+	{
+		return ERootGraphKind_ExportBpy::Macro;
+	}
+
+	return ERootGraphKind_ExportBpy::Event;
+}
+
+FString GetRootGraphPrefix_ExportBpy(UBlueprint* BP, UEdGraph* Graph)
+{
+	switch (ClassifyRootGraphKind_ExportBpy(BP, Graph))
+	{
+	case ERootGraphKind_ExportBpy::Macro:
+		return TEXT("macro_");
+	case ERootGraphKind_ExportBpy::Function:
+		return TEXT("fn_");
+	default:
+		return TEXT("evt_");
+	}
+}
+
+FString GetRootGraphType_ExportBpy(UBlueprint* BP, UEdGraph* Graph)
+{
+	switch (ClassifyRootGraphKind_ExportBpy(BP, Graph))
+	{
+	case ERootGraphKind_ExportBpy::Macro:
+		return TEXT("macro");
+	case ERootGraphKind_ExportBpy::Function:
+		return TEXT("function");
+	default:
+		return TEXT("event_graph");
+	}
+}
+
+void CollectRootGraphs_ExportBpy(UBlueprint* BP, TArray<UEdGraph*>& OutGraphs)
+{
+	OutGraphs.Reset();
+	if (!BP)
+	{
+		return;
+	}
+
+	TSet<UEdGraph*> SeenGraphs;
+	auto TryAddGraph = [&](UEdGraph* Graph)
+	{
+		if (!Graph || SeenGraphs.Contains(Graph))
+		{
+			return;
+		}
+		if (Graph->GetOuter() != BP)
+		{
+			return;
+		}
+		if (BP->DelegateSignatureGraphs.Contains(Graph))
+		{
+			return;
+		}
+
+		SeenGraphs.Add(Graph);
+		OutGraphs.Add(Graph);
+	};
+
+	auto CollectArray = [&](const TArray<TObjectPtr<UEdGraph>>& Graphs)
+	{
+		for (UEdGraph* Graph : Graphs)
+		{
+			TryAddGraph(Graph);
+		}
+	};
+
+	CollectArray(BP->MacroGraphs);
+	CollectArray(BP->FunctionGraphs);
+	CollectArray(BP->UbergraphPages);
+
+	TArray<UEdGraph*> AllGraphs;
+	BP->GetAllGraphs(AllGraphs);
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		TryAddGraph(Graph);
+	}
+
+	OutGraphs.Sort([BP](const UEdGraph& A, const UEdGraph& B)
+	{
+		const ERootGraphKind_ExportBpy KindA =
+			ClassifyRootGraphKind_ExportBpy(BP, const_cast<UEdGraph*>(&A));
+		const ERootGraphKind_ExportBpy KindB =
+			ClassifyRootGraphKind_ExportBpy(BP, const_cast<UEdGraph*>(&B));
+		if (KindA != KindB)
+		{
+			return static_cast<uint8>(KindA) < static_cast<uint8>(KindB);
+		}
+		return A.GetName() < B.GetName();
+	});
 }
 
 void CollectGraphModuleNames_ExportBpy(UBlueprint* BP, TArray<FString>& OutGraphModules)
@@ -1483,22 +1752,17 @@ void CollectGraphModuleNames_ExportBpy(UBlueprint* BP, TArray<FString>& OutGraph
 		return;
 	}
 
-	auto Collect = [&OutGraphModules](const TArray<UEdGraph*>& Graphs, const FString& Prefix)
+	TArray<UEdGraph*> RootGraphs;
+	CollectRootGraphs_ExportBpy(BP, RootGraphs);
+	for (UEdGraph* Graph : RootGraphs)
 	{
-		for (UEdGraph* Graph : Graphs)
+		if (!Graph)
 		{
-			if (!Graph)
-			{
-				continue;
-			}
-
-			OutGraphModules.Add(BuildModuleName_ExportBpy(Prefix, Graph->GetName()));
+			continue;
 		}
-	};
 
-	Collect(BP->FunctionGraphs, TEXT("fn_"));
-	Collect(BP->MacroGraphs, TEXT("macro_"));
-	Collect(BP->UbergraphPages, TEXT("evt_"));
+		OutGraphModules.Add(BuildModuleName_ExportBpy(GetRootGraphPrefix_ExportBpy(BP, Graph), Graph->GetName()));
+	}
 }
 
 FString BuildPinRefFallback_ExportBpy(const FString& NodeVar, const FString& RawPinName)
@@ -1835,6 +2099,35 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 			Info.TargetType = EnumObject->GetPathName();
 			Info.NodeProps.Add(TEXT("Enum"), EnumObject->GetPathName());
 		}
+
+		TArray<FString> VisibleEnumEntries;
+		if (const FArrayProperty* VisibleEnumEntriesProperty =
+				FindFProperty<FArrayProperty>(UAnimGraphNode_BlendListByEnum::StaticClass(), TEXT("VisibleEnumEntries")))
+		{
+			if (const FNameProperty* VisibleEnumEntryProperty = CastField<FNameProperty>(VisibleEnumEntriesProperty->Inner))
+			{
+				FScriptArrayHelper VisibleEnumEntriesHelper(
+					VisibleEnumEntriesProperty,
+					VisibleEnumEntriesProperty->ContainerPtrToValuePtr<void>(
+						const_cast<UAnimGraphNode_BlendListByEnum*>(BlendListByEnumNode)));
+				VisibleEnumEntries.Reserve(VisibleEnumEntriesHelper.Num());
+
+				for (int32 EntryIndex = 0; EntryIndex < VisibleEnumEntriesHelper.Num(); ++EntryIndex)
+				{
+					const FName VisibleEnumEntry =
+						VisibleEnumEntryProperty->GetPropertyValue(VisibleEnumEntriesHelper.GetRawPtr(EntryIndex));
+					if (!VisibleEnumEntry.IsNone())
+					{
+						VisibleEnumEntries.Add(VisibleEnumEntry.ToString());
+					}
+				}
+			}
+		}
+
+		if (VisibleEnumEntries.Num() > 0)
+		{
+			Info.NodeProps.Add(TEXT("VisibleEnumEntries"), FString::Join(VisibleEnumEntries, TEXT("|")));
+		}
 	}
 	else if (const UAnimGraphNode_SaveCachedPose* SaveCachedPoseNode = Cast<UAnimGraphNode_SaveCachedPose>(Node))
 	{
@@ -1885,6 +2178,33 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 			Info.TargetType = StructNode->StructType->GetPathName();
 			Info.NodeProps.Add(TEXT("StructType"), StructNode->StructType->GetPathName());
 		}
+	}
+
+	if (const UK2Node_BreakStruct* BreakStructNode = Cast<UK2Node_BreakStruct>(Node))
+	{
+		TArray<FString> VisiblePins;
+		for (const FOptionalPinFromProperty& Record : BreakStructNode->ShowPinForProperties)
+		{
+			if (Record.bShowPin)
+			{
+				VisiblePins.Add(Record.PropertyName.ToString());
+			}
+		}
+
+		Info.NodeProps.Add(TEXT("VisiblePins"), FString::Join(VisiblePins, TEXT("|")));
+	}
+	else if (const UK2Node_MakeStruct* MakeStructNode = Cast<UK2Node_MakeStruct>(Node))
+	{
+		TArray<FString> VisiblePins;
+		for (const FOptionalPinFromProperty& Record : MakeStructNode->ShowPinForProperties)
+		{
+			if (Record.bShowPin)
+			{
+				VisiblePins.Add(Record.PropertyName.ToString());
+			}
+		}
+
+		Info.NodeProps.Add(TEXT("VisiblePins"), FString::Join(VisiblePins, TEXT("|")));
 	}
 
 	if (const UK2Node_Variable* VariableNode = Cast<UK2Node_Variable>(Node))
@@ -2070,7 +2390,7 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 
 	if (Info.NodeType.StartsWith(TEXT("AnimGraphNode_")))
 	{
-		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
+		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("ShowPinForProperties"));
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("CustomPinProperties"));
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("InitialUpdateFunction"));
@@ -2234,6 +2554,45 @@ bool UBPDirectExporter::ExportBlueprintToPy(
 	{
 		TArray<FString> DataLines;
 		TArray<FString> ExecLines;
+		TSet<FString> SeenConnections;
+
+		auto TryAppendConnection = [&](UK2Node* SrcNode, const FString& SrcVar, UEdGraphPin* SrcPin, UEdGraphPin* RawDst)
+		{
+			TArray<UEdGraphPin*> ResolvedDstPins;
+			ResolveRerouteChainAll(RawDst, ResolvedDstPins);
+			for (UEdGraphPin* DstPin : ResolvedDstPins)
+			{
+				UK2Node* DstNode = Cast<UK2Node>(DstPin->GetOwningNode());
+				if (!DstNode)
+				{
+					continue;
+				}
+
+				const FString* DstVar = NodeVarMap.Find(DstNode);
+				if (!DstVar)
+				{
+					continue;
+				}
+
+				const FString SrcRef = TranslateOutputPinRef_ExportBpy(SrcNode, SrcVar, SrcPin);
+				const FString DstRef = TranslateInputPinRef_ExportBpy(DstNode, *DstVar, DstPin);
+				const FString ConnLine = SrcRef + TEXT(" >> ") + DstRef;
+				if (SeenConnections.Contains(ConnLine))
+				{
+					continue;
+				}
+
+				SeenConnections.Add(ConnLine);
+				if (SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+				{
+					ExecLines.Add(ConnLine);
+				}
+				else
+				{
+					DataLines.Add(ConnLine);
+				}
+			}
+		};
 
 		for (int32 Index = 0; Index < SourceNodes.Num(); ++Index)
 		{
@@ -2248,35 +2607,14 @@ bool UBPDirectExporter::ExportBlueprintToPy(
 
 				for (UEdGraphPin* RawDst : SrcPin->LinkedTo)
 				{
-					UEdGraphPin* DstPin = ResolveRerouteChain(RawDst);
-					if (!DstPin)
-					{
-						continue;
-					}
+					TryAppendConnection(SrcNode, SrcVar, SrcPin, RawDst);
+				}
 
-					UK2Node* DstNode = Cast<UK2Node>(DstPin->GetOwningNode());
-					if (!DstNode)
+				if (SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+				{
+					for (UEdGraphPin* SyntheticDst : GetSyntheticExecPassThroughTargets_ExportBpy(SrcNode, SrcPin))
 					{
-						continue;
-					}
-
-					const FString* DstVar = NodeVarMap.Find(DstNode);
-					if (!DstVar)
-					{
-						continue;
-					}
-
-					const FString SrcRef = TranslateOutputPinRef_ExportBpy(SrcNode, SrcVar, SrcPin);
-					const FString DstRef = TranslateInputPinRef_ExportBpy(DstNode, *DstVar, DstPin);
-					const FString ConnLine = SrcRef + TEXT(" >> ") + DstRef;
-
-					if (SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
-					{
-						ExecLines.Add(ConnLine);
-					}
-					else
-					{
-						DataLines.Add(ConnLine);
+						TryAppendConnection(SrcNode, SrcVar, SrcPin, SyntheticDst);
 					}
 				}
 			}
@@ -2304,38 +2642,22 @@ bool UBPDirectExporter::ExportBlueprintToPy(
 	};
 
 	TArray<FString> GraphModules;
-
-	auto WriteGraphs = [&](const TArray<UEdGraph*>& Graphs, const FString& Prefix) -> bool
+	TArray<UEdGraph*> RootGraphs;
+	CollectRootGraphs_ExportBpy(BP, RootGraphs);
+	for (UEdGraph* Graph : RootGraphs)
 	{
-		for (UEdGraph* Graph : Graphs)
+		if (!Graph)
 		{
-			if (!Graph)
-			{
-				continue;
-			}
-
-			FString ModuleName;
-			if (!GenerateGraphFile(BP, Graph, Prefix, BPOutDir, ModuleName, OutError))
-			{
-				return false;
-			}
-
-			GraphModules.Add(ModuleName);
+			continue;
 		}
-		return true;
-	};
 
-	if (!WriteGraphs(BP->FunctionGraphs, TEXT("fn_")))
-	{
-		return false;
-	}
-	if (!WriteGraphs(BP->MacroGraphs, TEXT("macro_")))
-	{
-		return false;
-	}
-	if (!WriteGraphs(BP->UbergraphPages, TEXT("evt_")))
-	{
-		return false;
+		FString ModuleName;
+		if (!GenerateGraphFile(BP, Graph, GetRootGraphPrefix_ExportBpy(BP, Graph), BPOutDir, ModuleName, OutError))
+		{
+			return false;
+		}
+
+		GraphModules.Add(ModuleName);
 	}
 
 	if (!GenerateMainFile(BP, BPOutDir, GraphModules, OutError))
@@ -2569,12 +2891,20 @@ FString UBPDirectExporter::GenerateVariablesSection(UBlueprint* BP)
 		else if (Var.VarType.IsSet()) ContainerStr = TEXT("set");
 		else if (Var.VarType.IsMap()) ContainerStr = TEXT("map");
 
-		Out += FString::Printf(
-			TEXT("bp.var(%s, %s, container=%s, default=%s)\n"),
+		FString VariableLine = FString::Printf(
+			TEXT("bp.var(%s, %s, container=%s, default=%s"),
 			*MakePythonStringLiteral_ExportBpy(Var.VarName.ToString()),
 			*MakePythonStringLiteral_ExportBpy(TypeStr),
 			*MakePythonStringLiteral_ExportBpy(ContainerStr),
 			*MakePythonStringLiteral_ExportBpy(DefaultValue));
+		if (Var.VarGuid.IsValid())
+		{
+			VariableLine += FString::Printf(
+				TEXT(", guid=%s"),
+				*MakePythonStringLiteral_ExportBpy(Var.VarGuid.ToString(EGuidFormats::Digits)));
+		}
+		VariableLine += TEXT(")\n");
+		Out += VariableLine;
 	}
 	Out += TEXT("\n");
 	return Out;
@@ -2709,7 +3039,17 @@ FString UBPDirectExporter::GenerateClassDefaultsSection(UBlueprint* BP)
 			bHadAny = true;
 		}
 
-		if (USkeletalMesh* PreviewMesh = AnimBP->GetPreviewMesh())
+		USkeletalMesh* PreviewMesh = nullptr;
+		if (UAnimBlueprint* MutableAnimBP = const_cast<UAnimBlueprint*>(AnimBP))
+		{
+			PreviewMesh = MutableAnimBP->GetPreviewMesh(false);
+		}
+		if (!PreviewMesh && AnimBP->TargetSkeleton)
+		{
+			PreviewMesh = AnimBP->TargetSkeleton->GetPreviewMesh(true);
+		}
+
+		if (PreviewMesh)
 		{
 			Out += FString::Printf(
 				TEXT("bp.default(%s, %s)\n"),
@@ -2797,9 +3137,6 @@ FString UBPDirectExporter::GenerateInheritedComponentDefaultsSection(UBlueprint*
 			const FProperty* Prop = *It;
 			if (!Prop) continue;
 			if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_EditorOnly)) continue;
-			if (CastField<FArrayProperty>(Prop) || CastField<FSetProperty>(Prop) || CastField<FMapProperty>(Prop))
-				continue;
-
 			const void* ValuePtr   = Prop->ContainerPtrToValuePtr<void>(BPComp);
 
 			// Only diff against parent if the parent component's class actually owns this property
@@ -2911,14 +3248,6 @@ static FString BuildComponentPropertiesPyDict_ExportBpy(UActorComponent* Templat
 		const FString PropName = Prop->GetName();
 		if (PropName.Equals(TEXT("AttachParent"), ESearchCase::IgnoreCase) ||
 			PropName.Equals(TEXT("AttachSocketName"), ESearchCase::IgnoreCase))
-		{
-			continue;
-		}
-
-		// Skip arrays/sets/maps — they're complex, importer doesn't handle them
-		if (CastField<FArrayProperty>(Prop)
-			|| CastField<FSetProperty>(Prop)
-			|| CastField<FMapProperty>(Prop))
 		{
 			continue;
 		}
@@ -3162,8 +3491,9 @@ bool UBPDirectExporter::GenerateGraphFile(
 
 	// ── Determine graph context header ─────────────────────────────────────────
 	UBlueprint* OwnerBP = Cast<UBlueprint>(Graph->GetOuter());
-	bool bIsFunction = OwnerBP && OwnerBP->FunctionGraphs.Contains(Graph);
-	bool bIsMacro    = OwnerBP && OwnerBP->MacroGraphs.Contains(Graph);
+	const FString RootGraphType = GetRootGraphType_ExportBpy(OwnerBP, Graph);
+	const bool bIsFunction = RootGraphType == TEXT("function");
+	const bool bIsMacro = RootGraphType == TEXT("macro");
 
 	FString GraphName = Graph->GetName();
 	OutModuleName = BuildModuleName_ExportBpy(Prefix, GraphName);
@@ -3313,6 +3643,46 @@ bool UBPDirectExporter::GenerateGraphFile(
 	{
 		TArray<FString> DataLines;
 		TArray<FString> ExecLines;
+		TSet<FString> SeenConnections;
+
+		auto TryAppendConnection = [&](UK2Node* SrcNode, const FString& SrcVar, UEdGraphPin* SrcPin, UEdGraphPin* RawDst)
+		{
+			TArray<UEdGraphPin*> ResolvedDstPins;
+			ResolveRerouteChainAll(RawDst, ResolvedDstPins);
+			for (UEdGraphPin* DstPin : ResolvedDstPins)
+			{
+				UK2Node* DstNode = Cast<UK2Node>(DstPin->GetOwningNode());
+				if (!DstNode)
+				{
+					continue;
+				}
+
+				const FString* DstVar = NodeVarMap.Find(DstNode);
+				if (!DstVar)
+				{
+					continue;
+				}
+
+				const FString SrcRef = TranslateOutputPinRef_ExportBpy(SrcNode, SrcVar, SrcPin);
+				const FString DstRef = TranslateInputPinRef_ExportBpy(DstNode, *DstVar, DstPin);
+				const FString ConnLine = SrcRef + TEXT(" >> ") + DstRef;
+				if (SeenConnections.Contains(ConnLine))
+				{
+					continue;
+				}
+
+				SeenConnections.Add(ConnLine);
+				if (SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+				{
+					ExecLines.Add(ConnLine);
+				}
+				else
+				{
+					DataLines.Add(ConnLine);
+				}
+			}
+		};
+
 		for (int32 Index = 0; Index < AllNodes.Num(); ++Index)
 		{
 			UK2Node* SrcNode = AllNodes[Index];
@@ -3326,34 +3696,14 @@ bool UBPDirectExporter::GenerateGraphFile(
 
 				for (UEdGraphPin* RawDst : SrcPin->LinkedTo)
 				{
-					UEdGraphPin* DstPin = ResolveRerouteChain(RawDst);
-					if (!DstPin)
-					{
-						continue;
-					}
+					TryAppendConnection(SrcNode, SrcVar, SrcPin, RawDst);
+				}
 
-					UK2Node* DstNode = Cast<UK2Node>(DstPin->GetOwningNode());
-					if (!DstNode)
+				if (SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+				{
+					for (UEdGraphPin* SyntheticDst : GetSyntheticExecPassThroughTargets_ExportBpy(SrcNode, SrcPin))
 					{
-						continue;
-					}
-
-					const FString* DstVar = NodeVarMap.Find(DstNode);
-					if (!DstVar)
-					{
-						continue;
-					}
-
-					const FString SrcRef = TranslateOutputPinRef_ExportBpy(SrcNode, SrcVar, SrcPin);
-					const FString DstRef = TranslateInputPinRef_ExportBpy(DstNode, *DstVar, DstPin);
-					const FString ConnLine = SrcRef + TEXT(" >> ") + DstRef;
-					if (SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
-					{
-						ExecLines.Add(ConnLine);
-					}
-					else
-					{
-						DataLines.Add(ConnLine);
+						TryAppendConnection(SrcNode, SrcVar, SrcPin, SyntheticDst);
 					}
 				}
 			}
@@ -3393,6 +3743,10 @@ bool UBPDirectExporter::GenerateGraphFile(
 			for (const FString& DefaultLine : NodeToDefaultValueLines(Info))
 			{
 				Lines += TEXT("        ") + DefaultLine + TEXT("\n");
+			}
+			for (const FString& ExtraPropLine : InlineExtraPropLines_ExportBpy(Info))
+			{
+				Lines += TEXT("        ") + ExtraPropLine + TEXT("\n");
 			}
 		}
 		Lines += TEXT("\n");
@@ -3797,19 +4151,56 @@ TArray<UK2Node*> UBPDirectExporter::TopologicalSort(const TArray<UK2Node*>& Node
 
 UEdGraphPin* UBPDirectExporter::ResolveRerouteChain(UEdGraphPin* Pin)
 {
-	if (!Pin) return nullptr;
-	const int32 MaxDepth = 64;
-	int32 Depth = 0;
-	while (Pin && Depth++ < MaxDepth)
+	TArray<UEdGraphPin*> ResolvedPins;
+	ResolveRerouteChainAll(Pin, ResolvedPins);
+	return ResolvedPins.IsEmpty() ? nullptr : ResolvedPins[0];
+}
+
+void UBPDirectExporter::ResolveRerouteChainAll(UEdGraphPin* Pin, TArray<UEdGraphPin*>& OutPins)
+{
+	OutPins.Reset();
+	if (!Pin)
 	{
-		UK2Node_Knot* Knot = Cast<UK2Node_Knot>(Pin->GetOwningNode());
-		if (!Knot) return Pin;
-		// Follow through the knot
-		UEdGraphPin* OutPin = Knot->GetOutputPin();
-		if (!OutPin || OutPin->LinkedTo.IsEmpty()) return nullptr;
-		Pin = OutPin->LinkedTo[0];
+		return;
 	}
-	return Pin;
+
+	TArray<UEdGraphPin*> Stack;
+	Stack.Add(Pin);
+
+	TSet<UEdGraphPin*> Visited;
+	const int32 MaxDepth = 256;
+	int32 Depth = 0;
+
+	while (!Stack.IsEmpty() && Depth++ < MaxDepth)
+	{
+		UEdGraphPin* Current = Stack.Pop(false);
+		if (!Current || Visited.Contains(Current))
+		{
+			continue;
+		}
+
+		Visited.Add(Current);
+		UK2Node_Knot* Knot = Cast<UK2Node_Knot>(Current->GetOwningNode());
+		if (!Knot)
+		{
+			OutPins.AddUnique(Current);
+			continue;
+		}
+
+		UEdGraphPin* OutPin = Knot->GetOutputPin();
+		if (!OutPin || OutPin->LinkedTo.IsEmpty())
+		{
+			continue;
+		}
+
+		for (UEdGraphPin* LinkedPin : OutPin->LinkedTo)
+		{
+			if (LinkedPin && !Visited.Contains(LinkedPin))
+			{
+				Stack.Add(LinkedPin);
+			}
+		}
+	}
 }
 
 // ─── ReadBlueprintToJson ──────────────────────────────────────────────────────
@@ -3975,8 +4366,6 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeBlueprintToJson(UBlueprint* 
 					{
 						continue;
 					}
-					if (CastField<FArrayProperty>(Prop) || CastField<FSetProperty>(Prop) || CastField<FMapProperty>(Prop)) continue;
-
 					const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Template);
 					const void* DefaultPtr = CDO ? Prop->ContainerPtrToValuePtr<void>(CDO) : nullptr;
 					if (DefaultPtr && Prop->Identical(ValuePtr, DefaultPtr)) continue;
@@ -4012,17 +4401,15 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeBlueprintToJson(UBlueprint* 
 	// Graphs
 	TArray<TSharedPtr<FJsonValue>> Graphs;
 
-	// Function graphs
-	for (UEdGraph* G : BP->FunctionGraphs)
-		if (G) Graphs.Add(MakeShared<FJsonValueObject>(SerializeGraph(G)));
-
-	// Macro graphs
-	for (UEdGraph* G : BP->MacroGraphs)
-		if (G) Graphs.Add(MakeShared<FJsonValueObject>(SerializeGraph(G)));
-
-	// Event graphs
-	for (UEdGraph* G : BP->UbergraphPages)
-		if (G) Graphs.Add(MakeShared<FJsonValueObject>(SerializeGraph(G)));
+	TArray<UEdGraph*> RootGraphs;
+	CollectRootGraphs_ExportBpy(BP, RootGraphs);
+	for (UEdGraph* G : RootGraphs)
+	{
+		if (G)
+		{
+			Graphs.Add(MakeShared<FJsonValueObject>(SerializeGraph(G)));
+		}
+	}
 
 	Root->SetArrayField(TEXT("graphs"), Graphs);
 
@@ -4069,10 +4456,7 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeGraph(UEdGraph* Graph)
 	else if (Graph->GetOuter() && Graph->GetOuter()->IsA<UBlueprint>())
 	{
 		UBlueprint* BP = Cast<UBlueprint>(Graph->GetOuter());
-		if (BP && BP->FunctionGraphs.Contains(Graph))
-			GType = TEXT("function");
-		else if (BP && BP->MacroGraphs.Contains(Graph))
-			GType = TEXT("macro");
+		GType = GetRootGraphType_ExportBpy(BP, Graph);
 	}
 	GObj->SetStringField(TEXT("graph_type"), GType);
 
@@ -4433,6 +4817,7 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeGenericNode(UEdGraphNode* No
 TArray<TSharedPtr<FJsonValue>> UBPDirectExporter::SerializeConnections(UEdGraph* Graph)
 {
 	TArray<TSharedPtr<FJsonValue>> Result;
+	TSet<FString> SeenConnections;
 
 	// Build uid map (skip knots)
 	TMap<UEdGraphNode*, FString> NodeUidMap;
@@ -4453,17 +4838,65 @@ TArray<TSharedPtr<FJsonValue>> UBPDirectExporter::SerializeConnections(UEdGraph*
 			if (SrcPin->Direction != EGPD_Output) continue;
 			for (UEdGraphPin* RawDst : SrcPin->LinkedTo)
 			{
-				UEdGraphPin* DstPin = ResolveRerouteChain(RawDst);
-				if (!DstPin) continue;
-				FString* DstUid = NodeUidMap.Find(DstPin->GetOwningNode());
-				if (!DstUid) continue;
+				TArray<UEdGraphPin*> ResolvedDstPins;
+				ResolveRerouteChainAll(RawDst, ResolvedDstPins);
+				for (UEdGraphPin* DstPin : ResolvedDstPins)
+				{
+					FString* DstUid = NodeUidMap.Find(DstPin->GetOwningNode());
+					if (!DstUid) continue;
 
-				auto CObj = MakeShared<FJsonObject>();
-				CObj->SetStringField(TEXT("src_node"), *SrcUid);
-				CObj->SetStringField(TEXT("src_pin"),  SrcPin->PinName.ToString());
-				CObj->SetStringField(TEXT("dst_node"), *DstUid);
-				CObj->SetStringField(TEXT("dst_pin"),  DstPin->PinName.ToString());
-				Result.Add(MakeShared<FJsonValueObject>(CObj));
+					const FString SrcPinName = SrcPin->PinName.ToString();
+					const FString DstPinName = DstPin->PinName.ToString();
+					const FString DedupKey = *SrcUid + TEXT("|") + SrcPinName + TEXT("|") + *DstUid + TEXT("|") + DstPinName;
+					if (SeenConnections.Contains(DedupKey))
+					{
+						continue;
+					}
+					SeenConnections.Add(DedupKey);
+
+					auto CObj = MakeShared<FJsonObject>();
+					CObj->SetStringField(TEXT("src_node"), *SrcUid);
+					CObj->SetStringField(TEXT("src_pin"),  SrcPinName);
+					CObj->SetStringField(TEXT("dst_node"), *DstUid);
+					CObj->SetStringField(TEXT("dst_pin"),  DstPinName);
+					Result.Add(MakeShared<FJsonValueObject>(CObj));
+				}
+			}
+
+			if (SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+			{
+				const UK2Node* SrcNode = Cast<UK2Node>(N);
+				if (!SrcNode)
+				{
+					continue;
+				}
+
+				for (UEdGraphPin* SyntheticDst : GetSyntheticExecPassThroughTargets_ExportBpy(const_cast<UK2Node*>(SrcNode), SrcPin))
+				{
+					TArray<UEdGraphPin*> ResolvedDstPins;
+					ResolveRerouteChainAll(SyntheticDst, ResolvedDstPins);
+					for (UEdGraphPin* DstPin : ResolvedDstPins)
+					{
+						FString* DstUid = NodeUidMap.Find(DstPin->GetOwningNode());
+						if (!DstUid) continue;
+
+						const FString SrcPinName = SrcPin->PinName.ToString();
+						const FString DstPinName = DstPin->PinName.ToString();
+						const FString DedupKey = *SrcUid + TEXT("|") + SrcPinName + TEXT("|") + *DstUid + TEXT("|") + DstPinName;
+						if (SeenConnections.Contains(DedupKey))
+						{
+							continue;
+						}
+						SeenConnections.Add(DedupKey);
+
+						auto CObj = MakeShared<FJsonObject>();
+						CObj->SetStringField(TEXT("src_node"), *SrcUid);
+						CObj->SetStringField(TEXT("src_pin"),  SrcPinName);
+						CObj->SetStringField(TEXT("dst_node"), *DstUid);
+						CObj->SetStringField(TEXT("dst_pin"),  DstPinName);
+						Result.Add(MakeShared<FJsonValueObject>(CObj));
+					}
+				}
 			}
 		}
 	}

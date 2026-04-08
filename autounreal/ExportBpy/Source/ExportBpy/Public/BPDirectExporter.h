@@ -164,4 +164,5 @@ private:
 	static void AssignReadableNames(TArray<FNodeInfo>& Nodes);
 	static TArray<UK2Node*> TopologicalSort(const TArray<UK2Node*>& Nodes);
 	static UEdGraphPin* ResolveRerouteChain(UEdGraphPin* Pin);
+	static void ResolveRerouteChainAll(UEdGraphPin* Pin, TArray<UEdGraphPin*>& OutPins);
 };

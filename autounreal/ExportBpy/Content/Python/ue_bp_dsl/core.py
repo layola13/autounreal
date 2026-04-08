@@ -94,6 +94,7 @@ class _Variable:
     type_str:    str
     container:   str        = "single"
     default:     Any        = None
+    guid:        str        = ""
     category:    str        = ""
     replicated:  bool       = False
     rep_notify:  str        = ""
@@ -568,6 +569,7 @@ class Blueprint:
             type: Optional[str] = None,
             container: str = "single",
             default: Any = None,
+            guid: str = "",
             category: str = "",
             replicated: bool = False,
             rep_notify: str = "",
@@ -576,6 +578,7 @@ class Blueprint:
         resolved_type = type_str or type or ""
         self._variables.append(_Variable(
             name=name, type_str=resolved_type, container=container, default=default,
+            guid=guid,
             category=category, replicated=replicated,
             rep_notify=rep_notify,
             instance_editable=instance_editable,
@@ -674,6 +677,7 @@ class Blueprint:
                     "type":              v.type_str,
                     "container":         v.container,
                     "default":           str(v.default) if v.default is not None else "",
+                    "guid":              v.guid,
                     "category":          v.category,
                     "replicated":        v.replicated,
                     "rep_notify":        v.rep_notify,

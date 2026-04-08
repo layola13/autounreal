@@ -89,9 +89,15 @@ def _write_main_file(path: str, bp: Any, graph_files: List[str]) -> None:
         "# ── Variables ───────────────────────────────────────────",
     ]
     for var in getattr(bp, "_variables", []):
-        lines.append(
-            f"bp.var({var.name!r}, {var.type_str!r}, container={var.container!r}, default={str(var.default)!r})"
-        )
+        args = [
+            repr(var.name),
+            repr(var.type_str),
+            f"container={var.container!r}",
+            f"default={str(var.default)!r}",
+        ]
+        if getattr(var, "guid", ""):
+            args.append(f"guid={var.guid!r}")
+        lines.append(f"bp.var({', '.join(args)})")
     lines.append("")
     lines.append("# ── Components ──────────────────────────────────────────")
     for comp in getattr(bp, "_components", []):

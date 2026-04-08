@@ -4537,6 +4537,11 @@ FString BuildDefaultStandaloneAssetBpyExportPath_BP(UObject* Asset)
         TEXT("__bp__.bp.py"));
 }
 
+FString BuildDefaultStandaloneAssetMetaExportPath_BP(UObject* Asset)
+{
+    return FPaths::Combine(FPaths::GetPath(BuildDefaultStandaloneAssetBpyExportPath_BP(Asset)), TEXT("asset_meta.py"));
+}
+
 FString NormalizePythonPathForScriptLiteral_BP(const FString& InPath)
 {
     return InPath.Replace(TEXT("\\"), TEXT("/"));
@@ -4571,6 +4576,43 @@ FString ResolveExistingPythonScriptPath_BP(const FString& Candidate)
 FString BuildPythonExecutionCacheRoot_BP()
 {
     return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UnrealMCP"), TEXT("PythonExec"));
+}
+
+bool ExportStandaloneAssetMetaText_BP(UObject* Asset, FString& OutMetaText, FString& OutError)
+{
+    OutMetaText.Reset();
+    OutError.Reset();
+
+    if (!Asset)
+    {
+        OutError = TEXT("Standalone asset is null");
+        return false;
+    }
+
+    const FString CacheDir = FPaths::Combine(
+        BuildPythonExecutionCacheRoot_BP(),
+        TEXT("StandaloneAssetMeta"),
+        FGuid::NewGuid().ToString(EGuidFormats::Digits));
+    IFileManager::Get().MakeDirectory(*CacheDir, true);
+
+    FString ExportError;
+    if (!UBPDirectExporter::ExportStandaloneAssetToPy(Asset->GetPathName(), CacheDir, ExportError))
+    {
+        OutError = ExportError.IsEmpty()
+            ? FString::Printf(TEXT("Failed to export standalone asset meta: %s"), *Asset->GetPathName())
+            : ExportError;
+        return false;
+    }
+
+    const FString AssetName = FPackageName::ObjectPathToObjectName(Asset->GetPathName());
+    const FString LegacyMetaPath = FPaths::Combine(CacheDir, AssetName + TEXT("__asset__.meta.py"));
+    if (!FFileHelper::LoadFileToString(OutMetaText, *LegacyMetaPath))
+    {
+        OutError = FString::Printf(TEXT("Failed to read standalone asset meta file: %s"), *LegacyMetaPath);
+        return false;
+    }
+
+    return true;
 }
 
 FString ResolveIsolatedPythonExecutable_BP()
@@ -8028,22 +8070,47 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleGetBlueprintMeta(
 {
     FString BlueprintRef;
     UBlueprint* Blueprint = ResolveBlueprintFromParams_BP(Params, BlueprintRef);
-    if (!Blueprint)
+    if (Blueprint)
     {
-        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
-            BlueprintRef.IsEmpty() ? TEXT("Missing blueprint target (target/asset_path/blueprint_path/blueprint_name)") : FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintRef));
+        FBlueprintMetaExportOptions ExportOptions;
+        BuildMetaExportOptionsFromParams_BP(Params, ExportOptions);
+
+        const FString MetaText = BuildBlueprintMetaText_BP(Blueprint, ExportOptions);
+
+        TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+        ResultObj->SetBoolField(TEXT("success"), true);
+        ResultObj->SetBoolField(TEXT("isError"), false);
+        ResultObj->SetStringField(TEXT("asset_path"), Blueprint->GetPathName());
+        ResultObj->SetStringField(TEXT("blueprint_name"), Blueprint->GetName());
+        ResultObj->SetArrayField(TEXT("content"), BuildMetaContentArray_BP(MetaText));
+        return ResultObj;
     }
 
-    FBlueprintMetaExportOptions ExportOptions;
-    BuildMetaExportOptionsFromParams_BP(Params, ExportOptions);
+    FString AssetRef;
+    UObject* Asset = ResolveStandaloneAssetFromParams_BP(Params, AssetRef);
+    if (!Asset)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            AssetRef.IsEmpty()
+                ? TEXT("Missing asset target (target/asset_path/path)")
+                : FString::Printf(TEXT("Asset not found: %s"), *AssetRef));
+    }
 
-    const FString MetaText = BuildBlueprintMetaText_BP(Blueprint, ExportOptions);
+    FString MetaText;
+    FString MetaError;
+    if (!ExportStandaloneAssetMetaText_BP(Asset, MetaText, MetaError))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MetaError.IsEmpty()
+                ? FString::Printf(TEXT("Failed to export standalone asset meta: %s"), *Asset->GetPathName())
+                : MetaError);
+    }
 
     TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
     ResultObj->SetBoolField(TEXT("success"), true);
     ResultObj->SetBoolField(TEXT("isError"), false);
-    ResultObj->SetStringField(TEXT("asset_path"), Blueprint->GetPathName());
-    ResultObj->SetStringField(TEXT("blueprint_name"), Blueprint->GetName());
+    ResultObj->SetStringField(TEXT("asset_path"), Asset->GetPathName());
+    ResultObj->SetStringField(TEXT("asset_class"), Asset->GetClass()->GetPathName());
     ResultObj->SetArrayField(TEXT("content"), BuildMetaContentArray_BP(MetaText));
     return ResultObj;
 }
@@ -8052,15 +8119,90 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleExportBlueprintMe
 {
     FString BlueprintRef;
     UBlueprint* Blueprint = ResolveBlueprintFromParams_BP(Params, BlueprintRef);
-    if (!Blueprint)
+    if (Blueprint)
     {
-        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
-            BlueprintRef.IsEmpty() ? TEXT("Missing blueprint target (target/asset_path/blueprint_path/blueprint_name)") : FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintRef));
+        FBlueprintMetaExportOptions ExportOptions;
+        BuildMetaExportOptionsFromParams_BP(Params, ExportOptions);
+        const FString MetaText = BuildBlueprintMetaText_BP(Blueprint, ExportOptions);
+
+        FString OutputPath;
+        Params->TryGetStringField(TEXT("output_path"), OutputPath);
+        if (OutputPath.IsEmpty())
+        {
+            Params->TryGetStringField(TEXT("output_file"), OutputPath);
+        }
+        if (OutputPath.IsEmpty())
+        {
+            Params->TryGetStringField(TEXT("path"), OutputPath);
+        }
+
+        FString OutputDirectory;
+        if (OutputPath.IsEmpty())
+        {
+            Params->TryGetStringField(TEXT("output_directory"), OutputDirectory);
+            if (OutputDirectory.IsEmpty())
+            {
+                Params->TryGetStringField(TEXT("directory"), OutputDirectory);
+            }
+        }
+
+        if (!OutputDirectory.IsEmpty())
+        {
+            OutputPath = FPaths::Combine(OutputDirectory, Blueprint->GetName() + TEXT(".meta"));
+        }
+
+        if (OutputPath.IsEmpty())
+        {
+            OutputPath = BuildDefaultMetaExportPath_BP(Blueprint);
+        }
+        else
+        {
+            if (!OutputPath.EndsWith(TEXT(".meta"), ESearchCase::IgnoreCase) && FPaths::GetExtension(OutputPath).IsEmpty())
+            {
+                OutputPath = FPaths::Combine(OutputPath, Blueprint->GetName() + TEXT(".meta"));
+            }
+
+            if (FPaths::IsRelative(OutputPath))
+            {
+                OutputPath = FPaths::Combine(FPaths::ProjectDir(), OutputPath);
+            }
+        }
+
+        IFileManager::Get().MakeDirectory(*FPaths::GetPath(OutputPath), true);
+        if (!FFileHelper::SaveStringToFile(MetaText, *OutputPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to write meta file: %s"), *OutputPath));
+        }
+
+        TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+        ResultObj->SetBoolField(TEXT("success"), true);
+        ResultObj->SetBoolField(TEXT("isError"), false);
+        ResultObj->SetStringField(TEXT("asset_path"), Blueprint->GetPathName());
+        ResultObj->SetStringField(TEXT("blueprint_name"), Blueprint->GetName());
+        ResultObj->SetStringField(TEXT("output_path"), OutputPath);
+        ResultObj->SetArrayField(TEXT("content"), BuildMetaContentArray_BP(MetaText));
+        return ResultObj;
     }
 
-    FBlueprintMetaExportOptions ExportOptions;
-    BuildMetaExportOptionsFromParams_BP(Params, ExportOptions);
-    const FString MetaText = BuildBlueprintMetaText_BP(Blueprint, ExportOptions);
+    FString AssetRef;
+    UObject* Asset = ResolveStandaloneAssetFromParams_BP(Params, AssetRef);
+    if (!Asset)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            AssetRef.IsEmpty()
+                ? TEXT("Missing asset target (target/asset_path/path)")
+                : FString::Printf(TEXT("Asset not found: %s"), *AssetRef));
+    }
+
+    FString MetaText;
+    FString MetaError;
+    if (!ExportStandaloneAssetMetaText_BP(Asset, MetaText, MetaError))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MetaError.IsEmpty()
+                ? FString::Printf(TEXT("Failed to export standalone asset meta: %s"), *Asset->GetPathName())
+                : MetaError);
+    }
 
     FString OutputPath;
     Params->TryGetStringField(TEXT("output_path"), OutputPath);
@@ -8085,23 +8227,23 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleExportBlueprintMe
 
     if (!OutputDirectory.IsEmpty())
     {
-        OutputPath = FPaths::Combine(OutputDirectory, Blueprint->GetName() + TEXT(".meta"));
+        OutputPath = FPaths::Combine(OutputDirectory, TEXT("asset_meta.py"));
     }
 
     if (OutputPath.IsEmpty())
     {
-        OutputPath = BuildDefaultMetaExportPath_BP(Blueprint);
+        OutputPath = BuildDefaultStandaloneAssetMetaExportPath_BP(Asset);
     }
     else
     {
-        if (!OutputPath.EndsWith(TEXT(".meta"), ESearchCase::IgnoreCase) && FPaths::GetExtension(OutputPath).IsEmpty())
-        {
-            OutputPath = FPaths::Combine(OutputPath, Blueprint->GetName() + TEXT(".meta"));
-        }
-
         if (FPaths::IsRelative(OutputPath))
         {
             OutputPath = FPaths::Combine(FPaths::ProjectDir(), OutputPath);
+        }
+
+        if (FPaths::GetExtension(OutputPath).IsEmpty())
+        {
+            OutputPath = FPaths::Combine(OutputPath, TEXT("asset_meta.py"));
         }
     }
 
@@ -8114,8 +8256,8 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleExportBlueprintMe
     TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
     ResultObj->SetBoolField(TEXT("success"), true);
     ResultObj->SetBoolField(TEXT("isError"), false);
-    ResultObj->SetStringField(TEXT("asset_path"), Blueprint->GetPathName());
-    ResultObj->SetStringField(TEXT("blueprint_name"), Blueprint->GetName());
+    ResultObj->SetStringField(TEXT("asset_path"), Asset->GetPathName());
+    ResultObj->SetStringField(TEXT("asset_class"), Asset->GetClass()->GetPathName());
     ResultObj->SetStringField(TEXT("output_path"), OutputPath);
     ResultObj->SetArrayField(TEXT("content"), BuildMetaContentArray_BP(MetaText));
     return ResultObj;

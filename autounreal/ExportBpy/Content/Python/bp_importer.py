@@ -434,14 +434,26 @@ def _import_blueprint_object_with_details(
     bridge_asset_path = _normalize_bridge_blueprint_path(asset_path)
     repair_ok = ok
     repair_err = ""
+    post_repair_ok = True
+    post_repair_err = ""
     compiled_ok = not compile_blueprint
     compile_err = ""
 
     if ok:
-        repair_ok, repair_err = _repair_imported_blueprint_pin_defaults(bridge_asset_path, payload)
+        repair_ok, repair_err = _repair_imported_blueprint_pin_defaults(
+            bridge_asset_path,
+            payload,
+            stage_label="pre-compile",
+        )
         if repair_ok and compile_blueprint:
             compiled_ok, compile_err = _compile_blueprint_with_bridge(bridge_asset_path)
-        if repair_ok:
+        if repair_ok and compiled_ok and compile_blueprint:
+            post_repair_ok, post_repair_err = _repair_imported_blueprint_pin_defaults(
+                bridge_asset_path,
+                payload,
+                stage_label="post-compile",
+            )
+        if repair_ok and post_repair_ok:
             _save_asset_if_possible(bridge_asset_path)
 
     validation_summary = _validate_imported_blueprint(asset_path, payload) if ok else {}
@@ -451,8 +463,8 @@ def _import_blueprint_object_with_details(
         if retried_summary:
             validation_summary = retried_summary
     validation_ok = bool(validation_summary.get("ok", False)) if validation_summary else False
-    success = bool(ok and repair_ok and (compiled_ok if compile_blueprint else True))
-    error_parts = [part for part in (err, repair_err, compile_err) if part]
+    success = bool(ok and repair_ok and post_repair_ok and (compiled_ok if compile_blueprint else True))
+    error_parts = [part for part in (err, repair_err, compile_err, post_repair_err) if part]
     return {
         "success": success,
         "error": " | ".join(error_parts),
@@ -1390,54 +1402,260 @@ def _normalize_guid_text(value: Any) -> str:
     return text.replace("{", "").replace("}", "").replace("-", "").upper()
 
 
-def _find_live_graph(blueprint: Any, graph_name: str):
-    library = getattr(unreal, "BlueprintEditorLibrary", None)
-    if library is None or blueprint is None or not graph_name:
+def _looks_like_graph_object(candidate: Any) -> bool:
+    if candidate is None:
+        return False
+
+    class_name = ""
+    try:
+        node_class = candidate.get_class()
+    except Exception:
+        node_class = None
+    if node_class is not None:
+        try:
+            class_name = str(node_class.get_name() or "")
+        except Exception:
+            class_name = ""
+    if not class_name:
+        try:
+            class_name = str(type(candidate).__name__ or "")
+        except Exception:
+            class_name = ""
+
+    lowered_class = class_name.lower()
+    if "graph" in lowered_class:
+        return True
+
+    if hasattr(candidate, "get_nodes") or hasattr(candidate, "nodes"):
+        return True
+
+    if hasattr(candidate, "get_editor_property"):
+        for property_name in ("nodes", "Nodes", "schema", "Schema"):
+            try:
+                value = candidate.get_editor_property(property_name)
+            except Exception:
+                value = None
+            if value is not None:
+                return True
+
+    return False
+
+
+def _unwrap_graph_candidate(candidate: Any) -> Any:
+    if candidate is None:
         return None
 
-    lowered = graph_name.lower()
-    if lowered == "eventgraph" and hasattr(library, "find_event_graph"):
+    if isinstance(candidate, (list, tuple)):
+        for item in candidate:
+            unwrapped = _unwrap_graph_candidate(item)
+            if unwrapped is not None:
+                return unwrapped
+        return None
+
+    if isinstance(candidate, dict):
+        for key in ("graph", "result", "value", "return_value", "out_graph"):
+            if key in candidate:
+                unwrapped = _unwrap_graph_candidate(candidate.get(key))
+                if unwrapped is not None:
+                    return unwrapped
+        for value in candidate.values():
+            unwrapped = _unwrap_graph_candidate(value)
+            if unwrapped is not None:
+                return unwrapped
+        return None
+
+    if _looks_like_graph_object(candidate):
+        return candidate
+    return None
+
+
+def _safe_graph_name(graph: Any) -> str:
+    if graph is None:
+        return ""
+
+    for property_name in ("graph_name", "GraphName"):
+        try:
+            value = graph.get_editor_property(property_name)
+        except Exception:
+            value = None
+        if value:
+            return str(value)
+
+    if hasattr(graph, "get_name"):
+        try:
+            value = graph.get_name()
+        except Exception:
+            value = ""
+        if value:
+            return str(value)
+
+    return ""
+
+
+def _normalize_graph_name(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
+def _iter_blueprint_graphs(blueprint: Any) -> List[Any]:
+    if blueprint is None:
+        return []
+
+    candidates: List[Any] = []
+    seen_ids: Set[int] = set()
+
+    def _append_graph(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                _append_graph(item)
+            return
+
+        graph = _unwrap_graph_candidate(value)
+        if graph is None:
+            return
+
+        key = id(graph)
+        if key in seen_ids:
+            return
+        seen_ids.add(key)
+        candidates.append(graph)
+
+    library = getattr(unreal, "BlueprintEditorLibrary", None)
+    if library is not None:
+        for method_name in (
+            "get_all_graphs",
+            "get_uber_graph_pages",
+            "get_function_graphs",
+            "get_macro_graphs",
+        ):
+            if not hasattr(library, method_name):
+                continue
+            method = getattr(library, method_name, None)
+            if method is None:
+                continue
+            try:
+                _append_graph(method(blueprint))
+            except Exception:
+                pass
+
+    if hasattr(blueprint, "get_editor_property"):
+        for property_name in (
+            "ubergraph_pages",
+            "function_graphs",
+            "macro_graphs",
+            "delegate_signature_graphs",
+            "all_graphs",
+            "event_graph",
+        ):
+            try:
+                value = blueprint.get_editor_property(property_name)
+            except Exception:
+                value = None
+            _append_graph(value)
+
+    return candidates
+
+
+def _find_live_graph(blueprint: Any, graph_name: str):
+    library = getattr(unreal, "BlueprintEditorLibrary", None)
+    if blueprint is None or not graph_name:
+        return None
+
+    target_name = _normalize_graph_name(graph_name)
+
+    if library is not None and target_name == "eventgraph" and hasattr(library, "find_event_graph"):
         try:
             graph = library.find_event_graph(blueprint)
         except Exception:
             graph = None
-        if graph is not None:
-            return graph
+        unwrapped = _unwrap_graph_candidate(graph)
+        if unwrapped is not None:
+            return unwrapped
 
-    if hasattr(library, "find_graph"):
+    if library is not None and hasattr(library, "find_graph"):
         try:
-            return library.find_graph(blueprint, graph_name)
+            graph = library.find_graph(blueprint, graph_name)
         except Exception:
-            return None
+            graph = None
+        unwrapped = _unwrap_graph_candidate(graph)
+        if unwrapped is not None:
+            return unwrapped
+
+    if target_name == "eventgraph":
+        for graph in _iter_blueprint_graphs(blueprint):
+            name = _normalize_graph_name(_safe_graph_name(graph))
+            if name == target_name:
+                return graph
+
+    for graph in _iter_blueprint_graphs(blueprint):
+        name = _normalize_graph_name(_safe_graph_name(graph))
+        if name == target_name:
+            return graph
 
     return None
 
 
 def _get_live_graph_nodes(graph: Any) -> List[Any]:
-    if graph is None:
+    live_graph = _unwrap_graph_candidate(graph)
+    if live_graph is None:
         return []
+
+    library = getattr(unreal, "BlueprintEditorLibrary", None)
+    if library is not None and hasattr(library, "get_graph_nodes"):
+        try:
+            nodes = library.get_graph_nodes(live_graph)
+        except Exception:
+            nodes = None
+        if nodes is not None:
+            try:
+                node_list = list(nodes)
+            except Exception:
+                node_list = []
+            if node_list:
+                return node_list
+
+    if hasattr(live_graph, "get_nodes"):
+        try:
+            nodes = live_graph.get_nodes()
+        except Exception:
+            nodes = None
+        if nodes is not None:
+            try:
+                node_list = list(nodes)
+            except Exception:
+                node_list = []
+            if node_list:
+                return node_list
 
     for property_name in ("nodes", "Nodes"):
         try:
-            nodes = graph.get_editor_property(property_name)
+            nodes = live_graph.get_editor_property(property_name)
         except Exception:
             nodes = None
         if nodes is not None:
             try:
-                return list(nodes)
+                node_list = list(nodes)
             except Exception:
-                pass
+                node_list = []
+            if node_list:
+                return node_list
 
     for attribute_name in ("nodes", "Nodes"):
         try:
-            nodes = getattr(graph, attribute_name)
+            nodes = getattr(live_graph, attribute_name)
         except Exception:
             nodes = None
         if nodes is not None:
             try:
-                return list(nodes)
+                node_list = list(nodes)
             except Exception:
-                pass
+                node_list = []
+            if node_list:
+                return node_list
 
     return []
 
@@ -1520,11 +1738,51 @@ def _get_live_node_position(node: Any) -> Tuple[Optional[int], Optional[int]]:
     return pos_x, pos_y
 
 
-def _find_live_node_by_fallback(graph: Any, source_node: Dict[str, Any], defaults: Dict[str, Any]):
+def _find_live_node_by_fallback(
+    graph: Any,
+    source_node: Dict[str, Any],
+    defaults: Dict[str, Any],
+    pin_aliases: Optional[Dict[str, Any]] = None,
+):
     expected_class = str(source_node.get("node_class", "") or "")
     expected_x = _safe_int_position(source_node.get("pos_x"))
     expected_y = _safe_int_position(source_node.get("pos_y"))
-    expected_pins = {str(pin_name).strip() for pin_name in defaults.keys() if str(pin_name).strip()}
+    expected_pin_candidates: List[List[str]] = []
+    seen_pin_groups: Set[str] = set()
+    for pin_name in defaults.keys():
+        raw_name = str(pin_name).strip()
+        if not raw_name:
+            continue
+
+        candidates: List[str] = []
+        seen_candidates: Set[str] = set()
+
+        def _add_candidate(name: Any) -> None:
+            text = str(name or "").strip()
+            if not text:
+                return
+            key = text.lower()
+            if key in seen_candidates:
+                return
+            seen_candidates.add(key)
+            candidates.append(text)
+
+        _add_candidate(raw_name)
+        if isinstance(pin_aliases, dict):
+            _add_candidate(pin_aliases.get(raw_name))
+            for alias_key, alias_value in pin_aliases.items():
+                if str(alias_key or "").strip().lower() == raw_name.lower():
+                    _add_candidate(alias_value)
+
+        if not candidates:
+            continue
+
+        group_key = "|".join(name.lower() for name in candidates)
+        if group_key in seen_pin_groups:
+            continue
+        seen_pin_groups.add(group_key)
+        expected_pin_candidates.append(candidates)
+
     position_tolerance = 64
 
     if not expected_class:
@@ -1535,14 +1793,19 @@ def _find_live_node_by_fallback(graph: Any, source_node: Dict[str, Any], default
         if _get_live_node_class_name(live_node) != expected_class:
             continue
 
-        if expected_pins:
+        if expected_pin_candidates:
             missing_pin = False
-            for pin_name in expected_pins:
-                try:
-                    pin = live_node.find_pin(pin_name)
-                except Exception:
-                    pin = None
-                if pin is None:
+            for pin_candidates in expected_pin_candidates:
+                pin_found = False
+                for pin_name in pin_candidates:
+                    try:
+                        pin = live_node.find_pin(pin_name)
+                    except Exception:
+                        pin = None
+                    if pin is not None:
+                        pin_found = True
+                        break
+                if not pin_found:
                     missing_pin = True
                     break
             if missing_pin:
@@ -1621,21 +1884,144 @@ def _resolve_default_object_for_pin(value: Any):
 
 def _stringify_pin_default(value: Any) -> str:
     if isinstance(value, bool):
-        return "True" if value else "False"
+        return "true" if value else "false"
     return str(value)
 
 
-def _set_live_pin_default(node: Any, pin_name: str, value: Any) -> Tuple[bool, str]:
+def _iter_live_node_pins(node: Any) -> List[Any]:
+    if node is None:
+        return []
+
+    for property_name in ("pins", "Pins"):
+        try:
+            pins = node.get_editor_property(property_name)
+        except Exception:
+            pins = None
+        if pins is not None:
+            try:
+                return list(pins)
+            except Exception:
+                pass
+
+    for attribute_name in ("pins", "Pins"):
+        try:
+            pins = getattr(node, attribute_name)
+        except Exception:
+            pins = None
+        if pins is not None:
+            try:
+                return list(pins)
+            except Exception:
+                pass
+
+    return []
+
+
+def _get_live_pin_guid_text(pin: Any) -> str:
+    if pin is None:
+        return ""
+
+    for property_name in ("pin_id", "PinId"):
+        try:
+            value = pin.get_editor_property(property_name)
+        except Exception:
+            value = None
+        normalized = _normalize_guid_text(value)
+        if normalized:
+            return normalized
+
+    for attribute_name in ("pin_id", "PinId"):
+        try:
+            value = getattr(pin, attribute_name)
+        except Exception:
+            value = None
+        normalized = _normalize_guid_text(value)
+        if normalized:
+            return normalized
+
+    return ""
+
+
+def _resolve_live_pin(
+    node: Any,
+    pin_name: str,
+    pin_aliases: Optional[Dict[str, Any]] = None,
+    pin_ids: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Any], str]:
+    if node is None or not hasattr(node, "find_pin"):
+        return None, "Node does not support pin lookup"
+
+    requested = str(pin_name or "").strip()
+    if not requested:
+        return None, "Pin name is empty"
+
+    candidate_names: List[str] = []
+    seen_names: Set[str] = set()
+
+    def _add_candidate(name: Any) -> None:
+        text = str(name or "").strip()
+        if not text:
+            return
+        key = text.lower()
+        if key in seen_names:
+            return
+        seen_names.add(key)
+        candidate_names.append(text)
+
+    _add_candidate(requested)
+
+    if isinstance(pin_aliases, dict):
+        alias_value = pin_aliases.get(requested)
+        _add_candidate(alias_value)
+        for key, value in pin_aliases.items():
+            if str(key or "").strip().lower() == requested.lower():
+                _add_candidate(value)
+
+    for candidate in candidate_names:
+        try:
+            pin = node.find_pin(candidate)
+        except Exception:
+            pin = None
+        if pin is not None:
+            return pin, ""
+
+    if isinstance(pin_ids, dict):
+        requested_pin_id = pin_ids.get(requested)
+        if requested_pin_id is None:
+            for key, value in pin_ids.items():
+                if str(key or "").strip().lower() == requested.lower():
+                    requested_pin_id = value
+                    break
+
+        wanted_pin_guid = _normalize_guid_text(requested_pin_id)
+        if wanted_pin_guid:
+            for live_pin in _iter_live_node_pins(node):
+                if _get_live_pin_guid_text(live_pin) == wanted_pin_guid:
+                    return live_pin, ""
+
+    attempted = ", ".join(candidate_names) if candidate_names else requested
+    return None, f"Pin not found: {requested} (tried: {attempted})"
+
+
+def _set_live_pin_default(
+    node: Any,
+    pin_name: str,
+    value: Any,
+    pin_aliases: Optional[Dict[str, Any]] = None,
+    pin_ids: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str]:
     if node is None or not hasattr(node, "find_pin"):
         return False, f"Node does not support pin lookup: {pin_name}"
 
-    try:
-        pin = node.find_pin(pin_name)
-    except Exception as exc:
-        return False, str(exc)
-
+    pin, resolve_error = _resolve_live_pin(node, pin_name, pin_aliases=pin_aliases, pin_ids=pin_ids)
     if pin is None:
-        return False, f"Pin not found: {pin_name}"
+        return False, resolve_error or f"Pin not found: {pin_name}"
+
+    if hasattr(node, "modify"):
+        try:
+            node.modify()
+        except Exception:
+            pass
 
     try:
         schema = pin.get_schema() if hasattr(pin, "get_schema") else None
@@ -1645,18 +2031,40 @@ def _set_live_pin_default(node: Any, pin_name: str, value: Any) -> Tuple[bool, s
     default_object = _resolve_default_object_for_pin(value)
     try:
         if default_object is not None:
+            applied = False
             if schema is not None and hasattr(schema, "try_set_default_object"):
-                schema.try_set_default_object(pin, default_object, False)
-            else:
+                try:
+                    schema_result = schema.try_set_default_object(pin, default_object, False)
+                    applied = True if schema_result is None else bool(schema_result)
+                except Exception:
+                    applied = False
+            if not applied:
                 pin.default_object = default_object
                 pin.default_value = default_object.get_path_name()
             return True, ""
 
         default_value = _stringify_pin_default(value)
+        applied = False
         if schema is not None and hasattr(schema, "try_set_default_value"):
-            schema.try_set_default_value(pin, default_value, False)
-        else:
+            try:
+                schema_result = schema.try_set_default_value(pin, default_value, False)
+                applied = True if schema_result is None else bool(schema_result)
+            except Exception:
+                applied = False
+        if not applied:
             pin.default_value = default_value
+
+        # Prevent autogenerated defaults from re-overriding explicit imported values.
+        for property_name in ("autogenerated_default_value", "AutogeneratedDefaultValue"):
+            try:
+                pin.set_editor_property(property_name, "")
+                break
+            except Exception:
+                try:
+                    setattr(pin, property_name, "")
+                    break
+                except Exception:
+                    pass
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -1671,7 +2079,28 @@ def _log_repair_warning(message: str) -> None:
         pass
 
 
-def _repair_imported_blueprint_pin_defaults(asset_path: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
+def _is_force_blend_callsite_node(node_payload: Dict[str, Any], live_node: Any) -> bool:
+    try:
+        source_class = str(node_payload.get("node_class", "") or "")
+    except Exception:
+        source_class = ""
+    if source_class and source_class != "K2Node_CallFunction":
+        return False
+
+    for pin_name in ("ForceBlend", "StateMachineState"):
+        try:
+            if live_node.find_pin(pin_name) is None:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _repair_imported_blueprint_pin_defaults(
+    asset_path: str,
+    payload: Dict[str, Any],
+    stage_label: str = "repair",
+) -> Tuple[bool, str]:
     graphs = payload.get("graphs", [])
     if not isinstance(graphs, list):
         return True, ""
@@ -1682,6 +2111,13 @@ def _repair_imported_blueprint_pin_defaults(asset_path: str, payload: Dict[str, 
 
     failures: List[str] = []
     skipped_nodes = 0
+    visited_graphs = 0
+    nodes_with_defaults = 0
+    force_blend_attempts = 0
+    force_blend_applied = 0
+    force_blend_failures: List[str] = []
+    force_blend_skipped_nodes: List[str] = []
+    graph_debug_samples: List[str] = []
     for graph in graphs:
         if not isinstance(graph, dict):
             continue
@@ -1690,11 +2126,26 @@ def _repair_imported_blueprint_pin_defaults(asset_path: str, payload: Dict[str, 
         graph_nodes = graph.get("nodes", [])
         if not strand_name or not isinstance(graph_nodes, list):
             continue
+        visited_graphs += 1
 
         live_graph = _find_live_graph(blueprint, strand_name)
         if live_graph is None:
             failures.append(f"{strand_name}: graph not found after import")
             continue
+        if len(graph_debug_samples) < 5:
+            try:
+                graph_type_name = type(live_graph).__name__
+            except Exception:
+                graph_type_name = "UnknownType"
+            try:
+                graph_runtime_name = live_graph.get_name() if hasattr(live_graph, "get_name") else ""
+            except Exception:
+                graph_runtime_name = ""
+            live_graph_node_count = len(_get_live_graph_nodes(live_graph))
+            graph_debug_samples.append(
+                f"{strand_name}=>{graph_runtime_name or '<no-name>'} "
+                f"type={graph_type_name} nodes={live_graph_node_count}"
+            )
 
         for node in graph_nodes:
             if not isinstance(node, dict):
@@ -1704,29 +2155,81 @@ def _repair_imported_blueprint_pin_defaults(asset_path: str, payload: Dict[str, 
             defaults = node.get("defaults")
             if not node_guid or not isinstance(defaults, dict) or not defaults:
                 continue
+            nodes_with_defaults += 1
+
+            pin_aliases = node.get("pin_aliases")
+            if not isinstance(pin_aliases, dict):
+                pin_aliases = {}
+            pin_ids = node.get("pin_ids")
+            if not isinstance(pin_ids, dict):
+                pin_ids = {}
 
             live_node = _find_live_node_by_guid(live_graph, node_guid)
             if live_node is None:
-                live_node = _find_live_node_by_fallback(live_graph, node, defaults)
+                live_node = _find_live_node_by_fallback(
+                    live_graph,
+                    node,
+                    defaults,
+                    pin_aliases=pin_aliases,
+                )
                 if live_node is None:
                     skipped_nodes += 1
+                    if "ForceBlend" in defaults:
+                        force_blend_skipped_nodes.append(f"{strand_name}:{node_guid}")
                     continue
 
             for pin_name, value in defaults.items():
                 normalized_pin_name = str(pin_name).strip()
                 if not normalized_pin_name:
                     continue
-                ok, error = _set_live_pin_default(live_node, normalized_pin_name, value)
+
+                is_force_blend_target = (
+                    normalized_pin_name.lower() == "forceblend"
+                    and _is_force_blend_callsite_node(node, live_node)
+                )
+                if is_force_blend_target:
+                    force_blend_attempts += 1
+
+                ok, error = _set_live_pin_default(
+                    live_node,
+                    normalized_pin_name,
+                    value,
+                    pin_aliases=pin_aliases,
+                    pin_ids=pin_ids,
+                )
                 if not ok:
+                    if is_force_blend_target:
+                        force_blend_failures.append(
+                            f"{strand_name}:{getattr(live_node, 'get_name', lambda: 'UnknownNode')()}"
+                        )
                     _log_repair_warning(
                         f"Pin repair skipped in {strand_name}: "
                         f"{getattr(live_node, 'get_name', lambda: 'UnknownNode')()}.{normalized_pin_name}: {error}"
                     )
+                elif is_force_blend_target:
+                    force_blend_applied += 1
 
-    if skipped_nodes and os.getenv("EXPORTBPY_LOG_PIN_REPAIR_SKIPS", "").lower() in ("1", "true", "yes", "on"):
+    _log_repair_warning(
+        f"Pin repair [{stage_label}] summary: graphs={visited_graphs}, "
+        f"nodes_with_defaults={nodes_with_defaults}, skipped_nodes={skipped_nodes}, "
+        f"force_blend_attempts={force_blend_attempts}, force_blend_applied={force_blend_applied}"
+    )
+    if graph_debug_samples:
         _log_repair_warning(
-            f"Pin repair skipped on {skipped_nodes} node(s); enable only for importer debugging"
+            f"Pin repair [{stage_label}] graph samples: {'; '.join(graph_debug_samples)}"
         )
+    if force_blend_skipped_nodes:
+        sample = ", ".join(force_blend_skipped_nodes[:5])
+        _log_repair_warning(f"Pin repair [{stage_label}] ForceBlend skipped samples: {sample}")
+
+    if force_blend_attempts:
+        _log_repair_warning(
+            f"Pin repair [{stage_label}] ForceBlend attempts={force_blend_attempts}, "
+            f"applied={force_blend_applied}, failed={force_blend_attempts - force_blend_applied}"
+        )
+        if force_blend_failures:
+            sample = ", ".join(force_blend_failures[:3])
+            _log_repair_warning(f"Pin repair [{stage_label}] ForceBlend failed samples: {sample}")
 
     return (len(failures) == 0), " | ".join(failures)
 

@@ -82,6 +82,72 @@
 
 namespace
 {
+void GatherReachableBlueprintGraphsForLookup(
+    UEdGraph* Graph,
+    TSet<UEdGraph*>& VisitedGraphs,
+    TArray<UEdGraph*>& OutGraphs)
+{
+    if (!Graph || VisitedGraphs.Contains(Graph))
+    {
+        return;
+    }
+
+    VisitedGraphs.Add(Graph);
+    OutGraphs.Add(Graph);
+
+    for (UEdGraph* SubGraph : Graph->SubGraphs)
+    {
+        GatherReachableBlueprintGraphsForLookup(SubGraph, VisitedGraphs, OutGraphs);
+    }
+
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        if (!Node || !Node->GetClass())
+        {
+            continue;
+        }
+
+        for (TFieldIterator<FProperty> It(Node->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+        {
+            const FObjectPropertyBase* GraphProperty = CastField<FObjectPropertyBase>(*It);
+            if (!GraphProperty || !GraphProperty->PropertyClass ||
+                !GraphProperty->PropertyClass->IsChildOf(UEdGraph::StaticClass()))
+            {
+                continue;
+            }
+
+            UEdGraph* NestedGraph = Cast<UEdGraph>(GraphProperty->GetObjectPropertyValue_InContainer(Node));
+            if (NestedGraph)
+            {
+                GatherReachableBlueprintGraphsForLookup(NestedGraph, VisitedGraphs, OutGraphs);
+            }
+        }
+    }
+}
+
+TArray<UEdGraph*> GatherAllBlueprintGraphsForLookup(UBlueprint* Blueprint)
+{
+    TArray<UEdGraph*> RootGraphs;
+    if (!Blueprint)
+    {
+        return RootGraphs;
+    }
+
+    Blueprint->GetAllGraphs(RootGraphs);
+    if (RootGraphs.Num() == 0)
+    {
+        return RootGraphs;
+    }
+
+    TArray<UEdGraph*> AllGraphs;
+    TSet<UEdGraph*> VisitedGraphs;
+    for (UEdGraph* RootGraph : RootGraphs)
+    {
+        GatherReachableBlueprintGraphsForLookup(RootGraph, VisitedGraphs, AllGraphs);
+    }
+    return AllGraphs;
+}
+
 UEdGraph* FindBlueprintGraphByNameOrPath(UBlueprint* Blueprint, const FString& GraphIdentifier)
 {
     if (!Blueprint || GraphIdentifier.IsEmpty())
@@ -89,17 +155,13 @@ UEdGraph* FindBlueprintGraphByNameOrPath(UBlueprint* Blueprint, const FString& G
         return nullptr;
     }
 
-    TArray<UEdGraph*> AllGraphs;
-    Blueprint->GetAllGraphs(AllGraphs);
-
-    for (UEdGraph* Graph : AllGraphs)
+    TArray<UEdGraph*> AllGraphs = GatherAllBlueprintGraphsForLookup(Blueprint);
+    if (AllGraphs.Num() == 0)
     {
-        if (Graph && Graph->GetName().Equals(GraphIdentifier, ESearchCase::IgnoreCase))
-        {
-            return Graph;
-        }
+        Blueprint->GetAllGraphs(AllGraphs);
     }
 
+    // Prefer explicit path matches first to avoid ambiguity when duplicate graph names exist.
     for (UEdGraph* Graph : AllGraphs)
     {
         if (Graph && Graph->GetPathName().Equals(GraphIdentifier, ESearchCase::IgnoreCase))
@@ -108,11 +170,56 @@ UEdGraph* FindBlueprintGraphByNameOrPath(UBlueprint* Blueprint, const FString& G
         }
     }
 
+    const bool bIdentifierLooksLikePath =
+        GraphIdentifier.Contains(TEXT("/")) || GraphIdentifier.Contains(TEXT(":"));
+    if (bIdentifierLooksLikePath)
+    {
+        for (UEdGraph* Graph : AllGraphs)
+        {
+            if (Graph && Graph->GetPathName().EndsWith(GraphIdentifier, ESearchCase::IgnoreCase))
+            {
+                return Graph;
+            }
+        }
+    }
+
+    TArray<UEdGraph*> NameMatches;
+    NameMatches.Reserve(AllGraphs.Num());
     for (UEdGraph* Graph : AllGraphs)
     {
-        if (Graph && Graph->GetPathName().EndsWith(GraphIdentifier, ESearchCase::IgnoreCase))
+        if (Graph && Graph->GetName().Equals(GraphIdentifier, ESearchCase::IgnoreCase))
         {
-            return Graph;
+            NameMatches.Add(Graph);
+        }
+    }
+
+    if (NameMatches.Num() == 1)
+    {
+        return NameMatches[0];
+    }
+
+    if (NameMatches.Num() > 1)
+    {
+        // Duplicate names can happen with nested animation graphs. Pick the richest graph.
+        UEdGraph* BestGraph = nullptr;
+        int32 BestNodeCount = INDEX_NONE;
+        for (UEdGraph* Candidate : NameMatches)
+        {
+            if (!Candidate)
+            {
+                continue;
+            }
+
+            const int32 NodeCount = Candidate->Nodes.Num();
+            if (!BestGraph || NodeCount > BestNodeCount)
+            {
+                BestGraph = Candidate;
+                BestNodeCount = NodeCount;
+            }
+        }
+        if (BestGraph)
+        {
+            return BestGraph;
         }
     }
 
@@ -127,8 +234,11 @@ TArray<FString> GetAllBlueprintGraphNames(UBlueprint* Blueprint)
         return GraphNames;
     }
 
-    TArray<UEdGraph*> AllGraphs;
-    Blueprint->GetAllGraphs(AllGraphs);
+    TArray<UEdGraph*> AllGraphs = GatherAllBlueprintGraphsForLookup(Blueprint);
+    if (AllGraphs.Num() == 0)
+    {
+        Blueprint->GetAllGraphs(AllGraphs);
+    }
     GraphNames.Reserve(AllGraphs.Num());
 
     for (UEdGraph* Graph : AllGraphs)

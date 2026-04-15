@@ -411,6 +411,7 @@ def _import_blueprint_object_with_details(
         payload = bp_obj.to_dict()
         _augment_explicit_variable_type_metadata(payload)
         _sanitize_problematic_default_strings(payload)
+        preflight_stats = _collect_expected_import_stats(payload)
         json_str = json.dumps(payload, ensure_ascii=False, indent=2)
     except Exception as exc:
         return _error_details(f"序列化失败: {exc}")
@@ -425,6 +426,7 @@ def _import_blueprint_object_with_details(
             "import_mode": "bpy_directory",
             "compiled": bool(compile_blueprint),
             "validation_ok": True,
+            "preflight_summary": preflight_stats,
             "validation_summary": {"ok": True, "warnings": ["dry-run"]},
         }
 
@@ -432,12 +434,22 @@ def _import_blueprint_object_with_details(
     if not ok and err:
         err = _describe_missing_connection_nodes(payload, err)
     bridge_asset_path = _normalize_bridge_blueprint_path(asset_path)
+    expected_delegate_bindings = preflight_stats.get("expected_create_delegate_bindings", [])
+    has_expected_delegate_bindings = bool(
+        isinstance(expected_delegate_bindings, list) and expected_delegate_bindings
+    )
     repair_ok = ok
     repair_err = ""
     post_repair_ok = True
     post_repair_err = ""
     compiled_ok = not compile_blueprint
     compile_err = ""
+    delegate_restore_ok = True
+    delegate_restore_err = ""
+    delegate_recompile_ok = True
+    delegate_recompile_err = ""
+    delegate_final_restore_ok = True
+    delegate_final_restore_err = ""
 
     if ok:
         repair_ok, repair_err = _repair_imported_blueprint_pin_defaults(
@@ -453,18 +465,69 @@ def _import_blueprint_object_with_details(
                 payload,
                 stage_label="post-compile",
             )
-        if repair_ok and post_repair_ok:
+        if repair_ok and post_repair_ok and compile_blueprint and has_expected_delegate_bindings:
+            delegate_restore_ok, delegate_restore_err = _restore_create_delegate_bindings_with_bridge(
+                json_str,
+                bridge_asset_path,
+            )
+            if delegate_restore_ok:
+                delegate_recompile_ok, delegate_recompile_err = _compile_blueprint_with_bridge(
+                    bridge_asset_path
+                )
+            if delegate_restore_ok and delegate_recompile_ok:
+                delegate_final_restore_ok, delegate_final_restore_err = _restore_create_delegate_bindings_with_bridge(
+                    json_str,
+                    bridge_asset_path,
+                )
+        if (
+            repair_ok
+            and post_repair_ok
+            and delegate_restore_ok
+            and delegate_recompile_ok
+            and delegate_final_restore_ok
+        ):
             _save_asset_if_possible(bridge_asset_path)
 
-    validation_summary = _validate_imported_blueprint(asset_path, payload) if ok else {}
+    validation_summary = (
+        _validate_imported_blueprint(asset_path, payload, preflight_stats=preflight_stats)
+        if ok
+        else {}
+    )
     if ok and validation_summary.get("missing_components"):
         _save_asset_if_possible(bridge_asset_path)
-        retried_summary = _validate_imported_blueprint(asset_path, payload)
+        retried_summary = _validate_imported_blueprint(
+            asset_path,
+            payload,
+            preflight_stats=preflight_stats,
+        )
         if retried_summary:
             validation_summary = retried_summary
     validation_ok = bool(validation_summary.get("ok", False)) if validation_summary else False
-    success = bool(ok and repair_ok and post_repair_ok and (compiled_ok if compile_blueprint else True))
-    error_parts = [part for part in (err, repair_err, compile_err, post_repair_err) if part]
+    success = bool(
+        ok
+        and repair_ok
+        and post_repair_ok
+        and (compiled_ok if compile_blueprint else True)
+        and delegate_restore_ok
+        and delegate_recompile_ok
+        and delegate_final_restore_ok
+        and validation_ok
+    )
+    error_parts = [
+        part
+        for part in (
+            err,
+            repair_err,
+            compile_err,
+            post_repair_err,
+            delegate_restore_err,
+            delegate_recompile_err,
+            delegate_final_restore_err,
+        )
+        if part
+    ]
+    if ok and not validation_ok:
+        error_parts.append("strict import validation failed")
     return {
         "success": success,
         "error": " | ".join(error_parts),
@@ -472,6 +535,7 @@ def _import_blueprint_object_with_details(
         "import_mode": "bpy_directory",
         "compiled": bool(success and compile_blueprint),
         "validation_ok": validation_ok,
+        "preflight_summary": preflight_stats,
         "validation_summary": validation_summary,
     }
 
@@ -1210,9 +1274,308 @@ def _normalize_mobility_value(value: Any) -> str:
     return text.strip().lower()
 
 
-def _validate_imported_blueprint(asset_path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_function_name_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower() == "none":
+        return ""
+    return text
+
+
+def _collect_expected_import_stats(payload: Dict[str, Any]) -> Dict[str, Any]:
+    delegate_node_classes = (
+        "K2Node_CreateDelegate",
+        "K2Node_AssignDelegate",
+        "K2Node_AddDelegate",
+        "K2Node_CallDelegate",
+        "K2Node_RemoveDelegate",
+    )
+    summary: Dict[str, Any] = {
+        "expected_graph_count": 0,
+        "expected_function_count": 0,
+        "expected_total_node_count": 0,
+        "expected_graphs": [],
+        "expected_graph_node_counts": {},
+        "expected_function_names": [],
+        "expected_node_class_counts": {},
+        "expected_create_delegate_bindings": [],
+        "expected_delegate_node_counts": {name: 0 for name in delegate_node_classes},
+        "expected_delegate_nodes": [],
+        "expected_delegate_connections": [],
+        "warnings": [],
+    }
+
+    if not isinstance(payload, dict):
+        summary["warnings"].append("payload is not a dict")
+        return summary
+
+    graphs = payload.get("graphs", [])
+    if not isinstance(graphs, list):
+        summary["warnings"].append("payload.graphs is missing or not a list")
+        return summary
+
+    for graph_index, graph in enumerate(graphs):
+        if not isinstance(graph, dict):
+            continue
+
+        graph_name = str(graph.get("name", "") or "").strip() or f"<unnamed:{graph_index}>"
+        graph_type = str(graph.get("graph_type", "") or "").strip().lower()
+        raw_nodes = graph.get("nodes", [])
+        nodes = raw_nodes if isinstance(raw_nodes, list) else []
+        if not isinstance(raw_nodes, list):
+            summary["warnings"].append(f"{graph_name}: nodes field is not a list")
+
+        graph_entry = {
+            "name": graph_name,
+            "graph_type": graph_type,
+            "node_count": len(nodes),
+        }
+        summary["expected_graphs"].append(graph_entry)
+        summary["expected_graph_node_counts"][graph_name] = len(nodes)
+        summary["expected_graph_count"] += 1
+        summary["expected_total_node_count"] += len(nodes)
+
+        if graph_type == "function":
+            summary["expected_function_count"] += 1
+            summary["expected_function_names"].append(graph_name)
+
+        node_uid_to_info: Dict[str, Dict[str, Any]] = {}
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+
+            node_class = str(node.get("node_class", "") or "")
+            if node_class:
+                summary["expected_node_class_counts"][node_class] = (
+                    int(summary["expected_node_class_counts"].get(node_class, 0)) + 1
+                )
+
+            node_uid = str(node.get("uid", "") or "").strip()
+            node_guid = str(node.get("node_guid", "") or "").strip()
+            node_readable_name = str(node.get("readable_name", "") or "").strip()
+            node_member_name = _normalize_function_name_text(node.get("member_name"))
+            node_props = node.get("node_props", {})
+            if not isinstance(node_props, dict):
+                node_props = {}
+
+            selected_function = _normalize_function_name_text(node_props.get("SelectedFunctionName"))
+            delegate_reference = str(node_props.get("DelegateReference", "") or "").strip()
+            if not selected_function:
+                selected_function = node_member_name
+
+            if node_uid:
+                node_uid_to_info[node_uid] = {
+                    "uid": node_uid,
+                    "node_guid": node_guid,
+                    "node_class": node_class,
+                    "readable_name": node_readable_name,
+                    "member_name": node_member_name,
+                    "selected_function": selected_function,
+                    "delegate_reference": delegate_reference,
+                }
+
+            if node_class not in delegate_node_classes:
+                continue
+
+            summary["expected_delegate_node_counts"][node_class] = (
+                int(summary["expected_delegate_node_counts"].get(node_class, 0)) + 1
+            )
+            summary["expected_delegate_nodes"].append(
+                {
+                    "graph_name": graph_name,
+                    "uid": node_uid,
+                    "node_guid": node_guid,
+                    "node_class": node_class,
+                    "readable_name": node_readable_name,
+                    "member_name": node_member_name,
+                    "selected_function": selected_function,
+                    "delegate_reference": delegate_reference,
+                }
+            )
+
+            if node_class != "K2Node_CreateDelegate":
+                continue
+
+            delegate_info = {
+                "graph_name": graph_name,
+                "node_guid": node_guid,
+                "readable_name": node_readable_name,
+                "expected_function": selected_function,
+            }
+            summary["expected_create_delegate_bindings"].append(delegate_info)
+            if not selected_function:
+                summary["warnings"].append(
+                    f"{graph_name}:{delegate_info['readable_name'] or '<CreateDelegate>'} missing expected function name"
+                )
+
+        raw_connections = graph.get("connections", [])
+        connections = raw_connections if isinstance(raw_connections, list) else []
+        if not isinstance(raw_connections, list):
+            summary["warnings"].append(f"{graph_name}: connections field is not a list")
+        for connection in connections:
+            if not isinstance(connection, dict):
+                continue
+            src_uid = str(connection.get("src_node", "") or "").strip()
+            dst_uid = str(connection.get("dst_node", "") or "").strip()
+            src_pin = str(connection.get("src_pin", "") or "").strip()
+            dst_pin = str(connection.get("dst_pin", "") or "").strip()
+            if src_pin != "OutputDelegate" or dst_pin != "Delegate":
+                continue
+
+            src_info = node_uid_to_info.get(src_uid, {})
+            dst_info = node_uid_to_info.get(dst_uid, {})
+            summary["expected_delegate_connections"].append(
+                {
+                    "graph_name": graph_name,
+                    "src_uid": src_uid,
+                    "dst_uid": dst_uid,
+                    "src_node_guid": str(src_info.get("node_guid", "") or ""),
+                    "dst_node_guid": str(dst_info.get("node_guid", "") or ""),
+                    "src_node_class": str(src_info.get("node_class", "") or ""),
+                    "dst_node_class": str(dst_info.get("node_class", "") or ""),
+                    "src_readable_name": str(src_info.get("readable_name", "") or ""),
+                    "dst_readable_name": str(dst_info.get("readable_name", "") or ""),
+                }
+            )
+
+    summary["expected_function_names"] = sorted(
+        {
+            str(name or "").strip()
+            for name in summary["expected_function_names"]
+            if str(name or "").strip()
+        }
+    )
+    return summary
+
+
+def _read_blueprint_payload_via_exporter(asset_path: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    if not _HAS_UNREAL:
+        return None, "Unreal bridge unavailable"
+
+    exporter = getattr(unreal, "BPDirectExporter", None)
+    if exporter is None:
+        return None, "BPDirectExporter is unavailable"
+
+    export_method = None
+    for method_name in ("read_blueprint_to_json", "ReadBlueprintToJson"):
+        method = getattr(exporter, method_name, None)
+        if callable(method):
+            export_method = method
+            break
+    if export_method is None:
+        return None, "BPDirectExporter.ReadBlueprintToJson is unavailable"
+
+    candidates = [asset_path, _normalize_bridge_blueprint_path(asset_path)]
+    seen_candidates: Set[str] = set()
+    for candidate in candidates:
+        text_candidate = str(candidate or "").strip()
+        if not text_candidate or text_candidate in seen_candidates:
+            continue
+        seen_candidates.add(text_candidate)
+        try:
+            json_text = export_method(text_candidate)
+        except Exception:
+            json_text = ""
+        json_text = str(json_text or "").strip()
+        if not json_text:
+            continue
+        try:
+            payload = json.loads(json_text)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            return payload, ""
+
+    return None, f"failed to export imported blueprint to json: {asset_path}"
+
+
+def _get_live_function_graph_names(blueprint: Any) -> List[str]:
+    if blueprint is None:
+        return []
+
+    names: List[str] = []
+    seen: Set[str] = set()
+
+    def _append_name(value: Any) -> None:
+        name_text = str(value or "").strip()
+        if not name_text:
+            return
+        key = name_text.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        names.append(name_text)
+
+    found, function_graphs = _read_editor_property_flex(blueprint, "function_graphs")
+    if found and function_graphs is not None:
+        try:
+            iterable = list(function_graphs)
+        except Exception:
+            iterable = []
+        for graph in iterable:
+            _append_name(_safe_graph_name(graph))
+
+    library = getattr(unreal, "BlueprintEditorLibrary", None) if _HAS_UNREAL else None
+    if library is not None and hasattr(library, "get_function_graphs"):
+        try:
+            iterable = list(library.get_function_graphs(blueprint) or [])
+        except Exception:
+            iterable = []
+        for graph in iterable:
+            _append_name(_safe_graph_name(graph))
+
+    return names
+
+
+def _read_live_create_delegate_function_name(node: Any) -> str:
+    if node is None:
+        return ""
+
+    for method_name in ("get_function_name", "GetFunctionName"):
+        method = getattr(node, method_name, None)
+        if callable(method):
+            try:
+                value = method()
+            except Exception:
+                value = None
+            text = _normalize_function_name_text(value)
+            if text:
+                return text
+
+    for property_name in (
+        "selected_function_name",
+        "SelectedFunctionName",
+        "function_name",
+        "FunctionName",
+    ):
+        found, value = _read_editor_property_flex(node, property_name)
+        if not found:
+            continue
+        text = _normalize_function_name_text(value)
+        if text:
+            return text
+
+    return ""
+
+
+def _validate_imported_blueprint(
+    asset_path: str,
+    payload: Dict[str, Any],
+    preflight_stats: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "ok": True,
+        "preflight_stats": preflight_stats if isinstance(preflight_stats, dict) else {},
+        "missing_graphs": [],
+        "graph_node_count_mismatches": [],
+        "function_count_mismatch": {},
+        "missing_functions": [],
+        "unexpected_functions": [],
+        "create_delegate_mismatches": [],
+        "delegate_node_count_mismatches": [],
+        "delegate_decl_mismatches": [],
+        "delegate_connection_mismatches": [],
         "missing_components": [],
         "component_parent_mismatches": [],
         "component_socket_mismatches": [],
@@ -1224,6 +1587,9 @@ def _validate_imported_blueprint(asset_path: str, payload: Dict[str, Any]) -> Di
     if not _HAS_UNREAL or not isinstance(payload, dict):
         return summary
 
+    if not isinstance(summary["preflight_stats"], dict) or not summary["preflight_stats"]:
+        summary["preflight_stats"] = _collect_expected_import_stats(payload)
+
     blueprint = _load_blueprint_asset_for_repair(asset_path)
     generated_class = _get_generated_class(blueprint)
     cdo = _get_default_object(generated_class)
@@ -1234,6 +1600,271 @@ def _validate_imported_blueprint(asset_path: str, payload: Dict[str, Any]) -> Di
         summary["warnings"].append(f"Unable to load imported blueprint for validation: {asset_path}")
         summary["ok"] = False
         return summary
+
+    expected_stats = summary["preflight_stats"]
+    live_payload, live_payload_error = _read_blueprint_payload_via_exporter(asset_path)
+    live_stats: Dict[str, Any] = {}
+    if live_payload is None:
+        summary["warnings"].append(live_payload_error)
+        summary["missing_graphs"].append("<unable to read imported blueprint json>")
+    else:
+        live_stats = _collect_expected_import_stats(live_payload)
+    summary["live_stats"] = live_stats
+
+    expected_graph_node_counts = expected_stats.get("expected_graph_node_counts", {})
+    live_graph_node_counts = live_stats.get("expected_graph_node_counts", {})
+    if not isinstance(expected_graph_node_counts, dict):
+        expected_graph_node_counts = {}
+    if not isinstance(live_graph_node_counts, dict):
+        live_graph_node_counts = {}
+
+    for graph_name, expected_node_count_raw in expected_graph_node_counts.items():
+        graph_name_text = str(graph_name or "").strip()
+        if not graph_name_text:
+            continue
+
+        if graph_name_text not in live_graph_node_counts:
+            summary["missing_graphs"].append(graph_name_text)
+            continue
+
+        expected_node_count = int(expected_node_count_raw or 0)
+        actual_node_count = int(live_graph_node_counts.get(graph_name_text, 0) or 0)
+        if actual_node_count != expected_node_count:
+            summary["graph_node_count_mismatches"].append(
+                {
+                    "graph": graph_name_text,
+                    "expected_nodes": expected_node_count,
+                    "actual_nodes": actual_node_count,
+                }
+            )
+
+    expected_function_names = expected_stats.get("expected_function_names", [])
+    live_function_names = live_stats.get("expected_function_names", [])
+    if not isinstance(expected_function_names, list):
+        expected_function_names = []
+    if not isinstance(live_function_names, list):
+        live_function_names = []
+
+    expected_function_name_set = {
+        str(name or "").strip()
+        for name in expected_function_names
+        if str(name or "").strip()
+    }
+    live_function_name_set = {
+        str(name or "").strip()
+        for name in live_function_names
+        if str(name or "").strip()
+    }
+
+    expected_function_count = int(
+        expected_stats.get("expected_function_count", len(expected_function_name_set)) or 0
+    )
+    actual_function_count = int(
+        live_stats.get("expected_function_count", len(live_function_name_set)) or 0
+    )
+    if actual_function_count != expected_function_count:
+        summary["function_count_mismatch"] = {
+            "expected": expected_function_count,
+            "actual": actual_function_count,
+        }
+
+    summary["missing_functions"] = sorted(
+        expected_function_name_set.difference(live_function_name_set)
+    )
+    summary["unexpected_functions"] = sorted(
+        live_function_name_set.difference(expected_function_name_set)
+    )
+
+    expected_delegate_bindings = expected_stats.get("expected_create_delegate_bindings", [])
+    live_delegate_bindings = live_stats.get("expected_create_delegate_bindings", [])
+    if not isinstance(expected_delegate_bindings, list):
+        expected_delegate_bindings = []
+    if not isinstance(live_delegate_bindings, list):
+        live_delegate_bindings = []
+
+    live_delegate_by_guid: Dict[str, Dict[str, Any]] = {}
+    live_delegate_by_name: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for live_binding in live_delegate_bindings:
+        if not isinstance(live_binding, dict):
+            continue
+        live_graph_name = str(live_binding.get("graph_name", "") or "").strip()
+        live_readable_name = str(live_binding.get("readable_name", "") or "").strip()
+        live_guid = str(live_binding.get("node_guid", "") or "").strip()
+        if live_guid:
+            live_delegate_by_guid[live_guid] = live_binding
+        key = (live_graph_name, live_readable_name.lower())
+        live_delegate_by_name.setdefault(key, []).append(live_binding)
+
+    for expected_binding in expected_delegate_bindings:
+        if not isinstance(expected_binding, dict):
+            continue
+        expected_function = _normalize_function_name_text(expected_binding.get("expected_function"))
+        if not expected_function:
+            continue
+
+        expected_graph_name = str(expected_binding.get("graph_name", "") or "").strip()
+        expected_guid = str(expected_binding.get("node_guid", "") or "").strip()
+        expected_readable_name = str(expected_binding.get("readable_name", "") or "").strip()
+
+        live_binding = None
+        if expected_guid:
+            live_binding = live_delegate_by_guid.get(expected_guid)
+        if live_binding is None:
+            fallback_key = (expected_graph_name, expected_readable_name.lower())
+            candidates = live_delegate_by_name.get(fallback_key, [])
+            if candidates:
+                live_binding = candidates[0]
+
+        if live_binding is None:
+            summary["create_delegate_mismatches"].append(
+                {
+                    "graph": expected_graph_name,
+                    "node": expected_readable_name or "<CreateDelegate>",
+                    "expected_function": expected_function,
+                    "actual_function": "<missing node>",
+                }
+            )
+            continue
+
+        actual_function = _normalize_function_name_text(live_binding.get("expected_function"))
+        if actual_function != expected_function:
+            summary["create_delegate_mismatches"].append(
+                {
+                    "graph": expected_graph_name,
+                    "node": expected_readable_name or "<CreateDelegate>",
+                    "expected_function": expected_function,
+                    "actual_function": actual_function or "None",
+                }
+            )
+
+    expected_delegate_counts = expected_stats.get("expected_delegate_node_counts", {})
+    live_delegate_counts = live_stats.get("expected_delegate_node_counts", {})
+    if not isinstance(expected_delegate_counts, dict):
+        expected_delegate_counts = {}
+    if not isinstance(live_delegate_counts, dict):
+        live_delegate_counts = {}
+    for delegate_class in (
+        "K2Node_CreateDelegate",
+        "K2Node_AssignDelegate",
+        "K2Node_AddDelegate",
+        "K2Node_CallDelegate",
+        "K2Node_RemoveDelegate",
+    ):
+        expected_count = int(expected_delegate_counts.get(delegate_class, 0) or 0)
+        actual_count = int(live_delegate_counts.get(delegate_class, 0) or 0)
+        if expected_count != actual_count:
+            summary["delegate_node_count_mismatches"].append(
+                {
+                    "node_class": delegate_class,
+                    "expected": expected_count,
+                    "actual": actual_count,
+                }
+            )
+
+    expected_delegate_nodes = expected_stats.get("expected_delegate_nodes", [])
+    live_delegate_nodes = live_stats.get("expected_delegate_nodes", [])
+    if not isinstance(expected_delegate_nodes, list):
+        expected_delegate_nodes = []
+    if not isinstance(live_delegate_nodes, list):
+        live_delegate_nodes = []
+
+    live_delegate_nodes_by_guid: Dict[str, Dict[str, Any]] = {}
+    live_delegate_nodes_by_fallback: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for live_node in live_delegate_nodes:
+        if not isinstance(live_node, dict):
+            continue
+        live_guid = str(live_node.get("node_guid", "") or "").strip()
+        live_graph = str(live_node.get("graph_name", "") or "").strip()
+        live_class = str(live_node.get("node_class", "") or "").strip()
+        live_name = str(live_node.get("readable_name", "") or "").strip().lower()
+        if live_guid:
+            live_delegate_nodes_by_guid[live_guid] = live_node
+        fallback_key = (live_graph, live_class, live_name)
+        live_delegate_nodes_by_fallback.setdefault(fallback_key, []).append(live_node)
+
+    for expected_node in expected_delegate_nodes:
+        if not isinstance(expected_node, dict):
+            continue
+        expected_graph = str(expected_node.get("graph_name", "") or "").strip()
+        expected_class = str(expected_node.get("node_class", "") or "").strip()
+        expected_name = str(expected_node.get("readable_name", "") or "").strip()
+        expected_guid = str(expected_node.get("node_guid", "") or "").strip()
+        expected_member = _normalize_function_name_text(expected_node.get("member_name"))
+        expected_selected = _normalize_function_name_text(expected_node.get("selected_function"))
+        expected_ref = str(expected_node.get("delegate_reference", "") or "").strip()
+
+        live_node = None
+        if expected_guid:
+            live_node = live_delegate_nodes_by_guid.get(expected_guid)
+        if live_node is None:
+            fallback_key = (expected_graph, expected_class, expected_name.lower())
+            candidates = live_delegate_nodes_by_fallback.get(fallback_key, [])
+            if candidates:
+                live_node = candidates[0]
+
+        if live_node is None:
+            summary["delegate_decl_mismatches"].append(
+                {
+                    "graph": expected_graph,
+                    "node": expected_name or "<delegate>",
+                    "reason": "missing delegate node",
+                }
+            )
+            continue
+
+        actual_member = _normalize_function_name_text(live_node.get("member_name"))
+        actual_selected = _normalize_function_name_text(live_node.get("selected_function"))
+        actual_ref = str(live_node.get("delegate_reference", "") or "").strip()
+
+        mismatch_reasons: List[str] = []
+        if expected_member != actual_member:
+            mismatch_reasons.append(f"member_name expected={expected_member or 'None'} actual={actual_member or 'None'}")
+        if expected_selected != actual_selected:
+            mismatch_reasons.append(
+                f"selected_function expected={expected_selected or 'None'} actual={actual_selected or 'None'}"
+            )
+        if expected_ref != actual_ref:
+            mismatch_reasons.append(
+                f"delegate_reference expected={expected_ref or 'None'} actual={actual_ref or 'None'}"
+            )
+
+        if mismatch_reasons:
+            summary["delegate_decl_mismatches"].append(
+                {
+                    "graph": expected_graph,
+                    "node": expected_name or "<delegate>",
+                    "reason": "; ".join(mismatch_reasons),
+                }
+            )
+
+    expected_delegate_connections = expected_stats.get("expected_delegate_connections", [])
+    live_delegate_connections = live_stats.get("expected_delegate_connections", [])
+    if not isinstance(expected_delegate_connections, list):
+        expected_delegate_connections = []
+    if not isinstance(live_delegate_connections, list):
+        live_delegate_connections = []
+
+    def _delegate_edge_key(edge: Dict[str, Any]) -> Tuple[str, str, str]:
+        graph_name = str(edge.get("graph_name", "") or "").strip()
+        src_guid = str(edge.get("src_node_guid", "") or "").strip()
+        dst_guid = str(edge.get("dst_node_guid", "") or "").strip()
+        if src_guid and dst_guid:
+            return (graph_name, src_guid, dst_guid)
+        src_name = str(edge.get("src_readable_name", "") or "").strip()
+        dst_name = str(edge.get("dst_readable_name", "") or "").strip()
+        return (graph_name, src_name, dst_name)
+
+    expected_edge_keys = {_delegate_edge_key(edge) for edge in expected_delegate_connections if isinstance(edge, dict)}
+    live_edge_keys = {_delegate_edge_key(edge) for edge in live_delegate_connections if isinstance(edge, dict)}
+    missing_delegate_edges = sorted(expected_edge_keys.difference(live_edge_keys))
+    extra_delegate_edges = sorted(live_edge_keys.difference(expected_edge_keys))
+    if missing_delegate_edges or extra_delegate_edges:
+        summary["delegate_connection_mismatches"].append(
+            {
+                "missing_edges": missing_delegate_edges,
+                "unexpected_edges": extra_delegate_edges,
+            }
+        )
 
     components = payload.get("components", [])
     component_validation_available = bool(_iter_actor_components(cdo)) or bool(
@@ -1345,6 +1976,15 @@ def _validate_imported_blueprint(asset_path: str, payload: Dict[str, Any]) -> Di
     summary["ok"] = not any(
         summary[key]
         for key in (
+            "missing_graphs",
+            "graph_node_count_mismatches",
+            "function_count_mismatch",
+            "missing_functions",
+            "unexpected_functions",
+            "create_delegate_mismatches",
+            "delegate_node_count_mismatches",
+            "delegate_decl_mismatches",
+            "delegate_connection_mismatches",
             "missing_components",
             "component_parent_mismatches",
             "component_socket_mismatches",
@@ -1397,9 +2037,121 @@ def _load_blueprint_asset_for_repair(asset_path: str):
     return None
 
 
+def _coerce_guid_component_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text, 0)
+    except Exception:
+        return None
+
+
+def _extract_guid_components(value: Any) -> Optional[Tuple[int, int, int, int]]:
+    if value is None:
+        return None
+
+    component_values: List[int] = []
+    for component_name in ("a", "b", "c", "d"):
+        component = None
+
+        if hasattr(value, "get_editor_property"):
+            try:
+                component = value.get_editor_property(component_name)
+            except Exception:
+                component = None
+            if component is None:
+                try:
+                    component = value.get_editor_property(component_name.upper())
+                except Exception:
+                    component = None
+
+        if component is None:
+            try:
+                component = getattr(value, component_name)
+            except Exception:
+                component = None
+        if component is None:
+            try:
+                component = getattr(value, component_name.upper())
+            except Exception:
+                component = None
+
+        coerced = _coerce_guid_component_int(component)
+        if coerced is None:
+            return None
+        component_values.append(coerced)
+
+    if len(component_values) != 4:
+        return None
+    return tuple(component_values)  # type: ignore[return-value]
+
+
 def _normalize_guid_text(value: Any) -> str:
-    text = str(value or "").strip()
-    return text.replace("{", "").replace("}", "").replace("-", "").upper()
+    if value is None:
+        return ""
+
+    direct_components = _extract_guid_components(value)
+    if direct_components is not None:
+        return "".join(f"{(component & 0xFFFFFFFF):08X}" for component in direct_components)
+
+    text_candidate = None
+    for method_name in ("to_string", "ToString"):
+        if not hasattr(value, method_name):
+            continue
+        try:
+            method = getattr(value, method_name)
+            produced = method() if callable(method) else None
+        except Exception:
+            produced = None
+        if produced:
+            text_candidate = str(produced).strip()
+            if text_candidate:
+                break
+
+    text = text_candidate if text_candidate else str(value).strip()
+    if not text:
+        return ""
+
+    component_matches = re.findall(
+        r"([AaBbCcDd])\s*=\s*(0x[0-9A-Fa-f]+|-?\d+)",
+        text,
+    )
+    if component_matches:
+        component_map: Dict[str, int] = {}
+        for key, raw_value in component_matches:
+            try:
+                component_map[key.upper()] = int(raw_value, 0)
+            except Exception:
+                component_map = {}
+                break
+        if all(name in component_map for name in ("A", "B", "C", "D")):
+            return "".join(
+                f"{(component_map[name] & 0xFFFFFFFF):08X}"
+                for name in ("A", "B", "C", "D")
+            )
+
+    stripped = text.replace("{", "").replace("}", "").replace("-", "").upper()
+    if re.fullmatch(r"[0-9A-F]{32}", stripped or ""):
+        return stripped
+
+    hex_run = re.search(r"[0-9A-Fa-f]{32}", stripped)
+    if hex_run:
+        return hex_run.group(0).upper()
+
+    return ""
 
 
 def _looks_like_graph_object(candidate: Any) -> bool:
@@ -2266,6 +3018,67 @@ def _save_asset_if_possible(asset_path: str) -> bool:
         return bool(unreal.EditorAssetLibrary.save_asset(asset_path, False))
     except Exception:
         return False
+
+
+def _restore_create_delegate_bindings_with_bridge(json_str: str, asset_path: str) -> Tuple[bool, str]:
+    try:
+        import unreal
+
+        if (
+            hasattr(unreal, "BPDirectImporter")
+            and hasattr(unreal.BPDirectImporter, "restore_create_delegates_from_json_detailed")
+        ):
+            result = unreal.BPDirectImporter.restore_create_delegates_from_json_detailed(
+                json_str,
+                asset_path,
+            )
+        elif hasattr(unreal, "call_function"):
+            result = unreal.call_function(
+                "BPDirectImporter",
+                "RestoreCreateDelegatesFromJsonDetailed",
+                json_str,
+                asset_path,
+            )
+        else:
+            return False, (
+                "Unreal Python bridge cannot call "
+                "BPDirectImporter.RestoreCreateDelegatesFromJsonDetailed"
+            )
+
+        success: Optional[bool] = None
+        error_text = ""
+        if isinstance(result, str):
+            parsed = _parse_import_result_json(result)
+            if parsed is not None:
+                return parsed
+        if isinstance(result, tuple):
+            if result:
+                first = result[0]
+                if isinstance(first, bool):
+                    success = first
+                elif first is not None:
+                    success = bool(first)
+            if len(result) > 1 and result[1] is not None:
+                error_text = str(result[1])
+        elif isinstance(result, str):
+            success = True
+            error_text = result
+        elif isinstance(result, bool):
+            success = result
+        elif result is None:
+            success = False
+        else:
+            success = bool(result)
+
+        if success is None:
+            return False, error_text or "C++ delegate restore did not return a success flag"
+
+        if not success:
+            return False, error_text or "C++ delegate restore failed without an error message"
+
+        return True, error_text
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _call_cpp_importer(json_str: str, asset_path: str, compile_blueprint: bool = True) -> Tuple[bool, str]:

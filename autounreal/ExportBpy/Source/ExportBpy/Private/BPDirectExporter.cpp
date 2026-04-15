@@ -243,6 +243,47 @@ bool IsSupportedNonK2GraphNode_ExportBpy(const UEdGraphNode* Node)
 		Node->IsA<UEdGraphNode_Comment>());
 }
 
+FString SummarizeNodeClasses_ExportBpy(const TArray<UEdGraphNode*>& Nodes, const int32 MaxClasses = 12)
+{
+	if (Nodes.Num() == 0)
+	{
+		return TEXT("none");
+	}
+
+	TMap<FString, int32> ClassCounts;
+	for (const UEdGraphNode* Node : Nodes)
+	{
+		const FString ClassName = (Node && Node->GetClass())
+			? Node->GetClass()->GetName()
+			: TEXT("Unknown");
+		ClassCounts.FindOrAdd(ClassName)++;
+	}
+
+	TArray<FString> ClassKeys;
+	ClassCounts.GetKeys(ClassKeys);
+	ClassKeys.Sort();
+
+	TArray<FString> Parts;
+	int32 Emitted = 0;
+	for (const FString& Key : ClassKeys)
+	{
+		if (Emitted >= MaxClasses)
+		{
+			const int32 Remaining = ClassKeys.Num() - Emitted;
+			if (Remaining > 0)
+			{
+				Parts.Add(FString::Printf(TEXT("...+%d classes"), Remaining));
+			}
+			break;
+		}
+
+		Parts.Add(FString::Printf(TEXT("%s=%d"), *Key, ClassCounts[Key]));
+		++Emitted;
+	}
+
+	return FString::Join(Parts, TEXT(", "));
+}
+
 bool IsBlendStackGraphLike_ExportBpy(const UEdGraph* Graph)
 {
 	if (!Graph)
@@ -2652,6 +2693,70 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 	return Info;
 }
 
+FNodeInfo BuildNodeInfoForGenericGraphNode_ExportBpy(UEdGraphNode* Node)
+{
+	FNodeInfo Info;
+	if (!Node)
+	{
+		return Info;
+	}
+
+	Info.NodeType = Node->GetClass() ? Node->GetClass()->GetName() : TEXT("UnknownNode");
+	Info.Position = FVector2D(Node->NodePosX, Node->NodePosY);
+	Info.NodeGuid = Node->NodeGuid.ToString(EGuidFormats::Digits);
+
+	auto AddNodeProp = [&Info, Node](const TCHAR* PropertyName, bool bUseDelta = false)
+	{
+		if (!PropertyName || !Node || !Node->GetClass())
+		{
+			return;
+		}
+
+		FProperty* Property = Node->GetClass()->FindPropertyByName(FName(PropertyName));
+		if (!Property)
+		{
+			return;
+		}
+
+		void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Node);
+		if (!ValuePtr)
+		{
+			return;
+		}
+
+		void* DefaultPtr = nullptr;
+		if (bUseDelta)
+		{
+			if (UObject* DefaultObject = Node->GetClass()->GetDefaultObject())
+			{
+				DefaultPtr = Property->ContainerPtrToValuePtr<void>(DefaultObject);
+			}
+		}
+
+		FString ExportedValue;
+		Property->ExportTextItem_Direct(ExportedValue, ValuePtr, DefaultPtr, Node, PPF_None);
+		if (!ExportedValue.IsEmpty())
+		{
+			Info.NodeProps.Add(PropertyName, ExportedValue);
+		}
+	};
+
+	if (Node->IsA<UEdGraphNode_Comment>())
+	{
+		AddNodeProp(TEXT("NodeComment"));
+		AddNodeProp(TEXT("CommentColor"));
+		AddNodeProp(TEXT("FontSize"));
+		AddNodeProp(TEXT("MoveMode"));
+		AddNodeProp(TEXT("CommentDepth"));
+		AddNodeProp(TEXT("bColorCommentBubble"));
+		AddNodeProp(TEXT("bCommentBubbleVisible"));
+		AddNodeProp(TEXT("NodeWidth"));
+		AddNodeProp(TEXT("NodeHeight"));
+	}
+
+	return Info;
+}
+
 void AppendStringMapSection_ExportBpy(
 	FString& InOut,
 	const FString& SectionName,
@@ -3696,25 +3801,56 @@ bool UBPDirectExporter::GenerateGraphFile(
 	FString& OutError)
 {
 	TArray<FNodeInfo> NodeInfos;
-	TArray<UK2Node*> AllNodes;
+	TArray<UK2Node*> K2Nodes;
+	TArray<UEdGraphNode*> GenericNodes;
+	TArray<UEdGraphNode*> OmittedNonK2Nodes;
+	const int32 SourceNodeTotal = Graph ? Graph->Nodes.Num() : 0;
 
 	for (UEdGraphNode* N : Graph->Nodes)
 	{
 		UK2Node* K2 = Cast<UK2Node>(N);
-		if (!K2) continue;
-		AllNodes.Add(K2);
+		if (K2)
+		{
+			K2Nodes.Add(K2);
+			continue;
+		}
+
+		if (N && N->IsA<UEdGraphNode_Comment>())
+		{
+			GenericNodes.Add(N);
+			continue;
+		}
+
+		OmittedNonK2Nodes.Add(N);
 	}
 
-	AllNodes = TopologicalSort(AllNodes);
-	for (UK2Node* Node : AllNodes)
+	const int32 ExportableNodeTotal = K2Nodes.Num() + GenericNodes.Num();
+	if (ExportableNodeTotal != SourceNodeTotal)
+	{
+		OutError = FString::Printf(
+			TEXT("Export node count mismatch in graph '%s': source_nodes=%d exported_nodes=%d omitted_nodes=%d omitted_classes=[%s]"),
+			Graph ? *Graph->GetName() : TEXT("<null>"),
+			SourceNodeTotal,
+			ExportableNodeTotal,
+			OmittedNonK2Nodes.Num(),
+			*SummarizeNodeClasses_ExportBpy(OmittedNonK2Nodes));
+		return false;
+	}
+
+	K2Nodes = TopologicalSort(K2Nodes);
+	for (UK2Node* Node : K2Nodes)
 	{
 		NodeInfos.Add(BuildNodeInfo_ExportBpy(Node));
 	}
+	for (UEdGraphNode* Node : GenericNodes)
+	{
+		NodeInfos.Add(BuildNodeInfoForGenericGraphNode_ExportBpy(Node));
+	}
 
 	AssignReadableNames(NodeInfos);
-	for (int32 Index = 0; Index < AllNodes.Num() && Index < NodeInfos.Num(); ++Index)
+	for (int32 Index = 0; Index < K2Nodes.Num() && Index < NodeInfos.Num(); ++Index)
 	{
-		if (const UK2Node_Composite* CompositeNode = Cast<UK2Node_Composite>(AllNodes[Index]))
+		if (const UK2Node_Composite* CompositeNode = Cast<UK2Node_Composite>(K2Nodes[Index]))
 		{
 			if (CompositeNode->BoundGraph)
 			{
@@ -3731,9 +3867,9 @@ bool UBPDirectExporter::GenerateGraphFile(
 	TMap<FString, FString> PinAliasMap;
 	TMap<FString, FString> PinIdMap;
 	TMap<FString, TMap<FString, FString>> NodePropsMap;
-	for (int32 i = 0; i < AllNodes.Num(); i++)
+	for (int32 i = 0; i < K2Nodes.Num() && i < NodeInfos.Num(); i++)
 	{
-		NodeVarMap.Add(AllNodes[i], NodeInfos[i].VarName);
+		NodeVarMap.Add(K2Nodes[i], NodeInfos[i].VarName);
 		NodeGuidMap.Add(NodeInfos[i].VarName, NodeInfos[i].NodeGuid);
 		NodePosMap.Add(NodeInfos[i].VarName, NodeInfos[i].Position);
 
@@ -3784,7 +3920,7 @@ bool UBPDirectExporter::GenerateGraphFile(
 		FString InputsStr, OutputsStr;
 		bool bIsPure = false;
 		bool bThreadSafe = false;
-		for (UK2Node* K2 : AllNodes)
+		for (UK2Node* K2 : K2Nodes)
 		{
 			if (auto* FE = Cast<UK2Node_FunctionEntry>(K2))
 			{
@@ -3958,9 +4094,9 @@ bool UBPDirectExporter::GenerateGraphFile(
 			}
 		};
 
-		for (int32 Index = 0; Index < AllNodes.Num(); ++Index)
+		for (int32 Index = 0; Index < K2Nodes.Num() && Index < NodeInfos.Num(); ++Index)
 		{
-			UK2Node* SrcNode = AllNodes[Index];
+			UK2Node* SrcNode = K2Nodes[Index];
 			const FString& SrcVar = NodeInfos[Index].VarName;
 			for (UEdGraphPin* SrcPin : SrcNode->Pins)
 			{
@@ -4933,15 +5069,30 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeNode(UK2Node* Node)
 
 	// Defaults (unconnected input pins with non-empty default)
 	auto DefaultsObj = MakeShared<FJsonObject>();
+	auto InputPinTypesObj = MakeShared<FJsonObject>();
+	auto OutputPinTypesObj = MakeShared<FJsonObject>();
 	for (UEdGraphPin* Pin : Node->Pins)
 	{
+		const FString PinName = Pin->PinName.ToString();
+		const FString PinTypeString = NormalizeTypeString_ExportBpy(Pin->PinType);
+		if (Pin->Direction == EGPD_Input)
+		{
+			InputPinTypesObj->SetStringField(PinName, PinTypeString);
+		}
+		else if (Pin->Direction == EGPD_Output)
+		{
+			OutputPinTypesObj->SetStringField(PinName, PinTypeString);
+		}
+
 		const FString PinDefaultValue = GetPinDefaultValueForExport_ExportBpy(Pin);
 		if (!PinDefaultValue.IsEmpty())
 		{
-			DefaultsObj->SetStringField(Pin->PinName.ToString(), PinDefaultValue);
+			DefaultsObj->SetStringField(PinName, PinDefaultValue);
 		}
 	}
 	NObj->SetObjectField(TEXT("defaults"), DefaultsObj);
+	NObj->SetObjectField(TEXT("input_pin_types"), InputPinTypesObj);
+	NObj->SetObjectField(TEXT("output_pin_types"), OutputPinTypesObj);
 
 	auto NodePropsObj = MakeShared<FJsonObject>();
 	for (const TPair<FString, FString>& Entry : Info.NodeProps)

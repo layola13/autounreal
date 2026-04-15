@@ -145,7 +145,6 @@ FString StripGuidSuffix_ImportBpy(const FString& RawName);
 bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
 	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
 	const TMap<FString, UEdGraphNode*>& NodeMap,
-	bool bStrict,
 	FString& OutError);
 bool RestoreStateMachineAliasNodesAfterCreation_ImportBpy(
 	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
@@ -4980,32 +4979,6 @@ bool IsObjectLikePinCategory_ImportBpy(const FName& PinCategory)
 		PinCategory == UEdGraphSchema_K2::PC_SoftClass;
 }
 
-bool IsSimpleLiteralDefaultForPromotable_ImportBpy(const FString& DefaultValue)
-{
-	if (DefaultValue.IsEmpty())
-	{
-		return false;
-	}
-
-	if (DefaultValue.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
-		DefaultValue.Equals(TEXT("false"), ESearchCase::IgnoreCase))
-	{
-		return true;
-	}
-
-	double ParsedNumber = 0.0;
-	return LexTryParseString(ParsedNumber, *DefaultValue);
-}
-
-bool IsScalarLiteralPinCategory_ImportBpy(const FName& PinCategory)
-{
-	return PinCategory == UEdGraphSchema_K2::PC_Boolean ||
-		PinCategory == UEdGraphSchema_K2::PC_Byte ||
-		PinCategory == UEdGraphSchema_K2::PC_Int ||
-		PinCategory == UEdGraphSchema_K2::PC_Int64 ||
-		PinCategory == UEdGraphSchema_K2::PC_Real;
-}
-
 void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>& Value)
 {
 	if (!Pin || !Value.IsValid())
@@ -5085,22 +5058,6 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 			Pin->DefaultValue = DefaultValue;
 		}
 	}
-
-	// Promotable operator pins can lose explicit numeric defaults (e.g. +2, -0.5)
-	// after type promotion/rebind/reconstruct passes. If schema assignment did not
-	// stick, restore the serialized literal on safe input pins.
-	const bool bCanForcePromotableDefault =
-		bIsPromotableOperatorPin &&
-		Pin->Direction == EGPD_Input &&
-		IsScalarLiteralPinCategory_ImportBpy(Pin->PinType.PinCategory) &&
-		Pin->LinkedTo.Num() == 0 &&
-		IsSimpleLiteralDefaultForPromotable_ImportBpy(DefaultValue) &&
-		!Pin->DefaultValue.Equals(DefaultValue, ESearchCase::CaseSensitive);
-	if (bCanForcePromotableDefault)
-	{
-		Pin->DefaultValue = DefaultValue;
-	}
-
 	Pin->bDefaultValueIsIgnored = false;
 	// Keep the pin's auto-generated default intact. K2 uses this field to tell whether
 	// an imported value is an explicit override relative to a function signature default.
@@ -8922,7 +8879,6 @@ bool RebindUnresolvedSelfContextCallsAndReplaySerializedPins_ImportBpy(
 bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
 	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
 	const TMap<FString, UEdGraphNode*>& NodeMap,
-	bool bStrict,
 	FString& OutError)
 {
 	if (!NodesArr)
@@ -8951,58 +8907,22 @@ bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
 			continue;
 		}
 
-		FString SelectedFunctionName = GetNodePropString_ImportBpy(NodeObj, TEXT("SelectedFunctionName"));
-		if (SelectedFunctionName.IsEmpty() || SelectedFunctionName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
-		{
-			NodeObj->TryGetStringField(TEXT("member_name"), SelectedFunctionName);
-		}
-		if (SelectedFunctionName.IsEmpty() || SelectedFunctionName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+		const FString SelectedFunctionName = GetNodePropString_ImportBpy(NodeObj, TEXT("SelectedFunctionName"));
+		if (SelectedFunctionName.IsEmpty())
 		{
 			continue;
 		}
 
-		const UEdGraphPin* DelegateOutPinBefore = CreateDelegateNode->GetDelegateOutPin();
-		const int32 DelegateLinkCountBefore = DelegateOutPinBefore ? DelegateOutPinBefore->LinkedTo.Num() : -1;
-		UE_LOG(
-			LogTemp,
-			Warning,
-			TEXT("[ExportBpy] RestoreCreateDelegate(%s) node=%s requested=%s current=%s links_before=%d"),
-			bStrict ? TEXT("strict") : TEXT("deferred"),
-			*DescribeNode_ImportBpy(CreateDelegateNode),
-			*SelectedFunctionName,
-			*CreateDelegateNode->GetFunctionName().ToString(),
-			DelegateLinkCountBefore);
-
 		CreateDelegateNode->SetFunction(FName(*SelectedFunctionName));
 		CreateDelegateNode->HandleAnyChangeWithoutNotifying();
-		const UEdGraphPin* DelegateOutPinAfter = CreateDelegateNode->GetDelegateOutPin();
-		const int32 DelegateLinkCountAfter = DelegateOutPinAfter ? DelegateOutPinAfter->LinkedTo.Num() : -1;
-		UE_LOG(
-			LogTemp,
-			Warning,
-			TEXT("[ExportBpy] RestoreCreateDelegate(%s) node=%s after_set=%s links_after=%d"),
-			bStrict ? TEXT("strict") : TEXT("deferred"),
-			*DescribeNode_ImportBpy(CreateDelegateNode),
-			*CreateDelegateNode->GetFunctionName().ToString(),
-			DelegateLinkCountAfter);
 
 		if (CreateDelegateNode->GetFunctionName().IsNone())
 		{
-			if (bStrict)
-			{
-				OutError = FString::Printf(
-					TEXT("Failed to restore CreateDelegate binding '%s' on node %s after connections"),
-					*SelectedFunctionName,
-					*DescribeNode_ImportBpy(CreateDelegateNode));
-				return false;
-			}
-
-			UE_LOG(
-				LogTemp,
-				Warning,
-				TEXT("[ExportBpy] Deferring CreateDelegate binding '%s' on node %s (delegate signature not ready yet)"),
+			OutError = FString::Printf(
+				TEXT("Failed to restore CreateDelegate binding '%s' on node %s after connections"),
 				*SelectedFunctionName,
 				*DescribeNode_ImportBpy(CreateDelegateNode));
+			return false;
 		}
 	}
 
@@ -9084,10 +9004,7 @@ bool RestoreCallFunctionBindingFromJson_ImportBpy(
 	}
 
 	const UFunction* ExistingTargetFunction = CallNode->GetTargetFunction();
-	const bool bShouldRebindFunction =
-		ExistingTargetFunction == nullptr ||
-		ExistingTargetFunction != ResolvedFunction;
-	if (bShouldRebindFunction)
+	if (ExistingTargetFunction != ResolvedFunction)
 	{
 		CallNode->SetFromFunction(ResolvedFunction);
 		if (bSelfContextCall)
@@ -9152,45 +9069,6 @@ bool RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
 		}
 
 		if (!RestoreCallFunctionBindingFromJson_ImportBpy(CallNode, NodeObj, OutError))
-		{
-			return false;
-		}
-
-		const auto ApplySerializedPinTypes = [&](const TCHAR* FieldName, EEdGraphPinDirection Direction) -> bool
-		{
-			const TSharedPtr<FJsonObject>* PinTypesObj = nullptr;
-			if (!NodeObj->TryGetObjectField(FieldName, PinTypesObj) || !PinTypesObj || !PinTypesObj->IsValid())
-			{
-				return true;
-			}
-
-			for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*PinTypesObj)->Values)
-			{
-				if (!Entry.Value.IsValid())
-				{
-					continue;
-				}
-
-				FEdGraphPinType ParsedPinType;
-				ParsePinTypeString_ImportBpy(Entry.Value->AsString(), ParsedPinType);
-
-				UEdGraphPin* Pin = FindSerializedPinOnNode_ImportBpy(CallNode, NodeObj, Entry.Key, Direction);
-				if (!Pin)
-				{
-					continue;
-				}
-
-				Pin->PinType = ParsedPinType;
-			}
-
-			return true;
-		};
-
-		if (!ApplySerializedPinTypes(TEXT("input_pin_types"), EGPD_Input))
-		{
-			return false;
-		}
-		if (!ApplySerializedPinTypes(TEXT("output_pin_types"), EGPD_Output))
 		{
 			return false;
 		}
@@ -10364,20 +10242,14 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 		}
 	}
 
-	// Keep chooser references identical to the exported source asset.
-	// Retargeting to *_For_* chooser copies introduces runtime divergence for cloned ABPs.
-	constexpr bool bEnableChooserRetargeting_ImportBpy = false;
-	if (bEnableChooserRetargeting_ImportBpy)
+	bool bRetargetedChooserTables = false;
+	if (!RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(BP, bRetargetedChooserTables, OutError))
 	{
-		bool bRetargetedChooserTables = false;
-		if (!RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(BP, bRetargetedChooserTables, OutError))
-		{
-			return false;
-		}
-		if (bRetargetedChooserTables)
-		{
-			FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
-		}
+		return false;
+	}
+	if (bRetargetedChooserTables)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
 	}
 
 	if (bCompileBlueprint)
@@ -10432,191 +10304,6 @@ FString UBPDirectImporter::ImportBlueprintFromJsonDetailed(
 	ResultObj->SetStringField(TEXT("error"), OutError);
 	ResultObj->SetStringField(TEXT("asset_path"), TargetAssetPath);
 	ResultObj->SetBoolField(TEXT("compiled"), bSuccess && bCompileBlueprint);
-
-	FString ResultJson;
-	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ResultJson);
-	FJsonSerializer::Serialize(ResultObj, Writer);
-	return ResultJson;
-}
-
-static bool RestoreCreateDelegatesFromRootJson_ImportBpy(
-	UBlueprint* BP,
-	const TSharedPtr<FJsonObject>& Root,
-	int32& OutDelegateNodeCount,
-	int32& OutRestoredDelegateCount,
-	FString& OutError)
-{
-	OutDelegateNodeCount = 0;
-	OutRestoredDelegateCount = 0;
-
-	if (!BP || !Root.IsValid())
-	{
-		OutError = TEXT("Invalid blueprint or root json while restoring CreateDelegate bindings");
-		return false;
-	}
-
-	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
-	if (!Root->TryGetArrayField(TEXT("graphs"), GraphsArr) || !GraphsArr)
-	{
-		return true;
-	}
-
-	for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
-	{
-		const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
-		if (!GraphObj.IsValid())
-		{
-			continue;
-		}
-
-		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
-		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
-		{
-			continue;
-		}
-
-		TMap<FString, UEdGraphNode*> NodeMap;
-		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
-		{
-			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
-			if (!NodeObj.IsValid())
-			{
-				continue;
-			}
-
-			FString NodeClassName;
-			NodeObj->TryGetStringField(TEXT("node_class"), NodeClassName);
-			if (NodeClassName != TEXT("K2Node_CreateDelegate"))
-			{
-				continue;
-			}
-
-			++OutDelegateNodeCount;
-
-			FString NodeUid;
-			if (!NodeObj->TryGetStringField(TEXT("uid"), NodeUid) || NodeUid.IsEmpty())
-			{
-				OutError = TEXT("CreateDelegate node is missing uid in import json");
-				return false;
-			}
-
-			FGuid ParsedGuid;
-			UEdGraphNode* FoundNode = FindImportedNodeBySerializedUid_ImportBpy(BP, NodeUid);
-			if (!FoundNode && TryParseGuid_ImportBpy(NodeUid, ParsedGuid))
-			{
-				FoundNode = FindImportedNodeByGuidScan_ImportBpy(BP, ParsedGuid);
-			}
-			if (!FoundNode)
-			{
-				OutError = FString::Printf(
-					TEXT("Cannot locate imported CreateDelegate node by uid/guid: %s"),
-					*NodeUid);
-				return false;
-			}
-
-			if (!Cast<UK2Node_CreateDelegate>(FoundNode))
-			{
-				OutError = FString::Printf(
-					TEXT("Guid %s does not resolve to K2Node_CreateDelegate"),
-					*NodeUid);
-				return false;
-			}
-
-			NodeMap.Add(NodeUid, FoundNode);
-		}
-
-		if (NodeMap.Num() == 0)
-		{
-			continue;
-		}
-
-		if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, true, OutError))
-		{
-			return false;
-		}
-
-		for (const TPair<FString, UEdGraphNode*>& Pair : NodeMap)
-		{
-			if (const UK2Node_CreateDelegate* RestoredNode = Cast<UK2Node_CreateDelegate>(Pair.Value))
-			{
-				if (!RestoredNode->GetFunctionName().IsNone())
-				{
-					++OutRestoredDelegateCount;
-				}
-			}
-		}
-	}
-
-	return true;
-}
-
-bool UBPDirectImporter::RestoreCreateDelegatesFromJson(
-	const FString& JsonData,
-	const FString& TargetAssetPath,
-	FString& OutError)
-{
-	TSharedPtr<FJsonObject> Root;
-	{
-		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonData);
-		if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
-		{
-			OutError = TEXT("Failed to parse JSON while restoring CreateDelegate bindings");
-			return false;
-		}
-	}
-
-	UBlueprint* const BP = LoadBlueprintAsset_ImportBpy(TargetAssetPath);
-	if (!BP)
-	{
-		OutError = FString::Printf(TEXT("Unable to load blueprint asset for delegate restore: %s"), *TargetAssetPath);
-		return false;
-	}
-
-	int32 DelegateNodeCount = 0;
-	int32 RestoredDelegateCount = 0;
-	if (!RestoreCreateDelegatesFromRootJson_ImportBpy(BP, Root, DelegateNodeCount, RestoredDelegateCount, OutError))
-	{
-		return false;
-	}
-
-	if (DelegateNodeCount > 0 && RestoredDelegateCount != DelegateNodeCount)
-	{
-		OutError = FString::Printf(
-			TEXT("CreateDelegate restore mismatch: expected=%d restored=%d"),
-			DelegateNodeCount,
-			RestoredDelegateCount);
-		return false;
-	}
-
-	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
-	BP->MarkPackageDirty();
-	if (!SaveBlueprint(BP, OutError))
-	{
-		return false;
-	}
-
-	UE_LOG(
-		LogTemp,
-		Warning,
-		TEXT("[ExportBpy] RestoreCreateDelegatesFromJson target=%s delegates=%d restored=%d"),
-		*TargetAssetPath,
-		DelegateNodeCount,
-		RestoredDelegateCount);
-
-	return true;
-}
-
-FString UBPDirectImporter::RestoreCreateDelegatesFromJsonDetailed(
-	const FString& JsonData,
-	const FString& TargetAssetPath)
-{
-	FString OutError;
-	const bool bSuccess = RestoreCreateDelegatesFromJson(JsonData, TargetAssetPath, OutError);
-
-	TSharedRef<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-	ResultObj->SetBoolField(TEXT("success"), bSuccess);
-	ResultObj->SetStringField(TEXT("error"), OutError);
-	ResultObj->SetStringField(TEXT("asset_path"), TargetAssetPath);
 
 	FString ResultJson;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ResultJson);
@@ -11353,7 +11040,7 @@ bool UBPDirectImporter::PopulateGraph(
 	const TArray<TSharedPtr<FJsonValue>>* ConnsArr = nullptr;
 	GraphJson->TryGetArrayField(TEXT("connections"), ConnsArr);
 
-	auto ReplaySerializedConnections = [&](const TCHAR* PhaseLabel, const bool bAllowUnresolvedAtStall) -> bool
+	auto ReplaySerializedConnections = [&](const TCHAR* PhaseLabel) -> bool
 	{
 		if (!ConnsArr)
 		{
@@ -11424,18 +11111,6 @@ bool UBPDirectImporter::PopulateGraph(
 
 			if (!bMadeProgress)
 			{
-				if (bAllowUnresolvedAtStall)
-				{
-					UE_LOG(
-						LogTemp,
-						Warning,
-						TEXT("[ExportBpy] [%s] Deferring unresolved connections (remaining=%d, last_error=%s)"),
-						PhaseLabel ? PhaseLabel : TEXT("connections"),
-						PendingConnections.Num(),
-						LastConnectError.IsEmpty() ? TEXT("<none>") : *LastConnectError);
-					return true;
-				}
-
 				if (LastConnectError.IsEmpty())
 				{
 					OutError = FString::Printf(
@@ -11459,12 +11134,12 @@ bool UBPDirectImporter::PopulateGraph(
 	};
 
 	BreakAllGraphLinks_ImportBpy(Graph);
-	if (!ReplaySerializedConnections(TEXT("initial"), true))
+	if (!ReplaySerializedConnections(TEXT("initial")))
 	{
 		return false;
 	}
 
-	if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, false, OutError))
+	if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, OutError))
 	{
 		return false;
 	}
@@ -11524,33 +11199,7 @@ bool UBPDirectImporter::PopulateGraph(
 		}
 	}
 
-	if (!RestorePromotableOperatorBindingsAfterConnections_ImportBpy(NodesArr, NodeMap, OutError))
-	{
-		return false;
-	}
-
-	if (!ReplaySerializedConnections(TEXT("post_promotable_rebind"), false))
-	{
-		return false;
-	}
-
-	// Replaying links can re-promote wildcard operators based on transient pin state.
-	// Run one final binding pass and stop reconnecting afterwards so exported function refs
-	// remain identical to the source blueprint signatures.
-	if (!RestorePromotableOperatorBindingsAfterConnections_ImportBpy(NodesArr, NodeMap, OutError))
-	{
-		return false;
-	}
-
-	if (!ReplaySerializedConnections(TEXT("post_delegate_rebind"), false))
-	{
-		return false;
-	}
-
-	// Keep CreateDelegate bindings as the final operation in graph population.
-	// Additional connection replay can transiently clear SelectedFunctionName
-	// when delegate pins are temporarily disconnected during node notifications.
-	if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, true, OutError))
+	if (!ReplaySerializedConnections(TEXT("post_promotable_rebind")))
 	{
 		return false;
 	}
@@ -12673,17 +12322,6 @@ bool UBPDirectImporter::ConnectPins(
 
 	const FString RequestedSrcPin = !SrcPinFullName.IsEmpty() ? SrcPinFullName : SrcPinName;
 	const FString RequestedDstPin = !DstPinFullName.IsEmpty() ? DstPinFullName : DstPinName;
-	const auto IsPromotableOperatorCallNode = [](const UK2Node_CallFunction* CallNode) -> bool
-	{
-		if (!CallNode)
-		{
-			return false;
-		}
-
-		const FString NodeClassName = CallNode->GetClass()->GetName();
-		return NodeClassName == TEXT("K2Node_PromotableOperator") ||
-			NodeClassName == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
-	};
 	if (!SrcPin)
 	{
 		if (UK2Node_CallFunction* SrcCallNode = Cast<UK2Node_CallFunction>(SrcNode))
@@ -12709,12 +12347,7 @@ bool UBPDirectImporter::ConnectPins(
 			{
 				EnsureCallFunctionExecPins_ImportBpy(DstCallNode);
 			}
-			else if (
-				SrcPin &&
-				!NormalizedDstPin.IsEmpty() &&
-				!DstCallNode->FindPin(FName(*NormalizedDstPin), EGPD_Input) &&
-				!IsPromotableOperatorCallNode(DstCallNode) &&
-				DstCallNode->GetTargetFunction() == nullptr)
+			else if (SrcPin && !NormalizedDstPin.IsEmpty() && !DstCallNode->FindPin(FName(*NormalizedDstPin), EGPD_Input))
 			{
 				DstCallNode->CreatePin(EGPD_Input, SrcPin->PinType, FName(*NormalizedDstPin));
 			}
@@ -12836,22 +12469,6 @@ bool UBPDirectImporter::ConnectPins(
 		return EnsureReciprocalLink(TEXT("Schema created non-reciprocal link"));
 	}
 
-	const bool bBothExecPins =
-		SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec &&
-		DstPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
-	if (!bBothExecPins)
-	{
-		OutError = FString::Printf(
-			TEXT("Schema rejected typed connection: %s.%s (%s) -> %s.%s (%s)"),
-			*DescribeNode_ImportBpy(SrcNode),
-			*SrcPin->GetName(),
-			*DescribePinType_ImportBpy(SrcPin->PinType),
-			*DescribeNode_ImportBpy(DstNode),
-			*DstPin->GetName(),
-			*DescribePinType_ImportBpy(DstPin->PinType));
-		return false;
-	}
-
 	SrcPin->MakeLinkTo(DstPin);
 	SrcNode->PinConnectionListChanged(SrcPin);
 	DstNode->PinConnectionListChanged(DstPin);
@@ -12863,7 +12480,7 @@ bool UBPDirectImporter::ConnectPins(
 		Graph->NotifyGraphChanged();
 	}
 
-	return EnsureReciprocalLink(TEXT("Schema rejected exec connection"));
+	return EnsureReciprocalLink(TEXT("Schema rejected connection"));
 }
 
 // ─── ParsePinType ─────────────────────────────────────────────────────────────

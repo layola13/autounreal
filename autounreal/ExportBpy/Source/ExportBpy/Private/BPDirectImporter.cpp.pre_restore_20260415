@@ -13,7 +13,6 @@
 #include "AnimationStateMachineGraph.h"
 #include "AnimationStateGraph.h"
 #include "AnimationTransitionGraph.h"
-#include "AnimationTransitionSchema.h"
 #include "AnimationCustomTransitionGraph.h"
 #include "AnimationCustomTransitionSchema.h"
 #include "AnimGraphNode_Base.h"
@@ -50,6 +49,7 @@
 #include "K2Node_Variable.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
+#include "K2Node_PromotableOperator.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_IfThenElse.h"
@@ -77,6 +77,7 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "KismetCompiler.h"
+#include "Kismet/KismetMathLibrary.h"
 #include "Editor.h"
 #include "AssetToolsModule.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -142,10 +143,10 @@ bool SyncBlueprintVariableDescriptionFromJson_ImportBpy(
 bool PrepareResolvedNodeForDefaultPins_ImportBpy(UEdGraphNode* Node, FString& OutError);
 ETunnelKind_ImportBpy InferTunnelKind_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson);
 FString StripGuidSuffix_ImportBpy(const FString& RawName);
+FString DescribeNode_ImportBpy(const UEdGraphNode* Node);
 bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
 	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
 	const TMap<FString, UEdGraphNode*>& NodeMap,
-	bool bStrict,
 	FString& OutError);
 bool RestoreStateMachineAliasNodesAfterCreation_ImportBpy(
 	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
@@ -160,8 +161,6 @@ bool PopulateNestedGraphFromJsonText_ImportBpy(
 	FString& OutError);
 void RemoveUnlinkedOrphanPins_ImportBpy(UEdGraphNode* Node);
 bool EnsureTransitionCustomGraphExists_ImportBpy(UAnimStateTransitionNode* TransitionNode, FString& OutError);
-bool EnsureTransitionBoundGraphOwnership_ImportBpy(UAnimStateTransitionNode* TransitionNode, FString& OutError);
-bool EnsureConduitBoundGraphOwnership_ImportBpy(UAnimStateConduitNode* ConduitNode, FString& OutError);
 bool IsNodeGuidAlreadyUsedInBlueprint_ImportBpy(UBlueprint* BP, const FGuid& Guid, const UEdGraphNode* IgnoreNode);
 void ResetAnimationGraphResultNode_ImportBpy(UEdGraph* Graph);
 void AssignAnimationGraphResultNode_ImportBpy(UEdGraph* Graph, UEdGraphNode* Node);
@@ -175,33 +174,35 @@ bool RestoreAnimReferenceNodesAfterCreation_ImportBpy(
 	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
 	const TMap<FString, UEdGraphNode*>& NodeMap,
 	FString& OutError);
-bool HasEvaluateChooserMetadata_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson, FString& OutMissingProperties);
-bool HasEvaluateChooserAssetBound_ImportBpy(const UEdGraphNode* Node);
-bool IsEvaluateChooserNode_ImportBpy(const UEdGraphNode* Node);
-bool RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(
-	UBlueprint* BP,
-	bool& bOutAnyRetargeted,
+bool RestoreCallFunctionBindingFromJson_ImportBpy(
+	UK2Node_CallFunction* CallNode,
+	const TSharedPtr<FJsonObject>& NodeJson,
 	FString& OutError);
+bool RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
+	const TMap<FString, UEdGraphNode*>& NodeMap,
+	FString& OutError);
+bool IsTrackedTraversalNodeJson_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson);
+bool IsTrackedTraversalNodeInstance_ImportBpy(const UEdGraphNode* Node);
+void LogTrackedTraversalNodeState_ImportBpy(const TCHAR* Stage, const TSharedPtr<FJsonObject>& NodeJson, UEdGraphNode* Node);
+void LogTrackedTraversalNodesFromMap_ImportBpy(
+	const TCHAR* Stage,
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
+	const TMap<FString, UEdGraphNode*>& NodeMap);
 
 template <typename TObject>
 TObject* ResolveNamedObject_ImportBpy(const FString& Name)
 {
-	FString NormalizedName = Name;
-	NormalizedName.TrimStartAndEndInline();
-	if (NormalizedName.IsEmpty() ||
-		NormalizedName.Equals(TEXT("None"), ESearchCase::IgnoreCase) ||
-		NormalizedName.Equals(TEXT("Null"), ESearchCase::IgnoreCase) ||
-		NormalizedName.Equals(TEXT("nullptr"), ESearchCase::IgnoreCase) ||
-		NormalizedName.Equals(TEXT("Object None.None"), ESearchCase::IgnoreCase))
+	if (Name.IsEmpty())
 	{
 		return nullptr;
 	}
 
-	if (TObject* Found = FindObject<TObject>(nullptr, *NormalizedName))
+	if (TObject* Found = FindObject<TObject>(nullptr, *Name))
 	{
 		return Found;
 	}
-	if (TObject* Found = FindFirstObjectSafe<TObject>(*NormalizedName))
+	if (TObject* Found = FindFirstObjectSafe<TObject>(*Name))
 	{
 		return Found;
 	}
@@ -221,24 +222,24 @@ TObject* ResolveNamedObject_ImportBpy(const FString& Name)
 		return Cast<TObject>(StaticLoadObject(TObject::StaticClass(), nullptr, *Candidate));
 	};
 
-	if (TObject* Loaded = TryLoad(NormalizedName))
+	if (TObject* Loaded = TryLoad(Name))
 	{
 		return Loaded;
 	}
 
-	FString PackagePath = NormalizedName;
-	FString ObjectPath = NormalizedName;
-	if (const int32 DotIndex = NormalizedName.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd); DotIndex != INDEX_NONE)
+	FString PackagePath = Name;
+	FString ObjectPath = Name;
+	if (const int32 DotIndex = Name.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd); DotIndex != INDEX_NONE)
 	{
-		PackagePath = NormalizedName.Left(DotIndex);
+		PackagePath = Name.Left(DotIndex);
 	}
-	else if (NormalizedName.StartsWith(TEXT("/")))
+	else if (Name.StartsWith(TEXT("/")))
 	{
-		const FString AssetName = FPaths::GetBaseFilename(NormalizedName);
-		ObjectPath = FString::Printf(TEXT("%s.%s"), *NormalizedName, *AssetName);
+		const FString AssetName = FPaths::GetBaseFilename(Name);
+		ObjectPath = FString::Printf(TEXT("%s.%s"), *Name, *AssetName);
 	}
 
-	if (PackagePath != NormalizedName)
+	if (PackagePath != Name)
 	{
 		if (TObject* Loaded = TryLoad(PackagePath))
 		{
@@ -246,7 +247,7 @@ TObject* ResolveNamedObject_ImportBpy(const FString& Name)
 		}
 	}
 
-	if (ObjectPath != NormalizedName)
+	if (ObjectPath != Name)
 	{
 		if (TObject* Loaded = TryLoad(ObjectPath))
 		{
@@ -254,7 +255,7 @@ TObject* ResolveNamedObject_ImportBpy(const FString& Name)
 		}
 	}
 
-	if (!NormalizedName.Contains(TEXT("/")) && !NormalizedName.Contains(TEXT(".")))
+	if (!Name.Contains(TEXT("/")) && !Name.Contains(TEXT(".")))
 	{
 		const bool bSupportsAssetRegistryNameLookup =
 			TObject::StaticClass()->IsChildOf(UEnum::StaticClass()) ||
@@ -271,7 +272,7 @@ TObject* ResolveNamedObject_ImportBpy(const FString& Name)
 				CandidateAssets,
 				true);
 
-			const FName AssetName(*NormalizedName);
+			const FName AssetName(*Name);
 			for (const FAssetData& AssetData : CandidateAssets)
 			{
 				if (!AssetData.IsValid() || AssetData.AssetName != AssetName)
@@ -424,6 +425,232 @@ UClass* ResolveNativeAnimBlueprintParentClass_ImportBpy(const UBlueprint* BP)
 	}
 
 	return NativeClass;
+}
+
+bool IsTrackedTraversalNodeGuid_ImportBpy(const FString& GuidText)
+{
+	if (GuidText.IsEmpty())
+	{
+		return false;
+	}
+
+	FString NormalizedGuid = GuidText;
+	NormalizedGuid.ReplaceInline(TEXT("-"), TEXT(""));
+	NormalizedGuid = NormalizedGuid.ToUpper();
+
+	static const TSet<FString> TrackedNodeGuids = {
+		// Add_DoubleDouble chain in TryTraversalAction
+		TEXT("21A313E74ECF345881D695A0E01EF5C1"),
+		TEXT("946A97ED4C2D0344EFD8D4ADC345EACB"),
+		TEXT("2D1BE5F04CC49B225D3A6DBEDE484870"),
+		TEXT("2AB256194A7C1E94FD11FD890D309ADA"),
+		TEXT("2C7F4536451C956EFBFE379EC7FE82FF"),
+		TEXT("7842E7F44827CA0EA69FA68CC46D10E7"),
+		// Multiply_VectorVector chain fed by those Add nodes
+		TEXT("704CEB6C48B936A1AB62BAA12C1C11CC"),
+		TEXT("9488168A47D712B10795B49BB0910A69"),
+		TEXT("F4B688874906C3B912AF3988FB783B4D"),
+	};
+
+	return TrackedNodeGuids.Contains(NormalizedGuid);
+}
+
+bool IsTrackedTraversalFunctionRef_ImportBpy(const FString& FunctionRef)
+{
+	if (FunctionRef.IsEmpty())
+	{
+		return false;
+	}
+
+	return FunctionRef.EndsWith(TEXT("::Add_DoubleDouble"), ESearchCase::IgnoreCase) ||
+		FunctionRef.EndsWith(TEXT("::Add_VectorVector"), ESearchCase::IgnoreCase) ||
+		FunctionRef.EndsWith(TEXT("::Multiply_VectorVector"), ESearchCase::IgnoreCase) ||
+		FunctionRef.EndsWith(TEXT("::Multiply_VectorFloat"), ESearchCase::IgnoreCase);
+}
+
+bool IsTrackedTraversalNodeJson_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson)
+{
+	if (!NodeJson.IsValid())
+	{
+		return false;
+	}
+
+	FString NodeGuidText;
+	if (NodeJson->TryGetStringField(TEXT("node_guid"), NodeGuidText) &&
+		IsTrackedTraversalNodeGuid_ImportBpy(NodeGuidText))
+	{
+		return true;
+	}
+
+	FString FunctionRef;
+	NodeJson->TryGetStringField(TEXT("function_ref"), FunctionRef);
+	return IsTrackedTraversalFunctionRef_ImportBpy(FunctionRef);
+}
+
+bool IsTrackedTraversalNodeInstance_ImportBpy(const UEdGraphNode* Node)
+{
+	if (!Node)
+	{
+		return false;
+	}
+
+	if (IsTrackedTraversalNodeGuid_ImportBpy(Node->NodeGuid.ToString(EGuidFormats::Digits)))
+	{
+		return true;
+	}
+
+	const UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node);
+	if (!CallNode)
+	{
+		return false;
+	}
+
+	if (const UFunction* TargetFunction = CallNode->GetTargetFunction())
+	{
+		const FString QualifiedName =
+			TargetFunction->GetOwnerClass()
+				? FString::Printf(TEXT("%s::%s"), *TargetFunction->GetOwnerClass()->GetName(), *TargetFunction->GetName())
+				: TargetFunction->GetName();
+		if (IsTrackedTraversalFunctionRef_ImportBpy(QualifiedName))
+		{
+			return true;
+		}
+	}
+
+	const FString NodeTitle = CallNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
+	if (NodeTitle.Contains(TEXT("vector + vector"), ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+	return NodeTitle.Contains(TEXT("float + float"), ESearchCase::IgnoreCase) ||
+		NodeTitle.Contains(TEXT("vector * vector"), ESearchCase::IgnoreCase) ||
+		NodeTitle.Contains(TEXT("vector * float"), ESearchCase::IgnoreCase);
+}
+
+void LogTrackedTraversalNodeState_ImportBpy(const TCHAR* Stage, const TSharedPtr<FJsonObject>& NodeJson, UEdGraphNode* Node)
+{
+	if (!Node)
+	{
+		return;
+	}
+	if (!IsTrackedTraversalNodeJson_ImportBpy(NodeJson) && !IsTrackedTraversalNodeInstance_ImportBpy(Node))
+	{
+		return;
+	}
+
+	FString JsonGuidText;
+	FString FunctionRef;
+	if (NodeJson.IsValid())
+	{
+		NodeJson->TryGetStringField(TEXT("node_guid"), JsonGuidText);
+		NodeJson->TryGetStringField(TEXT("function_ref"), FunctionRef);
+	}
+
+	UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node);
+	FString TargetFunctionName = TEXT("<none>");
+	if (CallNode && CallNode->GetTargetFunction())
+	{
+		if (UClass* OwnerClass = CallNode->GetTargetFunction()->GetOwnerClass())
+		{
+			TargetFunctionName = FString::Printf(
+				TEXT("%s::%s"),
+				*OwnerClass->GetName(),
+				*CallNode->GetTargetFunction()->GetName());
+		}
+		else
+		{
+			TargetFunctionName = CallNode->GetTargetFunction()->GetName();
+		}
+	}
+
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[IBPY_TRACE] stage=%s json_guid=%s node_guid=%s class=%s title=%s function_ref=%s target=%s pins=%d"),
+		Stage ? Stage : TEXT("<none>"),
+		*JsonGuidText,
+		*Node->NodeGuid.ToString(EGuidFormats::Digits),
+		*Node->GetClass()->GetName(),
+		*Node->GetNodeTitle(ENodeTitleType::ListView).ToString(),
+		*FunctionRef,
+		*TargetFunctionName,
+		Node->Pins.Num());
+
+	for (UEdGraphPin* Pin : Node->Pins)
+	{
+		if (!Pin)
+		{
+			continue;
+		}
+
+		FString LinkedPinsText;
+		for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+		{
+			if (!LinkedPin || !LinkedPin->GetOwningNode())
+			{
+				continue;
+			}
+
+			if (!LinkedPinsText.IsEmpty())
+			{
+				LinkedPinsText += TEXT(",");
+			}
+			LinkedPinsText += FString::Printf(
+				TEXT("%s.%s"),
+				*DescribeNode_ImportBpy(LinkedPin->GetOwningNode()),
+				*LinkedPin->GetName());
+		}
+
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[IBPY_TRACE] stage=%s node_guid=%s pin=%s dir=%s cat=%s sub=%s container=%d default='%s' links=%d to=[%s]"),
+			Stage ? Stage : TEXT("<none>"),
+			*Node->NodeGuid.ToString(EGuidFormats::Digits),
+			*Pin->GetName(),
+			Pin->Direction == EGPD_Input ? TEXT("In") : TEXT("Out"),
+			*Pin->PinType.PinCategory.ToString(),
+			*Pin->PinType.PinSubCategory.ToString(),
+			(int32)Pin->PinType.ContainerType,
+			*Pin->GetDefaultAsString(),
+			Pin->LinkedTo.Num(),
+			*LinkedPinsText);
+	}
+}
+
+void LogTrackedTraversalNodesFromMap_ImportBpy(
+	const TCHAR* Stage,
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
+	const TMap<FString, UEdGraphNode*>& NodeMap)
+{
+	if (!NodesArr)
+	{
+		return;
+	}
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		FString Uid;
+		NodeObj->TryGetStringField(TEXT("uid"), Uid);
+		if (Uid.IsEmpty())
+		{
+			continue;
+		}
+
+		UEdGraphNode* const* NodePtr = NodeMap.Find(Uid);
+		if (!NodePtr || !*NodePtr)
+		{
+			continue;
+		}
+
+		LogTrackedTraversalNodeState_ImportBpy(Stage, NodeObj, *NodePtr);
+	}
 }
 
 FString GetSpecialNodePropString_ImportBpy(const TSharedPtr<FJsonObject>& NodeObj, const TCHAR* Key)
@@ -677,7 +904,7 @@ bool RestoreAnimGetterBindings_ImportBpy(
 		AnimGetterNode->CachedTitle = TargetFunction->GetDisplayNameText();
 	}
 
-	if (AnimGetterNode->HasValidBlueprint())
+	if (FBlueprintEditorUtils::FindBlueprintForNode(AnimGetterNode))
 	{
 		AnimGetterNode->ReconstructNode();
 	}
@@ -2943,7 +3170,6 @@ bool ImportChooserPropertyTextField_ImportBpy(
 		OutError = FString::Printf(TEXT("%s must be a string."), JsonFieldName);
 		return false;
 	}
-	TextValue = RemapBlueprintReferencesInSerializedText_ImportBpy(TextValue);
 
 	FProperty* Property = FindFProperty<FProperty>(Asset->GetClass(), PropertyName);
 	if (!Property)
@@ -3045,7 +3271,6 @@ bool RestoreChooserTableData_ImportBpy(
 			OutError = TEXT("chooser_output_object_type must be a string.");
 			return false;
 		}
-		OutputClassPath = RemapBlueprintReferenceForCurrentImport_ImportBpy(OutputClassPath, true);
 
 		UClass* OutputClass = nullptr;
 		if (!OutputClassPath.IsEmpty())
@@ -3074,7 +3299,6 @@ bool RestoreChooserTableData_ImportBpy(
 			OutError = TEXT("chooser_fallback_asset must be a string.");
 			return false;
 		}
-		FallbackAssetPath = RemapBlueprintReferenceForCurrentImport_ImportBpy(FallbackAssetPath, false);
 
 		FStructProperty* FallbackProperty = FindFProperty<FStructProperty>(Asset->GetClass(), TEXT("FallbackResult"));
 		if (!FallbackProperty || FallbackProperty->Struct != FInstancedStruct::StaticStruct())
@@ -3176,7 +3400,7 @@ bool RestoreChooserTableData_ImportBpy(
 			const FString AssetPath = Value->AsString().TrimStartAndEnd();
 			if (!AssetPath.IsEmpty())
 			{
-				ResultAssetPaths.Add(RemapBlueprintReferenceForCurrentImport_ImportBpy(AssetPath, false));
+				ResultAssetPaths.Add(AssetPath);
 			}
 		}
 
@@ -3635,382 +3859,6 @@ FString GetNodePropString_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson, con
 	return Value;
 }
 
-bool HasEvaluateChooserMetadata_ImportBpy(
-	const TSharedPtr<FJsonObject>& NodeJson,
-	FString& OutMissingProperties)
-{
-	OutMissingProperties.Reset();
-
-	if (!NodeJson.IsValid())
-	{
-		OutMissingProperties = TEXT("node_json");
-		return false;
-	}
-
-	const TSharedPtr<FJsonObject>* NodePropsObj = nullptr;
-	if (!NodeJson->TryGetObjectField(TEXT("node_props"), NodePropsObj) || !NodePropsObj || !NodePropsObj->IsValid())
-	{
-		OutMissingProperties = TEXT("node_props");
-		return false;
-	}
-
-	auto HasNonEmptyStringProperty = [NodePropsObj](const TCHAR* PropertyName) -> bool
-	{
-		if (!PropertyName)
-		{
-			return false;
-		}
-
-		FString PropertyValue;
-		return (*NodePropsObj)->TryGetStringField(PropertyName, PropertyValue) && !PropertyValue.IsEmpty();
-	};
-
-	TArray<FString> MissingProperties;
-	if (!HasNonEmptyStringProperty(TEXT("Chooser")))
-	{
-		MissingProperties.Add(TEXT("Chooser"));
-	}
-	if (!HasNonEmptyStringProperty(TEXT("Mode")))
-	{
-		MissingProperties.Add(TEXT("Mode"));
-	}
-
-	if (MissingProperties.Num() > 0)
-	{
-		OutMissingProperties = FString::Join(MissingProperties, TEXT(", "));
-		return false;
-	}
-
-	return true;
-}
-
-bool HasEvaluateChooserAssetBound_ImportBpy(const UEdGraphNode* Node)
-{
-	if (!Node)
-	{
-		return false;
-	}
-
-	const FString NodeClassName = Node->GetClass() ? Node->GetClass()->GetName() : FString();
-	if (NodeClassName != TEXT("K2Node_EvaluateChooser") && NodeClassName != TEXT("K2Node_EvaluateChooser2"))
-	{
-		return false;
-	}
-
-	const FObjectPropertyBase* ChooserProperty =
-		FindFProperty<FObjectPropertyBase>(Node->GetClass(), FName(TEXT("Chooser")));
-	if (!ChooserProperty)
-	{
-		return false;
-	}
-
-	return ChooserProperty->GetObjectPropertyValue_InContainer(Node) != nullptr;
-}
-
-bool IsEvaluateChooserNodeClass_ImportBpy(const FString& NodeClassName)
-{
-	return NodeClassName == TEXT("K2Node_EvaluateChooser") || NodeClassName == TEXT("K2Node_EvaluateChooser2");
-}
-
-FObjectPropertyBase* FindEvaluateChooserProperty_ImportBpy(const UEdGraphNode* Node)
-{
-	if (!Node || !Node->GetClass())
-	{
-		return nullptr;
-	}
-
-	const FString NodeClassName = Node->GetClass()->GetName();
-	if (!IsEvaluateChooserNodeClass_ImportBpy(NodeClassName))
-	{
-		return nullptr;
-	}
-
-	return FindFProperty<FObjectPropertyBase>(Node->GetClass(), FName(TEXT("Chooser")));
-}
-
-bool ObjectSerializedPropertyTextContains_ImportBpy(UObject* Object, const FString& Needle)
-{
-	if (!Object || Needle.IsEmpty())
-	{
-		return false;
-	}
-
-	for (TFieldIterator<FProperty> It(Object->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
-	{
-		FProperty* Property = *It;
-		if (!Property || Property->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated))
-		{
-			continue;
-		}
-
-		void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Object);
-		if (!ValuePtr)
-		{
-			continue;
-		}
-
-		FString ExportedValue;
-		Property->ExportTextItem_Direct(ExportedValue, ValuePtr, nullptr, Object, PPF_None);
-		if (!ExportedValue.IsEmpty() &&
-			ExportedValue.Contains(Needle, ESearchCase::CaseSensitive))
-		{
-			return true;
-		}
-	}
-
-	return false;
-}
-
-bool RemapObjectSerializedPropertyTextInPlace_ImportBpy(
-	UObject* Object,
-	const FString& SourceText,
-	const FString& TargetText,
-	bool& bOutChanged,
-	FString& OutError)
-{
-	bOutChanged = false;
-	if (!Object ||
-		SourceText.IsEmpty() ||
-		TargetText.IsEmpty() ||
-		SourceText.Equals(TargetText, ESearchCase::CaseSensitive))
-	{
-		return true;
-	}
-
-	Object->Modify();
-
-	for (TFieldIterator<FProperty> It(Object->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
-	{
-		FProperty* Property = *It;
-		if (!Property || Property->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated))
-		{
-			continue;
-		}
-
-		void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Object);
-		if (!ValuePtr)
-		{
-			continue;
-		}
-
-		FString ExportedValue;
-		Property->ExportTextItem_Direct(ExportedValue, ValuePtr, nullptr, Object, PPF_None);
-		if (ExportedValue.IsEmpty() ||
-			!ExportedValue.Contains(SourceText, ESearchCase::CaseSensitive))
-		{
-			continue;
-		}
-
-		FString RemappedValue = ExportedValue;
-		RemappedValue.ReplaceInline(*SourceText, *TargetText, ESearchCase::CaseSensitive);
-		if (RemappedValue.Equals(ExportedValue, ESearchCase::CaseSensitive))
-		{
-			continue;
-		}
-
-		if (!Property->ImportText_Direct(*RemappedValue, ValuePtr, Object, PPF_None))
-		{
-			OutError = FString::Printf(
-				TEXT("Failed to remap chooser property '%s' on %s"),
-				*Property->GetName(),
-				*Object->GetPathName());
-			return false;
-		}
-
-		bOutChanged = true;
-	}
-
-	return true;
-}
-
-FString BuildRetargetedChooserAssetPathForBlueprint_ImportBpy(
-	const FString& SourceChooserAssetPath,
-	const FString& TargetBlueprintPath)
-{
-	const FString TargetBlueprintObjectPath = NormalizeBlueprintObjectPath_ImportBpy(TargetBlueprintPath);
-	const FString TargetBlueprintPackagePath =
-		FPackageName::ObjectPathToPackageName(TargetBlueprintObjectPath);
-	const FString TargetDirectory = FPackageName::GetLongPackagePath(TargetBlueprintPackagePath);
-	const FString TargetBlueprintAssetName =
-		FPackageName::ObjectPathToObjectName(TargetBlueprintObjectPath);
-	const FString SourceChooserAssetName =
-		FPackageName::GetLongPackageAssetName(SourceChooserAssetPath);
-
-	if (TargetDirectory.IsEmpty() || TargetBlueprintAssetName.IsEmpty() || SourceChooserAssetName.IsEmpty())
-	{
-		return FString();
-	}
-
-	return FString::Printf(
-		TEXT("%s/%s_For_%s"),
-		*TargetDirectory,
-		*SourceChooserAssetName,
-		*TargetBlueprintAssetName);
-}
-
-bool RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(
-	UBlueprint* BP,
-	bool& bOutAnyRetargeted,
-	FString& OutError)
-{
-	bOutAnyRetargeted = false;
-
-	if (!BP ||
-		GCurrentImportSourceBlueprintPath_ImportBpy.IsEmpty() ||
-		GCurrentImportTargetBlueprintPath_ImportBpy.IsEmpty())
-	{
-		return true;
-	}
-
-	const FString SourceGeneratedClassPath =
-		BuildGeneratedClassObjectPathFromBlueprintPath_ImportBpy(GCurrentImportSourceBlueprintPath_ImportBpy);
-	const FString TargetGeneratedClassPath =
-		BuildGeneratedClassObjectPathFromBlueprintPath_ImportBpy(GCurrentImportTargetBlueprintPath_ImportBpy);
-
-	if (SourceGeneratedClassPath.IsEmpty() ||
-		TargetGeneratedClassPath.IsEmpty() ||
-		SourceGeneratedClassPath.Equals(TargetGeneratedClassPath, ESearchCase::CaseSensitive))
-	{
-		return true;
-	}
-
-	TArray<UEdGraph*> RootGraphs;
-	BP->GetAllGraphs(RootGraphs);
-
-	TArray<UEdGraph*> AllGraphs;
-	TSet<UEdGraph*> VisitedGraphs;
-	for (UEdGraph* RootGraph : RootGraphs)
-	{
-		GatherReachableGraphs_ImportBpy(RootGraph, VisitedGraphs, AllGraphs);
-	}
-
-	TMap<FString, UObject*> SourceChooserAssetToRetargetedAsset;
-	bool bUpdatedAnyNode = false;
-	bool bCreatedOrUpdatedAnyChooserAsset = false;
-
-	for (UEdGraph* Graph : AllGraphs)
-	{
-		if (!Graph)
-		{
-			continue;
-		}
-
-		for (UEdGraphNode* Node : Graph->Nodes)
-		{
-			if (!Node)
-			{
-				continue;
-			}
-
-			FObjectPropertyBase* ChooserProperty = FindEvaluateChooserProperty_ImportBpy(Node);
-			if (!ChooserProperty)
-			{
-				continue;
-			}
-
-			UObject* ChooserAsset = ChooserProperty->GetObjectPropertyValue_InContainer(Node);
-			if (!IsChooserTableAsset_ImportBpy(ChooserAsset))
-			{
-				continue;
-			}
-
-			const FString SourceChooserAssetPath =
-				FPackageName::ObjectPathToPackageName(ChooserAsset->GetPathName());
-			if (SourceChooserAssetPath.IsEmpty())
-			{
-				continue;
-			}
-
-			UObject* RetargetedChooserAsset = nullptr;
-			if (UObject** ExistingAsset = SourceChooserAssetToRetargetedAsset.Find(SourceChooserAssetPath))
-			{
-				RetargetedChooserAsset = *ExistingAsset;
-			}
-			else
-			{
-				const bool bNeedsRetarget =
-					ObjectSerializedPropertyTextContains_ImportBpy(ChooserAsset, SourceGeneratedClassPath);
-				if (!bNeedsRetarget)
-				{
-					RetargetedChooserAsset = ChooserAsset;
-				}
-				else
-				{
-					const FString RetargetedChooserAssetPath =
-						BuildRetargetedChooserAssetPathForBlueprint_ImportBpy(
-							SourceChooserAssetPath,
-							GCurrentImportTargetBlueprintPath_ImportBpy);
-					if (RetargetedChooserAssetPath.IsEmpty())
-					{
-						OutError = FString::Printf(
-							TEXT("Failed to build retargeted chooser asset path for %s"),
-							*SourceChooserAssetPath);
-						return false;
-					}
-
-					if (!UEditorAssetLibrary::DoesAssetExist(RetargetedChooserAssetPath))
-					{
-						if (!UEditorAssetLibrary::DuplicateAsset(SourceChooserAssetPath, RetargetedChooserAssetPath))
-						{
-							OutError = FString::Printf(
-								TEXT("Failed to duplicate chooser table %s -> %s"),
-								*SourceChooserAssetPath,
-								*RetargetedChooserAssetPath);
-							return false;
-						}
-					}
-
-					RetargetedChooserAsset = UEditorAssetLibrary::LoadAsset(RetargetedChooserAssetPath);
-					if (!RetargetedChooserAsset)
-					{
-						OutError = FString::Printf(
-							TEXT("Failed to load retargeted chooser table: %s"),
-							*RetargetedChooserAssetPath);
-						return false;
-					}
-
-					bool bChooserAssetChanged = false;
-					if (!RemapObjectSerializedPropertyTextInPlace_ImportBpy(
-							RetargetedChooserAsset,
-							SourceGeneratedClassPath,
-							TargetGeneratedClassPath,
-							bChooserAssetChanged,
-							OutError))
-					{
-						return false;
-					}
-
-					if (bChooserAssetChanged)
-					{
-						RetargetedChooserAsset->MarkPackageDirty();
-						UEditorAssetLibrary::SaveAsset(RetargetedChooserAssetPath, false);
-					}
-
-					bCreatedOrUpdatedAnyChooserAsset = true;
-				}
-
-				SourceChooserAssetToRetargetedAsset.Add(SourceChooserAssetPath, RetargetedChooserAsset);
-			}
-
-			if (RetargetedChooserAsset && RetargetedChooserAsset != ChooserAsset)
-			{
-				Node->Modify();
-				ChooserProperty->SetObjectPropertyValue_InContainer(Node, RetargetedChooserAsset);
-				bUpdatedAnyNode = true;
-			}
-		}
-	}
-
-	if (bUpdatedAnyNode || bCreatedOrUpdatedAnyChooserAsset)
-	{
-		FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
-		BP->MarkPackageDirty();
-		bOutAnyRetargeted = true;
-	}
-
-	return true;
-}
-
 bool NodeJsonContainsPinName_ImportBpy(
 	const TSharedPtr<FJsonObject>& NodeJson,
 	const TCHAR* FieldName,
@@ -4227,47 +4075,6 @@ UEdGraph* ResolveMacroGraph_ImportBpy(UEdGraph* ContextGraph, const FString& Gra
 	return ResolveMacroGraph_ImportBpy(GraphPath, MacroName);
 }
 
-UBlueprint* ResolveOwningBlueprintForGraph_ImportBpy(UEdGraph* Graph)
-{
-	if (!Graph)
-	{
-		return nullptr;
-	}
-
-	if (UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(Graph))
-	{
-		return Blueprint;
-	}
-
-	if (UEdGraphNode* OuterNode = Cast<UEdGraphNode>(Graph->GetOuter()))
-	{
-		if (UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(OuterNode))
-		{
-			return Blueprint;
-		}
-
-		if (UEdGraph* OwnerGraph = OuterNode->GetGraph())
-		{
-			if (UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(OwnerGraph))
-			{
-				return Blueprint;
-			}
-		}
-	}
-
-	if (UBlueprint* OuterBlueprint = Graph->GetTypedOuter<UBlueprint>())
-	{
-		return OuterBlueprint;
-	}
-
-	return nullptr;
-}
-
-UAnimBlueprint* ResolveOwningAnimBlueprintForGraph_ImportBpy(UEdGraph* Graph)
-{
-	return Cast<UAnimBlueprint>(ResolveOwningBlueprintForGraph_ImportBpy(Graph));
-}
-
 UFunction* ResolveFunctionOnBlueprintContext_ImportBpy(UEdGraph* Graph, const FString& FuncName)
 {
 	if (!Graph || FuncName.IsEmpty())
@@ -4280,7 +4087,7 @@ UFunction* ResolveFunctionOnBlueprintContext_ImportBpy(UEdGraph* Graph, const FS
 		return Class ? Class->FindFunctionByName(FName(*FuncName)) : nullptr;
 	};
 
-	if (UBlueprint* Blueprint = ResolveOwningBlueprintForGraph_ImportBpy(Graph))
+	if (UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(Graph))
 	{
 		if (UFunction* Func = FindOnClass(Blueprint->SkeletonGeneratedClass))
 		{
@@ -4383,7 +4190,7 @@ UFunction* ResolveSelfContextFunction_ImportBpy(UEdGraph* Graph, const FString& 
 		}
 	}
 
-	if (UBlueprint* Blueprint = ResolveOwningBlueprintForGraph_ImportBpy(Graph))
+	if (UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(Graph))
 	{
 		for (const FString& Candidate : Candidates)
 		{
@@ -4480,23 +4287,6 @@ int32 GetGraphImportPriority_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson)
 		return 4;
 	}
 	return 5;
-}
-
-bool IsNodeOwnedNestedGraphJson_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson)
-{
-	if (!GraphJson.IsValid())
-	{
-		return false;
-	}
-
-	FString GraphOuterKind;
-	if (!GraphJson->TryGetStringField(TEXT("graph_outer"), GraphOuterKind))
-	{
-		return false;
-	}
-
-	GraphOuterKind.TrimStartAndEndInline();
-	return GraphOuterKind.Equals(TEXT("Node"), ESearchCase::IgnoreCase);
 }
 
 void SetUseCachedPoseNameOfCache_ImportBpy(UAnimGraphNode_UseCachedPose* UseCachedPoseNode, const FString& CachePoseName)
@@ -4980,32 +4770,6 @@ bool IsObjectLikePinCategory_ImportBpy(const FName& PinCategory)
 		PinCategory == UEdGraphSchema_K2::PC_SoftClass;
 }
 
-bool IsSimpleLiteralDefaultForPromotable_ImportBpy(const FString& DefaultValue)
-{
-	if (DefaultValue.IsEmpty())
-	{
-		return false;
-	}
-
-	if (DefaultValue.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
-		DefaultValue.Equals(TEXT("false"), ESearchCase::IgnoreCase))
-	{
-		return true;
-	}
-
-	double ParsedNumber = 0.0;
-	return LexTryParseString(ParsedNumber, *DefaultValue);
-}
-
-bool IsScalarLiteralPinCategory_ImportBpy(const FName& PinCategory)
-{
-	return PinCategory == UEdGraphSchema_K2::PC_Boolean ||
-		PinCategory == UEdGraphSchema_K2::PC_Byte ||
-		PinCategory == UEdGraphSchema_K2::PC_Int ||
-		PinCategory == UEdGraphSchema_K2::PC_Int64 ||
-		PinCategory == UEdGraphSchema_K2::PC_Real;
-}
-
 void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>& Value)
 {
 	if (!Pin || !Value.IsValid())
@@ -5016,14 +4780,6 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 	const FString DefaultValue = JsonValueToDefaultString_ImportBpy(Value);
 	const UEdGraphSchema* Schema = Pin->GetSchema();
 	const FName& PinCategory = Pin->PinType.PinCategory;
-	const bool bIsWildcardPin = PinCategory == UEdGraphSchema_K2::PC_Wildcard;
-	const FString OwningNodeClassName =
-		Pin->GetOwningNode() && Pin->GetOwningNode()->GetClass()
-			? Pin->GetOwningNode()->GetClass()->GetName()
-			: FString();
-	const bool bIsPromotableOperatorPin =
-		OwningNodeClassName == TEXT("K2Node_PromotableOperator") ||
-		OwningNodeClassName == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
 
 	if (IsObjectLikePinCategory_ImportBpy(PinCategory) && !DefaultValue.IsEmpty())
 	{
@@ -5049,6 +4805,7 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 				Pin->DefaultObject = DefaultObject;
 			}
 			Pin->DefaultValue.Reset();
+			Pin->AutogeneratedDefaultValue.Reset();
 
 			return;
 		}
@@ -5071,39 +4828,11 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 	if (Schema)
 	{
 		Schema->TrySetDefaultValue(*Pin, DefaultValue, false);
-		if (!bIsWildcardPin &&
-			!bIsPromotableOperatorPin &&
-			!Pin->DefaultValue.Equals(DefaultValue, ESearchCase::CaseSensitive))
-		{
-			Pin->DefaultValue = DefaultValue;
-		}
 	}
 	else
 	{
-		if (!bIsWildcardPin && !bIsPromotableOperatorPin)
-		{
-			Pin->DefaultValue = DefaultValue;
-		}
-	}
-
-	// Promotable operator pins can lose explicit numeric defaults (e.g. +2, -0.5)
-	// after type promotion/rebind/reconstruct passes. If schema assignment did not
-	// stick, restore the serialized literal on safe input pins.
-	const bool bCanForcePromotableDefault =
-		bIsPromotableOperatorPin &&
-		Pin->Direction == EGPD_Input &&
-		IsScalarLiteralPinCategory_ImportBpy(Pin->PinType.PinCategory) &&
-		Pin->LinkedTo.Num() == 0 &&
-		IsSimpleLiteralDefaultForPromotable_ImportBpy(DefaultValue) &&
-		!Pin->DefaultValue.Equals(DefaultValue, ESearchCase::CaseSensitive);
-	if (bCanForcePromotableDefault)
-	{
 		Pin->DefaultValue = DefaultValue;
 	}
-
-	Pin->bDefaultValueIsIgnored = false;
-	// Keep the pin's auto-generated default intact. K2 uses this field to tell whether
-	// an imported value is an explicit override relative to a function signature default.
 }
 
 UScriptStruct* ResolveCommonStructType_ImportBpy(const FString& TypeName)
@@ -5306,15 +5035,6 @@ FString NormalizeRequestedPinName_ImportBpy(UEdGraphNode* Node, const FString& R
 		{
 			return UEdGraphSchema_K2::PN_Else.ToString();
 		}
-	}
-
-	// UE 5.7 chooser nodes can expose runtime pin names without the legacy "S_" prefix.
-	// Normalize exported legacy names so we bind to durable pins and avoid stale links.
-	if (IsEvaluateChooserNode_ImportBpy(Node) &&
-		RequestedPinName.StartsWith(TEXT("S_"), ESearchCase::IgnoreCase) &&
-		RequestedPinName.Len() > 2)
-	{
-		return RequestedPinName.RightChop(2);
 	}
 
 	return RequestedPinName;
@@ -5626,83 +5346,8 @@ void RestoreBlendListByEnumEntries_ImportBpy(
 	SetBlendListByEnumVisibleEntries_ImportBpy(BlendListByEnumNode, RequestedEntries);
 }
 
-bool IsEvaluateChooserNode_ImportBpy(const UEdGraphNode* Node)
-{
-	if (!Node)
-	{
-		return false;
-	}
-
-	const FString NodeClassName = Node->GetClass()->GetName();
-	return NodeClassName == TEXT("K2Node_EvaluateChooser") || NodeClassName == TEXT("K2Node_EvaluateChooser2");
-}
-
-void EnsureEvaluateChooserPinsForRequest_ImportBpy(
-	UEdGraphNode* Node,
-	const FString& RequestedPinName,
-	EEdGraphPinDirection Direction)
-{
-	if (!IsEvaluateChooserNode_ImportBpy(Node) || RequestedPinName.IsEmpty())
-	{
-		return;
-	}
-
-	const FString CanonicalPinName = StripGuidSuffix_ImportBpy(RequestedPinName);
-	if (CanonicalPinName.IsEmpty())
-	{
-		return;
-	}
-
-	if (Node->FindPin(FName(*CanonicalPinName), Direction))
-	{
-		return;
-	}
-
-	if (Direction == EGPD_Input && CanonicalPinName.Equals(TEXT("AnimInstance"), ESearchCase::IgnoreCase))
-	{
-		Node->CreatePin(EGPD_Input, UEdGraphSchema_K2::PC_Object, UAnimInstance::StaticClass(), FName(TEXT("AnimInstance")));
-		return;
-	}
-
-	if (Direction == EGPD_Output && CanonicalPinName.Equals(TEXT("Result"), ESearchCase::IgnoreCase))
-	{
-		if (HasEvaluateChooserAssetBound_ImportBpy(Node))
-		{
-			Node->ReconstructNode();
-		}
-		return;
-	}
-
-	if (CanonicalPinName.StartsWith(TEXT("S_"), ESearchCase::IgnoreCase))
-	{
-		const FString PinNameWithoutPrefix = CanonicalPinName.RightChop(2);
-		if (!PinNameWithoutPrefix.IsEmpty())
-		{
-			if (Node->FindPin(FName(*PinNameWithoutPrefix), Direction))
-			{
-				return;
-			}
-
-			// Let chooser node rebuild canonical pins from the bound table instead of
-			// creating synthetic legacy S_* pins that become stale after reconstruct.
-			if (HasEvaluateChooserAssetBound_ImportBpy(Node))
-			{
-				Node->ReconstructNode();
-				if (Node->FindPin(FName(*PinNameWithoutPrefix), Direction))
-				{
-					return;
-				}
-			}
-		}
-
-		return;
-	}
-}
-
 void EnsureDynamicPinsForRequest_ImportBpy(UEdGraphNode* Node, const FString& RequestedPinName, EEdGraphPinDirection Direction)
 {
-	EnsureEvaluateChooserPinsForRequest_ImportBpy(Node, RequestedPinName, Direction);
-
 	if (UAnimGraphNode_LinkedAnimLayer* LinkedLayerNode = Cast<UAnimGraphNode_LinkedAnimLayer>(Node))
 	{
 		if (Direction == EGPD_Input && !RequestedPinName.IsEmpty())
@@ -5862,17 +5507,6 @@ UEdGraphPin* FindExistingPinFlexible_ImportBpy(UEdGraphNode* Node, const FString
 		else if (NormalizedRequested.Equals(TEXT("exec"), ESearchCase::IgnoreCase))
 		{
 			CandidateNames.Add(TEXT("execute"));
-		}
-	}
-	if (IsEvaluateChooserNode_ImportBpy(Node))
-	{
-		if (NormalizedRequested.StartsWith(TEXT("S_"), ESearchCase::IgnoreCase) && NormalizedRequested.Len() > 2)
-		{
-			CandidateNames.Add(NormalizedRequested.RightChop(2));
-		}
-		else if (!NormalizedRequested.IsEmpty())
-		{
-			CandidateNames.Add(FString(TEXT("S_")) + NormalizedRequested);
 		}
 	}
 	if (UK2Node_Tunnel* TunnelNode = Cast<UK2Node_Tunnel>(Node))
@@ -7614,185 +7248,6 @@ bool ImportComponents_ImportBpy(
 	return true;
 }
 
-bool IsBlendStackGraphLike_ImportBpy(const UEdGraph* Graph)
-{
-	if (!Graph)
-	{
-		return false;
-	}
-
-	const FString GraphClassName = Graph->GetClass() ? Graph->GetClass()->GetName() : FString();
-	if (GraphClassName.Contains(TEXT("AnimationBlendStackGraph"), ESearchCase::IgnoreCase))
-	{
-		return true;
-	}
-
-	if (const UEdGraphSchema* Schema = Graph->GetSchema())
-	{
-		const FString SchemaClassName = Schema->GetClass() ? Schema->GetClass()->GetName() : FString();
-		if (SchemaClassName.Contains(TEXT("AnimationBlendStackGraphSchema"), ESearchCase::IgnoreCase))
-		{
-			return true;
-		}
-	}
-
-	return false;
-}
-
-UEdGraph* ResolveBlendStackGraph_ImportBpy(UEdGraphNode* Node)
-{
-	if (!Node || !Node->GetClass())
-	{
-		return nullptr;
-	}
-
-	const FString NodeClassName = Node->GetClass()->GetName();
-	if (!NodeClassName.StartsWith(TEXT("AnimGraphNode_BlendStack")))
-	{
-		return nullptr;
-	}
-
-	auto TryGetGraphProperty = [Node](const TCHAR* PropertyName) -> UEdGraph*
-	{
-		if (!PropertyName)
-		{
-			return nullptr;
-		}
-
-		const FObjectPropertyBase* GraphProperty =
-			FindFProperty<FObjectPropertyBase>(Node->GetClass(), FName(PropertyName));
-		if (!GraphProperty || !GraphProperty->PropertyClass ||
-			!GraphProperty->PropertyClass->IsChildOf(UEdGraph::StaticClass()))
-		{
-			return nullptr;
-		}
-
-		return Cast<UEdGraph>(GraphProperty->GetObjectPropertyValue_InContainer(Node));
-	};
-
-	constexpr const TCHAR* PreferredPropertyNames[] = {
-		TEXT("BoundGraph"),
-		TEXT("BlendStackGraph"),
-		TEXT("AnimationBlendStackGraph"),
-		TEXT("EditorBlendStackGraph")
-	};
-	for (const TCHAR* PropertyName : PreferredPropertyNames)
-	{
-		if (UEdGraph* Graph = TryGetGraphProperty(PropertyName))
-		{
-			if ((IsBlendStackGraphLike_ImportBpy(Graph) || FString(PropertyName).Equals(TEXT("BoundGraph"), ESearchCase::IgnoreCase)) &&
-				Graph->GetOuter() == Node)
-			{
-				return Graph;
-			}
-		}
-	}
-
-	UEdGraph* BestGraph = nullptr;
-	int32 BestScore = MIN_int32;
-	for (TFieldIterator<FProperty> It(Node->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
-	{
-		const FObjectPropertyBase* GraphProperty = CastField<FObjectPropertyBase>(*It);
-		if (!GraphProperty || !GraphProperty->PropertyClass ||
-			!GraphProperty->PropertyClass->IsChildOf(UEdGraph::StaticClass()))
-		{
-			continue;
-		}
-
-		UEdGraph* Graph = Cast<UEdGraph>(GraphProperty->GetObjectPropertyValue_InContainer(Node));
-		if (!Graph)
-		{
-			continue;
-		}
-
-		const FString PropertyName = GraphProperty->GetName();
-		const bool bPropertyLooksRelevant =
-			PropertyName.Equals(TEXT("BoundGraph"), ESearchCase::IgnoreCase) ||
-			PropertyName.Contains(TEXT("BlendStack"), ESearchCase::IgnoreCase) ||
-			PropertyName.Contains(TEXT("BoundGraph"), ESearchCase::IgnoreCase);
-		if (!bPropertyLooksRelevant && !IsBlendStackGraphLike_ImportBpy(Graph))
-		{
-			continue;
-		}
-
-		int32 Score = Graph->Nodes.Num();
-		if (PropertyName.Equals(TEXT("BoundGraph"), ESearchCase::IgnoreCase))
-		{
-			Score += 1000;
-		}
-		if (PropertyName.Contains(TEXT("BlendStack"), ESearchCase::IgnoreCase))
-		{
-			Score += 500;
-		}
-		if (IsBlendStackGraphLike_ImportBpy(Graph))
-		{
-			Score += 2000;
-		}
-		if (Graph->GetOuter() == Node)
-		{
-			Score += 4000;
-		}
-
-		if (!BestGraph || Score > BestScore)
-		{
-			BestGraph = Graph;
-			BestScore = Score;
-		}
-	}
-
-	return BestGraph;
-}
-
-FString DescribeGraphOuterKind_ImportBpy(const UEdGraph* Graph)
-{
-	if (!Graph)
-	{
-		return FString();
-	}
-
-	const UObject* Outer = Graph->GetOuter();
-	if (!Outer)
-	{
-		return TEXT("None");
-	}
-
-	if (Outer->IsA<UEdGraphNode>())
-	{
-		return TEXT("Node");
-	}
-	if (Outer->IsA<UBlueprint>())
-	{
-		return TEXT("Blueprint");
-	}
-
-	return Outer->GetClass() ? Outer->GetClass()->GetName() : TEXT("Unknown");
-}
-
-bool EnsureBlendStackGraphOwnership_ImportBpy(
-	UEdGraphNode* BlendStackNode,
-	UEdGraph* BlendStackGraph,
-	FString& OutError)
-{
-	if (!BlendStackNode || !BlendStackGraph)
-	{
-		return true;
-	}
-
-	if (BlendStackGraph->GetOuter() == BlendStackNode)
-	{
-		return true;
-	}
-
-	const UObject* Outer = BlendStackGraph->GetOuter();
-	OutError = FString::Printf(
-		TEXT("BlendStack graph ownership mismatch on node %s: expected graph outer '%s' (Node), got '%s' (outer_kind=%s)."),
-		*DescribeNode_ImportBpy(BlendStackNode),
-		*BlendStackNode->GetName(),
-		Outer ? *Outer->GetName() : TEXT("<null>"),
-		*DescribeGraphOuterKind_ImportBpy(BlendStackGraph));
-	return false;
-}
-
 bool ApplyNodeProps_ImportBpy(
 	UEdGraphNode* Node,
 	const TSharedPtr<FJsonObject>& NodeJson,
@@ -7817,7 +7272,6 @@ bool ApplyNodeProps_ImportBpy(
 	TSet<FName> MakeStructVisiblePins;
 	FString CompositeBoundGraphJsonTextPostReconstruct;
 	FString StateMachineGraphJsonTextPostReconstruct;
-	FString BlendStackGraphJsonTextPostReconstruct;
 	FString StateBoundGraphJsonTextPostReconstruct;
 	FString ConduitBoundGraphJsonTextPostReconstruct;
 	FString TransitionBoundGraphJsonTextPostReconstruct;
@@ -8062,56 +7516,180 @@ bool ApplyNodeProps_ImportBpy(
 	}
 
 	if (!bDeferNestedGraphImports)
+	if (UK2Node_Composite* CompositeNode = Cast<UK2Node_Composite>(Node))
 	{
 		FString BoundGraphJsonText;
 		if ((*NodePropsObj)->TryGetStringField(TEXT("BoundGraphJson"), BoundGraphJsonText) && !BoundGraphJsonText.IsEmpty())
 		{
-			if (Cast<UK2Node_Composite>(Node))
-			{
-				CompositeBoundGraphJsonTextPostReconstruct = BoundGraphJsonText;
-				bNeedsReconstruct = true;
-			}
-			else if (Cast<UAnimStateNode>(Node))
-			{
-				StateBoundGraphJsonTextPostReconstruct = BoundGraphJsonText;
-				bNeedsReconstruct = true;
-			}
-			else if (Cast<UAnimStateConduitNode>(Node))
-			{
-				ConduitBoundGraphJsonTextPostReconstruct = BoundGraphJsonText;
-				bNeedsReconstruct = true;
-			}
-			else if (Cast<UAnimStateTransitionNode>(Node))
-			{
-				TransitionBoundGraphJsonTextPostReconstruct = BoundGraphJsonText;
-				bNeedsReconstruct = true;
-			}
-		}
+			CompositeBoundGraphJsonTextPostReconstruct = BoundGraphJsonText;
 
+			if (!CompositeNode->BoundGraph)
+			{
+				OutError = FString::Printf(
+					TEXT("Composite node %s does not have a bound graph"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+
+			TSharedPtr<FJsonObject> BoundGraphJson;
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(BoundGraphJsonText);
+			if (!FJsonSerializer::Deserialize(Reader, BoundGraphJson) || !BoundGraphJson.IsValid())
+			{
+				OutError = FString::Printf(
+					TEXT("Cannot parse BoundGraphJson on node %s"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+
+			UBlueprint* OwningBlueprint = FBlueprintEditorUtils::FindBlueprintForGraph(CompositeNode->BoundGraph);
+			if (!OwningBlueprint)
+			{
+				OutError = FString::Printf(
+					TEXT("Cannot resolve owning blueprint for composite node %s"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+
+			if (!UBPDirectImporter::PopulateGraph(
+					OwningBlueprint,
+					CompositeNode->BoundGraph,
+					BoundGraphJson,
+					true,
+					OutError))
+			{
+				return false;
+			}
+
+			bNeedsReconstruct = true;
+		}
+	}
+
+	if (!bDeferNestedGraphImports)
+	if (UAnimGraphNode_StateMachineBase* StateMachineNode = Cast<UAnimGraphNode_StateMachineBase>(Node))
+	{
 		FString StateMachineGraphJsonText;
 		if ((*NodePropsObj)->TryGetStringField(TEXT("StateMachineGraphJson"), StateMachineGraphJsonText) &&
 			!StateMachineGraphJsonText.IsEmpty())
 		{
 			StateMachineGraphJsonTextPostReconstruct = StateMachineGraphJsonText;
-			bNeedsReconstruct = true;
-		}
 
-		FString BlendStackGraphJsonText;
-		if ((*NodePropsObj)->TryGetStringField(TEXT("BlendStackGraphJson"), BlendStackGraphJsonText) &&
-			!BlendStackGraphJsonText.IsEmpty())
-		{
-			BlendStackGraphJsonTextPostReconstruct = BlendStackGraphJsonText;
-			bNeedsReconstruct = true;
-		}
-
-		if (UAnimStateTransitionNode* TransitionNode = Cast<UAnimStateTransitionNode>(Node))
-		{
-			FString CustomTransitionGraphJsonText;
-			if ((*NodePropsObj)->TryGetStringField(TEXT("CustomTransitionGraphJson"), CustomTransitionGraphJsonText) &&
-				!CustomTransitionGraphJsonText.IsEmpty())
+			if (!StateMachineNode->EditorStateMachineGraph)
 			{
-				TransitionCustomGraphJsonTextPostReconstruct = CustomTransitionGraphJsonText;
-				bNeedsReconstruct = true;
+				OutError = FString::Printf(
+					TEXT("State machine node %s does not have an editor graph"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+
+			if (!PopulateNestedGraphFromJsonText_ImportBpy(
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
+					StateMachineNode->EditorStateMachineGraph,
+					StateMachineGraphJsonText,
+					OutError))
+			{
+				return false;
+			}
+		}
+	}
+
+	if (!bDeferNestedGraphImports)
+	if (UAnimStateNode* StateNode = Cast<UAnimStateNode>(Node))
+	{
+		FString BoundGraphJsonText;
+		if ((*NodePropsObj)->TryGetStringField(TEXT("BoundGraphJson"), BoundGraphJsonText) && !BoundGraphJsonText.IsEmpty())
+		{
+			StateBoundGraphJsonTextPostReconstruct = BoundGraphJsonText;
+
+			if (!StateNode->BoundGraph)
+			{
+				OutError = FString::Printf(
+					TEXT("State node %s does not have a bound graph"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+
+			if (!PopulateNestedGraphFromJsonText_ImportBpy(
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
+					StateNode->BoundGraph,
+					BoundGraphJsonText,
+					OutError))
+			{
+				return false;
+			}
+		}
+	}
+
+	if (!bDeferNestedGraphImports)
+	if (UAnimStateConduitNode* ConduitNode = Cast<UAnimStateConduitNode>(Node))
+	{
+		FString BoundGraphJsonText;
+		if ((*NodePropsObj)->TryGetStringField(TEXT("BoundGraphJson"), BoundGraphJsonText) && !BoundGraphJsonText.IsEmpty())
+		{
+			ConduitBoundGraphJsonTextPostReconstruct = BoundGraphJsonText;
+
+			if (!ConduitNode->BoundGraph)
+			{
+				OutError = FString::Printf(
+					TEXT("Conduit node %s does not have a bound graph"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+
+			if (!PopulateNestedGraphFromJsonText_ImportBpy(
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
+					ConduitNode->BoundGraph,
+					BoundGraphJsonText,
+					OutError))
+			{
+				return false;
+			}
+		}
+	}
+
+	if (!bDeferNestedGraphImports)
+	if (UAnimStateTransitionNode* TransitionNode = Cast<UAnimStateTransitionNode>(Node))
+	{
+		FString BoundGraphJsonText;
+		if ((*NodePropsObj)->TryGetStringField(TEXT("BoundGraphJson"), BoundGraphJsonText) && !BoundGraphJsonText.IsEmpty())
+		{
+			TransitionBoundGraphJsonTextPostReconstruct = BoundGraphJsonText;
+
+			if (!TransitionNode->GetBoundGraph())
+			{
+				OutError = FString::Printf(
+					TEXT("Transition node %s does not have a bound graph"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+
+			if (!PopulateNestedGraphFromJsonText_ImportBpy(
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
+					TransitionNode->GetBoundGraph(),
+					BoundGraphJsonText,
+					OutError))
+			{
+				return false;
+			}
+		}
+
+		FString CustomTransitionGraphJsonText;
+		if ((*NodePropsObj)->TryGetStringField(TEXT("CustomTransitionGraphJson"), CustomTransitionGraphJsonText) &&
+			!CustomTransitionGraphJsonText.IsEmpty())
+		{
+			TransitionCustomGraphJsonTextPostReconstruct = CustomTransitionGraphJsonText;
+
+			if (!EnsureTransitionCustomGraphExists_ImportBpy(TransitionNode, OutError))
+			{
+				return false;
+			}
+
+			if (!PopulateNestedGraphFromJsonText_ImportBpy(
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
+					TransitionNode->GetCustomTransitionGraph(),
+					CustomTransitionGraphJsonText,
+					OutError))
+			{
+				return false;
 			}
 		}
 	}
@@ -8126,19 +7704,9 @@ bool ApplyNodeProps_ImportBpy(
 		{
 			return true;
 		}
-		if (Key == TEXT("BlendStackGraphJson"))
-		{
-			return true;
-		}
 		if (Key == TEXT("StateMachineGraphJson") ||
 			Key == TEXT("CustomTransitionGraphJson") ||
 			Key == TEXT("AliasedStateUids"))
-		{
-			return true;
-		}
-		if (Key == TEXT("BoundGraph") ||
-			Key == TEXT("EditorStateMachineGraph") ||
-			Key == TEXT("CustomTransitionGraph"))
 		{
 			return true;
 		}
@@ -8174,31 +7742,6 @@ bool ApplyNodeProps_ImportBpy(
 	auto ReplayNestedGraphsPostReconstruct = [&]() -> bool
 	{
 		UBlueprint* const OwningBlueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
-		auto ResolveNestedGraphBlueprint = [&](UEdGraph* NestedGraph) -> UBlueprint*
-		{
-			if (OwningBlueprint)
-			{
-				return OwningBlueprint;
-			}
-
-			return NestedGraph ? FBlueprintEditorUtils::FindBlueprintForGraph(NestedGraph) : nullptr;
-		};
-
-		if (UAnimStateTransitionNode* TransitionNode = Cast<UAnimStateTransitionNode>(Node))
-		{
-			if (!EnsureTransitionBoundGraphOwnership_ImportBpy(TransitionNode, OutError))
-			{
-				return false;
-			}
-		}
-
-		if (UAnimStateConduitNode* ConduitNode = Cast<UAnimStateConduitNode>(Node))
-		{
-			if (!EnsureConduitBoundGraphOwnership_ImportBpy(ConduitNode, OutError))
-			{
-				return false;
-			}
-		}
 
 		if (!CompositeBoundGraphJsonTextPostReconstruct.IsEmpty())
 		{
@@ -8252,53 +7795,10 @@ bool ApplyNodeProps_ImportBpy(
 				return false;
 			}
 
-			UBlueprint* const NestedBlueprint = ResolveNestedGraphBlueprint(StateMachineNode->EditorStateMachineGraph);
-			if (!NestedBlueprint)
-			{
-				OutError = FString::Printf(
-					TEXT("Cannot resolve owning blueprint for state machine node %s after reconstruct"),
-					*DescribeNode_ImportBpy(Node));
-				return false;
-			}
-
 			if (!PopulateNestedGraphFromJsonText_ImportBpy(
-					NestedBlueprint,
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
 					StateMachineNode->EditorStateMachineGraph,
 					StateMachineGraphJsonTextPostReconstruct,
-					OutError))
-			{
-				return false;
-			}
-		}
-
-		if (!BlendStackGraphJsonTextPostReconstruct.IsEmpty())
-		{
-			UEdGraph* const BlendStackGraph = ResolveBlendStackGraph_ImportBpy(Node);
-			if (!BlendStackGraph)
-			{
-				OutError = FString::Printf(
-					TEXT("BlendStack node %s lost its blend stack graph after reconstruct"),
-					*DescribeNode_ImportBpy(Node));
-				return false;
-			}
-			if (!EnsureBlendStackGraphOwnership_ImportBpy(Node, BlendStackGraph, OutError))
-			{
-				return false;
-			}
-
-			UBlueprint* const NestedBlueprint = ResolveNestedGraphBlueprint(BlendStackGraph);
-			if (!NestedBlueprint)
-			{
-				OutError = FString::Printf(
-					TEXT("Cannot resolve owning blueprint for blend stack node %s after reconstruct"),
-					*DescribeNode_ImportBpy(Node));
-				return false;
-			}
-
-			if (!PopulateNestedGraphFromJsonText_ImportBpy(
-					NestedBlueprint,
-					BlendStackGraph,
-					BlendStackGraphJsonTextPostReconstruct,
 					OutError))
 			{
 				return false;
@@ -8316,17 +7816,8 @@ bool ApplyNodeProps_ImportBpy(
 				return false;
 			}
 
-			UBlueprint* const NestedBlueprint = ResolveNestedGraphBlueprint(StateNode->BoundGraph);
-			if (!NestedBlueprint)
-			{
-				OutError = FString::Printf(
-					TEXT("Cannot resolve owning blueprint for state node %s after reconstruct"),
-					*DescribeNode_ImportBpy(Node));
-				return false;
-			}
-
 			if (!PopulateNestedGraphFromJsonText_ImportBpy(
-					NestedBlueprint,
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
 					StateNode->BoundGraph,
 					StateBoundGraphJsonTextPostReconstruct,
 					OutError))
@@ -8338,7 +7829,7 @@ bool ApplyNodeProps_ImportBpy(
 		if (!ConduitBoundGraphJsonTextPostReconstruct.IsEmpty())
 		{
 			UAnimStateConduitNode* const ConduitNode = Cast<UAnimStateConduitNode>(Node);
-			if (!ConduitNode)
+			if (!ConduitNode || !ConduitNode->BoundGraph)
 			{
 				OutError = FString::Printf(
 					TEXT("Conduit node %s lost its bound graph after reconstruct"),
@@ -8346,30 +7837,8 @@ bool ApplyNodeProps_ImportBpy(
 				return false;
 			}
 
-			if (!EnsureConduitBoundGraphOwnership_ImportBpy(ConduitNode, OutError))
-			{
-				return false;
-			}
-
-			if (!ConduitNode->BoundGraph)
-			{
-				OutError = FString::Printf(
-					TEXT("Conduit node %s is missing a bound graph after ownership repair"),
-					*DescribeNode_ImportBpy(Node));
-				return false;
-			}
-
-			UBlueprint* const NestedBlueprint = ResolveNestedGraphBlueprint(ConduitNode->BoundGraph);
-			if (!NestedBlueprint)
-			{
-				OutError = FString::Printf(
-					TEXT("Cannot resolve owning blueprint for conduit node %s after reconstruct"),
-					*DescribeNode_ImportBpy(Node));
-				return false;
-			}
-
 			if (!PopulateNestedGraphFromJsonText_ImportBpy(
-					NestedBlueprint,
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
 					ConduitNode->BoundGraph,
 					ConduitBoundGraphJsonTextPostReconstruct,
 					OutError))
@@ -8381,7 +7850,7 @@ bool ApplyNodeProps_ImportBpy(
 		if (!TransitionBoundGraphJsonTextPostReconstruct.IsEmpty())
 		{
 			UAnimStateTransitionNode* const TransitionNode = Cast<UAnimStateTransitionNode>(Node);
-			if (!TransitionNode)
+			if (!TransitionNode || !TransitionNode->GetBoundGraph())
 			{
 				OutError = FString::Printf(
 					TEXT("Transition node %s lost its bound graph after reconstruct"),
@@ -8389,30 +7858,8 @@ bool ApplyNodeProps_ImportBpy(
 				return false;
 			}
 
-			if (!EnsureTransitionBoundGraphOwnership_ImportBpy(TransitionNode, OutError))
-			{
-				return false;
-			}
-
-			if (!TransitionNode->GetBoundGraph())
-			{
-				OutError = FString::Printf(
-					TEXT("Transition node %s is missing a bound graph after ownership repair"),
-					*DescribeNode_ImportBpy(Node));
-				return false;
-			}
-
-			UBlueprint* const NestedBlueprint = ResolveNestedGraphBlueprint(TransitionNode->GetBoundGraph());
-			if (!NestedBlueprint)
-			{
-				OutError = FString::Printf(
-					TEXT("Cannot resolve owning blueprint for transition node %s after reconstruct"),
-					*DescribeNode_ImportBpy(Node));
-				return false;
-			}
-
 			if (!PopulateNestedGraphFromJsonText_ImportBpy(
-					NestedBlueprint,
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
 					TransitionNode->GetBoundGraph(),
 					TransitionBoundGraphJsonTextPostReconstruct,
 					OutError))
@@ -8437,17 +7884,8 @@ bool ApplyNodeProps_ImportBpy(
 				return false;
 			}
 
-			UBlueprint* const NestedBlueprint = ResolveNestedGraphBlueprint(TransitionNode->GetCustomTransitionGraph());
-			if (!NestedBlueprint)
-			{
-				OutError = FString::Printf(
-					TEXT("Cannot resolve owning blueprint for transition custom graph node %s after reconstruct"),
-					*DescribeNode_ImportBpy(Node));
-				return false;
-			}
-
 			if (!PopulateNestedGraphFromJsonText_ImportBpy(
-					NestedBlueprint,
+					FBlueprintEditorUtils::FindBlueprintForNodeChecked(Node),
 					TransitionNode->GetCustomTransitionGraph(),
 					TransitionCustomGraphJsonTextPostReconstruct,
 					OutError))
@@ -8575,52 +8013,36 @@ bool ApplyNodeProps_ImportBpy(
 
 	if (bNeedsReconstruct)
 	{
-		const UK2Node_AnimGetter* const AnimGetterNode = Cast<UK2Node_AnimGetter>(Node);
-		const bool bSkipReconstructForAnimGetterWithoutOwner =
-			AnimGetterNode &&
-			!AnimGetterNode->HasValidBlueprint();
-		const bool bSkipReconstructForNestedAnimGraphOwner =
-			Cast<UAnimGraphNode_StateMachineBase>(Node) != nullptr ||
-			Cast<UAnimStateNode>(Node) != nullptr ||
-			Cast<UAnimStateConduitNode>(Node) != nullptr ||
-			Cast<UAnimStateTransitionNode>(Node) != nullptr;
-		const bool bAllowReconstruct =
-			!bSkipReconstructForAnimGetterWithoutOwner &&
-			!bSkipReconstructForNestedAnimGraphOwner;
-
-		if (bAllowReconstruct)
+		Node->ReconstructNode();
+		if (IsGetSubsystemNode_ImportBpy(Node))
 		{
-			Node->ReconstructNode();
-			if (IsGetSubsystemNode_ImportBpy(Node))
+			if (!ApplyGetSubsystemClassToNode_ImportBpy(Node, NodeJson, OutError))
 			{
-				if (!ApplyGetSubsystemClassToNode_ImportBpy(Node, NodeJson, OutError))
-				{
-					return false;
-				}
+				return false;
 			}
-			if (IsEnhancedInputActionNode_ImportBpy(Node))
+		}
+		if (IsEnhancedInputActionNode_ImportBpy(Node))
+		{
+			if (!ApplyEnhancedInputActionToNode_ImportBpy(Node, NodeJson, OutError))
 			{
-				if (!ApplyEnhancedInputActionToNode_ImportBpy(Node, NodeJson, OutError))
-				{
-					return false;
-				}
+				return false;
+			}
+		}
+
+		// ReconstructNode() can reset editor node state for AnimGraph and transition nodes.
+		// Replay safe property writes once more so exported node_props survive round-trip.
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*NodePropsObj)->Values)
+		{
+			const FString& Key = Entry.Key;
+			const TSharedPtr<FJsonValue>& JsonValue = Entry.Value;
+			if (!JsonValue.IsValid() || ShouldSkipGenericNodePropertyApply(Key))
+			{
+				continue;
 			}
 
-			// ReconstructNode() can reset editor node state for AnimGraph and transition nodes.
-			// Replay safe property writes once more so exported node_props survive round-trip.
-			for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*NodePropsObj)->Values)
+			if (FProperty* Property = Node->GetClass()->FindPropertyByName(FName(*Key)))
 			{
-				const FString& Key = Entry.Key;
-				const TSharedPtr<FJsonValue>& JsonValue = Entry.Value;
-				if (!JsonValue.IsValid() || ShouldSkipGenericNodePropertyApply(Key))
-				{
-					continue;
-				}
-
-				if (FProperty* Property = Node->GetClass()->FindPropertyByName(FName(*Key)))
-				{
-					ApplyJsonValueToProperty_ImportBpy(Node, Property, JsonValue);
-				}
+				ApplyJsonValueToProperty_ImportBpy(Node, Property, JsonValue);
 			}
 		}
 
@@ -8710,7 +8132,7 @@ bool ApplyPinDefaults_ImportBpy(
 				return InputPin;
 			}
 
-			// Function entry parameter defaults live on output pins.
+			// Function entry parameter defaults are stored on output pins.
 			if (Node->IsA<UK2Node_FunctionEntry>())
 			{
 				if (UEdGraphPin* OutputPin =
@@ -8820,195 +8242,6 @@ bool ApplyPinIds_ImportBpy(UEdGraphNode* Node, const TSharedPtr<FJsonObject>& No
 	return true;
 }
 
-bool RebindUnresolvedSelfContextCallsAndReplaySerializedPins_ImportBpy(
-	UBlueprint* BP,
-	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs,
-	FString& OutError)
-{
-	if (!BP)
-	{
-		return true;
-	}
-
-	bool bReboundAnyCallNode = false;
-	for (const TSharedPtr<FJsonObject>& GraphObj : SortedGraphs)
-	{
-		if (!GraphObj.IsValid())
-		{
-			continue;
-		}
-
-		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
-		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
-		{
-			continue;
-		}
-
-		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
-		{
-			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
-			if (!NodeObj.IsValid())
-			{
-				continue;
-			}
-
-			FString SerializedUid;
-			if (!NodeObj->TryGetStringField(TEXT("uid"), SerializedUid) || SerializedUid.IsEmpty())
-			{
-				continue;
-			}
-
-			UK2Node_CallFunction* const CallNode =
-				Cast<UK2Node_CallFunction>(FindImportedNodeBySerializedUid_ImportBpy(BP, SerializedUid));
-			if (!CallNode)
-			{
-				continue;
-			}
-
-			if (RebindUnresolvedSelfContextCallNode_ImportBpy(CallNode))
-			{
-				bReboundAnyCallNode = true;
-			}
-		}
-	}
-
-	for (const TSharedPtr<FJsonObject>& GraphObj : SortedGraphs)
-	{
-		if (!GraphObj.IsValid())
-		{
-			continue;
-		}
-
-		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
-		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
-		{
-			continue;
-		}
-
-		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
-		{
-			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
-			if (!NodeObj.IsValid())
-			{
-				continue;
-			}
-
-			FString SerializedUid;
-			if (!NodeObj->TryGetStringField(TEXT("uid"), SerializedUid) || SerializedUid.IsEmpty())
-			{
-				continue;
-			}
-
-			UEdGraphNode* const ExistingNode = FindImportedNodeBySerializedUid_ImportBpy(BP, SerializedUid);
-			if (!ExistingNode)
-			{
-				continue;
-			}
-
-			if (!ApplyPinDefaults_ImportBpy(ExistingNode, NodeObj, OutError, false))
-			{
-				return false;
-			}
-			if (!ApplyPinIds_ImportBpy(ExistingNode, NodeObj, OutError))
-			{
-				return false;
-			}
-		}
-	}
-
-	return true;
-}
-
-bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
-	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
-	const TMap<FString, UEdGraphNode*>& NodeMap,
-	bool bStrict,
-	FString& OutError)
-{
-	if (!NodesArr)
-	{
-		return true;
-	}
-
-	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
-	{
-		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
-		if (!NodeObj.IsValid())
-		{
-			continue;
-		}
-
-		const FString Uid = NodeObj->GetStringField(TEXT("uid"));
-		UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
-		if (!ExistingNode || !*ExistingNode)
-		{
-			continue;
-		}
-
-		UK2Node_CreateDelegate* const CreateDelegateNode = Cast<UK2Node_CreateDelegate>(*ExistingNode);
-		if (!CreateDelegateNode)
-		{
-			continue;
-		}
-
-		FString SelectedFunctionName = GetNodePropString_ImportBpy(NodeObj, TEXT("SelectedFunctionName"));
-		if (SelectedFunctionName.IsEmpty() || SelectedFunctionName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
-		{
-			NodeObj->TryGetStringField(TEXT("member_name"), SelectedFunctionName);
-		}
-		if (SelectedFunctionName.IsEmpty() || SelectedFunctionName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
-		{
-			continue;
-		}
-
-		const UEdGraphPin* DelegateOutPinBefore = CreateDelegateNode->GetDelegateOutPin();
-		const int32 DelegateLinkCountBefore = DelegateOutPinBefore ? DelegateOutPinBefore->LinkedTo.Num() : -1;
-		UE_LOG(
-			LogTemp,
-			Warning,
-			TEXT("[ExportBpy] RestoreCreateDelegate(%s) node=%s requested=%s current=%s links_before=%d"),
-			bStrict ? TEXT("strict") : TEXT("deferred"),
-			*DescribeNode_ImportBpy(CreateDelegateNode),
-			*SelectedFunctionName,
-			*CreateDelegateNode->GetFunctionName().ToString(),
-			DelegateLinkCountBefore);
-
-		CreateDelegateNode->SetFunction(FName(*SelectedFunctionName));
-		CreateDelegateNode->HandleAnyChangeWithoutNotifying();
-		const UEdGraphPin* DelegateOutPinAfter = CreateDelegateNode->GetDelegateOutPin();
-		const int32 DelegateLinkCountAfter = DelegateOutPinAfter ? DelegateOutPinAfter->LinkedTo.Num() : -1;
-		UE_LOG(
-			LogTemp,
-			Warning,
-			TEXT("[ExportBpy] RestoreCreateDelegate(%s) node=%s after_set=%s links_after=%d"),
-			bStrict ? TEXT("strict") : TEXT("deferred"),
-			*DescribeNode_ImportBpy(CreateDelegateNode),
-			*CreateDelegateNode->GetFunctionName().ToString(),
-			DelegateLinkCountAfter);
-
-		if (CreateDelegateNode->GetFunctionName().IsNone())
-		{
-			if (bStrict)
-			{
-				OutError = FString::Printf(
-					TEXT("Failed to restore CreateDelegate binding '%s' on node %s after connections"),
-					*SelectedFunctionName,
-					*DescribeNode_ImportBpy(CreateDelegateNode));
-				return false;
-			}
-
-			UE_LOG(
-				LogTemp,
-				Warning,
-				TEXT("[ExportBpy] Deferring CreateDelegate binding '%s' on node %s (delegate signature not ready yet)"),
-				*SelectedFunctionName,
-				*DescribeNode_ImportBpy(CreateDelegateNode));
-		}
-	}
-
-	return true;
-}
-
 bool RestoreCallFunctionBindingFromJson_ImportBpy(
 	UK2Node_CallFunction* CallNode,
 	const TSharedPtr<FJsonObject>& NodeJson,
@@ -9084,10 +8317,10 @@ bool RestoreCallFunctionBindingFromJson_ImportBpy(
 	}
 
 	const UFunction* ExistingTargetFunction = CallNode->GetTargetFunction();
-	const bool bShouldRebindFunction =
-		ExistingTargetFunction == nullptr ||
-		ExistingTargetFunction != ResolvedFunction;
-	if (bShouldRebindFunction)
+	// Do not force-reset promotable operators once connections exist. Replaying
+	// SetFromFunction on an already-promoted node can wipe inferred pin types
+	// and re-trigger wrong wildcard promotion during connection restore.
+	if (ExistingTargetFunction != ResolvedFunction)
 	{
 		CallNode->SetFromFunction(ResolvedFunction);
 		if (bSelfContextCall)
@@ -9151,52 +8384,179 @@ bool RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
 			continue;
 		}
 
+		auto ForceVectorPinType = [](UEdGraphPin* Pin)
+		{
+			if (!Pin)
+			{
+				return;
+			}
+			if (UScriptStruct* const VectorStruct = TBaseStructure<FVector>::Get())
+			{
+				Pin->PinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
+				Pin->PinType.PinSubCategory = NAME_None;
+				Pin->PinType.PinSubCategoryObject = VectorStruct;
+				Pin->PinType.PinValueType = FEdGraphTerminalType();
+				Pin->PinType.ContainerType = EPinContainerType::None;
+				Pin->PinType.bIsReference = false;
+				Pin->PinType.bIsConst = false;
+			}
+		};
+
+		auto ForceRealPinType = [](UEdGraphPin* Pin)
+		{
+			if (!Pin)
+			{
+				return;
+			}
+			Pin->PinType.PinCategory = UEdGraphSchema_K2::PC_Real;
+			if (Pin->PinType.PinSubCategory.IsNone())
+			{
+				Pin->PinType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+			}
+			Pin->PinType.PinSubCategoryObject = nullptr;
+			Pin->PinType.PinValueType = FEdGraphTerminalType();
+			Pin->PinType.ContainerType = EPinContainerType::None;
+			Pin->PinType.bIsReference = false;
+			Pin->PinType.bIsConst = false;
+		};
+
+		auto JsonObjectHasKey = [](const TSharedPtr<FJsonObject>& Obj, const TCHAR* Key) -> bool
+		{
+			return Obj.IsValid() && Key && Obj->Values.Contains(Key);
+		};
+
+		auto NodeHasSerializedPinKey = [&](const TCHAR* Key) -> bool
+		{
+			if (!Key)
+			{
+				return false;
+			}
+
+			const TSharedPtr<FJsonObject>* DefaultsObj = nullptr;
+			if (NodeObj->TryGetObjectField(TEXT("defaults"), DefaultsObj) &&
+				DefaultsObj && JsonObjectHasKey(*DefaultsObj, Key))
+			{
+				return true;
+			}
+
+			const TSharedPtr<FJsonObject>* PinIdsObj = nullptr;
+			if (NodeObj->TryGetObjectField(TEXT("pin_ids"), PinIdsObj) &&
+				PinIdsObj && JsonObjectHasKey(*PinIdsObj, Key))
+			{
+				return true;
+			}
+
+			return false;
+		};
+
+		LogTrackedTraversalNodeState_ImportBpy(TEXT("before_promotable_rebind"), NodeObj, CallNode);
+
 		if (!RestoreCallFunctionBindingFromJson_ImportBpy(CallNode, NodeObj, OutError))
 		{
 			return false;
 		}
 
-		const auto ApplySerializedPinTypes = [&](const TCHAR* FieldName, EEdGraphPinDirection Direction) -> bool
+		// UE5.7 can leave promotable vector multiply nodes in a mixed invalid state
+		// (A=Vector, B=Real, Return=Real). Normalize to Multiply_VectorFloat so
+		// downstream links keep vector outputs while preserving scalar scale input.
+		FString FunctionRef;
+		NodeObj->TryGetStringField(TEXT("function_ref"), FunctionRef);
+		const UFunction* const CurrentTargetFunction = CallNode->GetTargetFunction();
+		const bool bVectorMultiplyRef =
+			FunctionRef.Equals(TEXT("KismetMathLibrary::Multiply_VectorVector"), ESearchCase::CaseSensitive) ||
+			FunctionRef.EndsWith(TEXT("::Multiply_VectorVector"), ESearchCase::CaseSensitive) ||
+			(CurrentTargetFunction && CurrentTargetFunction->GetName() == TEXT("Multiply_VectorVector"));
+		if (bVectorMultiplyRef)
 		{
-			const TSharedPtr<FJsonObject>* PinTypesObj = nullptr;
-			if (!NodeObj->TryGetObjectField(FieldName, PinTypesObj) || !PinTypesObj || !PinTypesObj->IsValid())
+			UEdGraphPin* const PinA = FindPinFlexible_ImportBpy(CallNode, TEXT("A"), EGPD_Input);
+			UEdGraphPin* const PinB = FindPinFlexible_ImportBpy(CallNode, TEXT("B"), EGPD_Input);
+			UEdGraphPin* const PinResult = FindPinFlexible_ImportBpy(CallNode, TEXT("ReturnValue"), EGPD_Output);
+			const bool bAIsStruct = PinA && PinA->PinType.PinCategory == UEdGraphSchema_K2::PC_Struct;
+			const bool bBIsReal = PinB && PinB->PinType.PinCategory == UEdGraphSchema_K2::PC_Real;
+			if (bAIsStruct && bBIsReal)
 			{
-				return true;
+				if (UFunction* const MultiplyVectorFloatFn =
+						UKismetMathLibrary::StaticClass()->FindFunctionByName(TEXT("Multiply_VectorFloat")))
+				{
+					CallNode->SetFromFunction(MultiplyVectorFloatFn);
+					CallNode->FunctionReference.SetExternalMember(
+						TEXT("Multiply_VectorFloat"),
+						UKismetMathLibrary::StaticClass());
+					UE_LOG(
+						LogTemp,
+						Warning,
+						TEXT("[IBPY_TRACE] stage=force_vectorfloat node=%s target=%s"),
+						*DescribeNode_ImportBpy(CallNode),
+						*CallNode->GetTargetFunction()->GetName());
+
+					UEdGraphPin* const UpdatedPinA = FindPinFlexible_ImportBpy(CallNode, TEXT("A"), EGPD_Input);
+					UEdGraphPin* const UpdatedPinB = FindPinFlexible_ImportBpy(CallNode, TEXT("B"), EGPD_Input);
+					UEdGraphPin* const UpdatedPinResult = FindPinFlexible_ImportBpy(CallNode, TEXT("ReturnValue"), EGPD_Output);
+					ForceVectorPinType(UpdatedPinA);
+					ForceRealPinType(UpdatedPinB);
+					ForceVectorPinType(UpdatedPinResult);
+				}
+			}
+		}
+
+		// If Add_VectorVector is still scalar after restore, force it back to vector mode.
+		// This happens when earlier wildcard promotion latched to real and never recovered.
+		const bool bVectorAddRef =
+			FunctionRef.Equals(TEXT("KismetMathLibrary::Add_VectorVector"), ESearchCase::CaseSensitive) ||
+			FunctionRef.EndsWith(TEXT("::Add_VectorVector"), ESearchCase::CaseSensitive) ||
+			(CurrentTargetFunction && CurrentTargetFunction->GetName() == TEXT("Add_VectorVector"));
+		if (bVectorAddRef)
+		{
+			UEdGraphPin* const PinA = FindPinFlexible_ImportBpy(CallNode, TEXT("A"), EGPD_Input);
+			UEdGraphPin* const PinB = FindPinFlexible_ImportBpy(CallNode, TEXT("B"), EGPD_Input);
+			UEdGraphPin* const PinResult = FindPinFlexible_ImportBpy(CallNode, TEXT("ReturnValue"), EGPD_Output);
+			const bool bAIsStruct = PinA && PinA->PinType.PinCategory == UEdGraphSchema_K2::PC_Struct;
+			const bool bBIsStruct = PinB && PinB->PinType.PinCategory == UEdGraphSchema_K2::PC_Struct;
+			const bool bResultIsStruct = PinResult && PinResult->PinType.PinCategory == UEdGraphSchema_K2::PC_Struct;
+			const bool bNeedsForceSet =
+				!CurrentTargetFunction ||
+				CurrentTargetFunction->GetName() != TEXT("Add_VectorVector") ||
+				!bAIsStruct ||
+				!bBIsStruct ||
+				!bResultIsStruct;
+			if (bNeedsForceSet)
+			{
+				if (UFunction* const AddVectorVectorFn =
+						UKismetMathLibrary::StaticClass()->FindFunctionByName(TEXT("Add_VectorVector")))
+				{
+					CallNode->SetFromFunction(AddVectorVectorFn);
+					CallNode->FunctionReference.SetExternalMember(
+						TEXT("Add_VectorVector"),
+						UKismetMathLibrary::StaticClass());
+					UE_LOG(
+						LogTemp,
+						Warning,
+						TEXT("[IBPY_TRACE] stage=force_add_vectorvector node=%s target=%s"),
+						*DescribeNode_ImportBpy(CallNode),
+						*CallNode->GetTargetFunction()->GetName());
+				}
 			}
 
-			for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*PinTypesObj)->Values)
+			ForceVectorPinType(FindPinFlexible_ImportBpy(CallNode, TEXT("A"), EGPD_Input));
+			ForceVectorPinType(FindPinFlexible_ImportBpy(CallNode, TEXT("B"), EGPD_Input));
+			ForceVectorPinType(FindPinFlexible_ImportBpy(CallNode, TEXT("C"), EGPD_Input));
+			ForceVectorPinType(FindPinFlexible_ImportBpy(CallNode, TEXT("ReturnValue"), EGPD_Output));
+
+			const bool bHasSplitCSerialized =
+				NodeHasSerializedPinKey(TEXT("C_X")) ||
+				NodeHasSerializedPinKey(TEXT("C_Y")) ||
+				NodeHasSerializedPinKey(TEXT("C_Z"));
+			if (bHasSplitCSerialized)
 			{
-				if (!Entry.Value.IsValid())
-				{
-					continue;
-				}
-
-				FEdGraphPinType ParsedPinType;
-				ParsePinTypeString_ImportBpy(Entry.Value->AsString(), ParsedPinType);
-
-				UEdGraphPin* Pin = FindSerializedPinOnNode_ImportBpy(CallNode, NodeObj, Entry.Key, Direction);
-				if (!Pin)
-				{
-					continue;
-				}
-
-				Pin->PinType = ParsedPinType;
+				ForceRealPinType(FindSerializedPinOnNode_ImportBpy(CallNode, NodeObj, TEXT("C_X"), EGPD_Input));
+				ForceRealPinType(FindSerializedPinOnNode_ImportBpy(CallNode, NodeObj, TEXT("C_Y"), EGPD_Input));
+				ForceRealPinType(FindSerializedPinOnNode_ImportBpy(CallNode, NodeObj, TEXT("C_Z"), EGPD_Input));
 			}
-
-			return true;
-		};
-
-		if (!ApplySerializedPinTypes(TEXT("input_pin_types"), EGPD_Input))
-		{
-			return false;
 		}
-		if (!ApplySerializedPinTypes(TEXT("output_pin_types"), EGPD_Output))
-		{
-			return false;
-		}
+		LogTrackedTraversalNodeState_ImportBpy(TEXT("after_set_from_function"), NodeObj, CallNode);
 
-		// SetFromFunction can rebuild pins; replay serialized defaults and pin IDs so
-		// promotable operators stay bit-identical to exported call signatures.
+		// SetFromFunction may reconstruct pins. Replay exported pin defaults and ids so
+		// promotable operators remain bit-identical to exported signatures.
 		if (!ApplyPinDefaults_ImportBpy(CallNode, NodeObj, OutError, false))
 		{
 			return false;
@@ -9205,9 +8565,135 @@ bool RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
 		{
 			return false;
 		}
+		LogTrackedTraversalNodeState_ImportBpy(TEXT("after_promotable_defaults_and_ids"), NodeObj, CallNode);
 	}
 
 	return true;
+}
+
+bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
+	const TMap<FString, UEdGraphNode*>& NodeMap,
+	FString& OutError)
+{
+	if (!NodesArr)
+	{
+		return true;
+	}
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		const FString Uid = NodeObj->GetStringField(TEXT("uid"));
+		UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
+		if (!ExistingNode || !*ExistingNode)
+		{
+			continue;
+		}
+
+		UK2Node_CreateDelegate* const CreateDelegateNode = Cast<UK2Node_CreateDelegate>(*ExistingNode);
+		if (!CreateDelegateNode)
+		{
+			continue;
+		}
+
+		const FString SelectedFunctionName = GetNodePropString_ImportBpy(NodeObj, TEXT("SelectedFunctionName"));
+		if (SelectedFunctionName.IsEmpty())
+		{
+			continue;
+		}
+
+		CreateDelegateNode->SetFunction(FName(*SelectedFunctionName));
+		CreateDelegateNode->HandleAnyChangeWithoutNotifying();
+
+		if (CreateDelegateNode->GetFunctionName().IsNone())
+		{
+			OutError = FString::Printf(
+				TEXT("Failed to restore CreateDelegate binding '%s' on node %s after connections"),
+				*SelectedFunctionName,
+				*DescribeNode_ImportBpy(CreateDelegateNode));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void CleanupUnserializedDisconnectedConversionNodes_ImportBpy(
+	UBlueprint* BP,
+	UEdGraph* Graph,
+	const TMap<FString, UEdGraphNode*>& NodeMap)
+{
+	if (!BP || !Graph)
+	{
+		return;
+	}
+
+	TSet<const UEdGraphNode*> SerializedNodes;
+	for (const TPair<FString, UEdGraphNode*>& Entry : NodeMap)
+	{
+		if (Entry.Value)
+		{
+			SerializedNodes.Add(Entry.Value);
+		}
+	}
+
+	TArray<UEdGraphNode*> NodesToRemove;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node || SerializedNodes.Contains(Node))
+		{
+			continue;
+		}
+
+		UK2Node_CallFunction* const CallNode = Cast<UK2Node_CallFunction>(Node);
+		if (!CallNode)
+		{
+			continue;
+		}
+
+		const UFunction* const TargetFunction = CallNode->GetTargetFunction();
+		if (!TargetFunction || TargetFunction->GetOwnerClass() != UKismetMathLibrary::StaticClass())
+		{
+			continue;
+		}
+
+		if (!TargetFunction->GetName().StartsWith(TEXT("Conv_"), ESearchCase::CaseSensitive))
+		{
+			continue;
+		}
+
+		bool bHasLinks = false;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin && Pin->LinkedTo.Num() > 0)
+			{
+				bHasLinks = true;
+				break;
+			}
+		}
+		if (bHasLinks)
+		{
+			continue;
+		}
+
+		NodesToRemove.Add(Node);
+	}
+
+	for (UEdGraphNode* Node : NodesToRemove)
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[IBPY_TRACE] stage=cleanup_unsserialized_conversion node=%s"),
+			*DescribeNode_ImportBpy(Node));
+		FBlueprintEditorUtils::RemoveNode(BP, Node, true);
+	}
 }
 
 bool ApplyNodeJsonToNode_ImportBpy(
@@ -9257,6 +8743,13 @@ bool ApplyNodeJsonToNode_ImportBpy(
 	if (!ApplyNodeProps_ImportBpy(Node, NodeJson, OutError, bDeferNestedGraphImports))
 	{
 		return false;
+	}
+	if (UK2Node_CallFunction* CallFunctionNode = Cast<UK2Node_CallFunction>(Node))
+	{
+		if (!RestoreCallFunctionBindingFromJson_ImportBpy(CallFunctionNode, NodeJson, OutError))
+		{
+			return false;
+		}
 	}
 	RestoreSerializedNodeGuid();
 	if (!ApplyPinDefaults_ImportBpy(Node, NodeJson, OutError, true))
@@ -9471,36 +8964,6 @@ void ClearGraphNodes_ImportBpy(
 	}
 }
 
-bool RepairStateMachineSubgraphOwnershipBeforeClear_ImportBpy(UEdGraph* Graph, FString& OutError)
-{
-	if (!Graph || !Graph->IsA<UAnimationStateMachineGraph>())
-	{
-		return true;
-	}
-
-	for (UEdGraphNode* Node : Graph->Nodes)
-	{
-		if (UAnimStateTransitionNode* TransitionNode = Cast<UAnimStateTransitionNode>(Node))
-		{
-			if (!EnsureTransitionBoundGraphOwnership_ImportBpy(TransitionNode, OutError))
-			{
-				return false;
-			}
-			continue;
-		}
-
-		if (UAnimStateConduitNode* ConduitNode = Cast<UAnimStateConduitNode>(Node))
-		{
-			if (!EnsureConduitBoundGraphOwnership_ImportBpy(ConduitNode, OutError))
-			{
-				return false;
-			}
-		}
-	}
-
-	return true;
-}
-
 bool PopulateNestedGraphFromJsonText_ImportBpy(
 	UBlueprint* BP,
 	UEdGraph* Graph,
@@ -9518,28 +8981,20 @@ bool PopulateNestedGraphFromJsonText_ImportBpy(
 		return false;
 	}
 
-	UBlueprint* const GraphOwnerBlueprint = FBlueprintEditorUtils::FindBlueprintForGraph(Graph);
-	UEdGraphNode* const GraphOuterNode = Cast<UEdGraphNode>(Graph->GetOuter());
-	UBlueprint* const OuterNodeOwnerBlueprint =
-		GraphOuterNode ? FBlueprintEditorUtils::FindBlueprintForNode(GraphOuterNode) : nullptr;
-	UE_LOG(
-		LogTemp,
-		Warning,
-		TEXT("[ExportBpy][NestedGraph] graph=%s class=%s outer=%s bp_arg=%s graph_owner=%s outer_node=%s outer_node_owner=%s"),
-		*Graph->GetPathName(),
-		*GetNameSafe(Graph->GetClass()),
-		*GetPathNameSafe(Graph->GetOuter()),
-		*GetPathNameSafe(BP),
-		*GetPathNameSafe(GraphOwnerBlueprint),
-		*GetPathNameSafe(GraphOuterNode),
-		*GetPathNameSafe(OuterNodeOwnerBlueprint));
-
 	TSharedPtr<FJsonObject> GraphJson;
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(GraphJsonText);
 	if (!FJsonSerializer::Deserialize(Reader, GraphJson) || !GraphJson.IsValid())
 	{
 		OutError = TEXT("Cannot parse nested graph json");
 		return false;
+	}
+
+	FString SerializedGraphName;
+	if (GraphJson->TryGetStringField(TEXT("name"), SerializedGraphName) &&
+		!SerializedGraphName.IsEmpty() &&
+		Graph->GetName() != SerializedGraphName)
+	{
+		FBlueprintEditorUtils::RenameGraph(Graph, SerializedGraphName);
 	}
 
 	return UBPDirectImporter::PopulateGraph(BP, Graph, GraphJson, false, OutError);
@@ -9624,156 +9079,6 @@ bool EnsureTransitionCustomGraphExists_ImportBpy(UAnimStateTransitionNode* Trans
 	return TransitionNode->GetCustomTransitionGraph() != nullptr;
 }
 
-bool EnsureTransitionBoundGraphOwnership_ImportBpy(UAnimStateTransitionNode* TransitionNode, FString& OutError)
-{
-	if (!TransitionNode)
-	{
-		return false;
-	}
-
-	UEdGraph* ExistingBoundGraph = TransitionNode->GetBoundGraph();
-	if (ExistingBoundGraph && ExistingBoundGraph->GetOuter() == TransitionNode)
-	{
-		return true;
-	}
-
-	UEdGraph* ParentGraph = TransitionNode->GetGraph();
-	if (!ParentGraph)
-	{
-		OutError = FString::Printf(
-			TEXT("Transition node %s does not have a parent graph"),
-			*DescribeNode_ImportBpy(TransitionNode));
-		return false;
-	}
-
-	UEdGraph* NewBoundGraph = FBlueprintEditorUtils::CreateNewGraph(
-		TransitionNode,
-		NAME_None,
-		UAnimationTransitionGraph::StaticClass(),
-		UAnimationTransitionSchema::StaticClass());
-	if (!NewBoundGraph)
-	{
-		OutError = FString::Printf(
-			TEXT("Failed to create transition bound graph for node %s"),
-			*DescribeNode_ImportBpy(TransitionNode));
-		return false;
-	}
-
-	FEdGraphUtilities::RenameGraphToNameOrCloseToName(NewBoundGraph, TEXT("Transition"));
-
-	const UEdGraphSchema* Schema = NewBoundGraph->GetSchema();
-	if (!Schema)
-	{
-		OutError = FString::Printf(
-			TEXT("Transition bound graph for node %s is missing a graph schema"),
-			*DescribeNode_ImportBpy(TransitionNode));
-		return false;
-	}
-
-	Schema->CreateDefaultNodesForGraph(*NewBoundGraph);
-
-	if (ParentGraph->SubGraphs.Find(NewBoundGraph) == INDEX_NONE)
-	{
-		ParentGraph->Modify();
-		ParentGraph->SubGraphs.Add(NewBoundGraph);
-	}
-
-	FObjectPropertyBase* BoundGraphProperty =
-		FindFProperty<FObjectPropertyBase>(UAnimStateNodeBase::StaticClass(), TEXT("BoundGraph"));
-	if (!BoundGraphProperty)
-	{
-		OutError = TEXT("Cannot resolve UAnimStateNodeBase.BoundGraph property");
-		return false;
-	}
-
-	BoundGraphProperty->SetObjectPropertyValue_InContainer(TransitionNode, NewBoundGraph);
-	UEdGraph* FinalBoundGraph = TransitionNode->GetBoundGraph();
-	if (!FinalBoundGraph || FinalBoundGraph->GetOuter() != TransitionNode)
-	{
-		OutError = FString::Printf(
-			TEXT("Transition bound graph ownership mismatch on node %s after repair"),
-			*DescribeNode_ImportBpy(TransitionNode));
-		return false;
-	}
-
-	return true;
-}
-
-bool EnsureConduitBoundGraphOwnership_ImportBpy(UAnimStateConduitNode* ConduitNode, FString& OutError)
-{
-	if (!ConduitNode)
-	{
-		return false;
-	}
-
-	UEdGraph* ExistingBoundGraph = ConduitNode->BoundGraph;
-	if (ExistingBoundGraph && ExistingBoundGraph->GetOuter() == ConduitNode)
-	{
-		return true;
-	}
-
-	UEdGraph* ParentGraph = ConduitNode->GetGraph();
-	if (!ParentGraph)
-	{
-		OutError = FString::Printf(
-			TEXT("Conduit node %s does not have a parent graph"),
-			*DescribeNode_ImportBpy(ConduitNode));
-		return false;
-	}
-
-	UEdGraph* NewBoundGraph = FBlueprintEditorUtils::CreateNewGraph(
-		ConduitNode,
-		NAME_None,
-		UAnimationTransitionGraph::StaticClass(),
-		UAnimationTransitionSchema::StaticClass());
-	if (!NewBoundGraph)
-	{
-		OutError = FString::Printf(
-			TEXT("Failed to create conduit bound graph for node %s"),
-			*DescribeNode_ImportBpy(ConduitNode));
-		return false;
-	}
-
-	FEdGraphUtilities::RenameGraphToNameOrCloseToName(NewBoundGraph, TEXT("Conduit"));
-
-	const UEdGraphSchema* Schema = NewBoundGraph->GetSchema();
-	if (!Schema)
-	{
-		OutError = FString::Printf(
-			TEXT("Conduit bound graph for node %s is missing a graph schema"),
-			*DescribeNode_ImportBpy(ConduitNode));
-		return false;
-	}
-
-	Schema->CreateDefaultNodesForGraph(*NewBoundGraph);
-
-	if (ParentGraph->SubGraphs.Find(NewBoundGraph) == INDEX_NONE)
-	{
-		ParentGraph->Modify();
-		ParentGraph->SubGraphs.Add(NewBoundGraph);
-	}
-
-	FObjectPropertyBase* BoundGraphProperty =
-		FindFProperty<FObjectPropertyBase>(UAnimStateNodeBase::StaticClass(), TEXT("BoundGraph"));
-	if (!BoundGraphProperty)
-	{
-		OutError = TEXT("Cannot resolve UAnimStateNodeBase.BoundGraph property");
-		return false;
-	}
-
-	BoundGraphProperty->SetObjectPropertyValue_InContainer(ConduitNode, NewBoundGraph);
-	UEdGraph* FinalBoundGraph = ConduitNode->BoundGraph;
-	if (!FinalBoundGraph || FinalBoundGraph->GetOuter() != ConduitNode)
-	{
-		OutError = FString::Printf(
-			TEXT("Conduit bound graph ownership mismatch on node %s after repair"),
-			*DescribeNode_ImportBpy(ConduitNode));
-		return false;
-	}
-
-	return true;
-}
-
 bool IsNodeGuidAlreadyUsedInBlueprint_ImportBpy(UBlueprint* BP, const FGuid& Guid, const UEdGraphNode* IgnoreNode)
 {
 	if (!BP || !Guid.IsValid())
@@ -9781,8 +9086,26 @@ bool IsNodeGuidAlreadyUsedInBlueprint_ImportBpy(UBlueprint* BP, const FGuid& Gui
 		return false;
 	}
 
-	// Keep GUID uniqueness blueprint-wide. AnimBlueprint compile enforces this
-	// across child graphs and will regenerate duplicates otherwise.
+	// UE can legitimately reuse node GUIDs across different nested anim graphs
+	// (for example separate transition graphs). Treat collisions as graph-local
+	// when we are restoring an imported node's serialized GUID.
+	if (IgnoreNode && IgnoreNode->GetGraph())
+	{
+		for (UEdGraphNode* ExistingNode : IgnoreNode->GetGraph()->Nodes)
+		{
+			if (!ExistingNode || ExistingNode == IgnoreNode)
+			{
+				continue;
+			}
+
+			if (ExistingNode->NodeGuid == Guid)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
 
 	TArray<UEdGraph*> RootGraphs;
 	BP->GetAllGraphs(RootGraphs);
@@ -9831,18 +9154,6 @@ void ResetAnimationGraphResultNode_ImportBpy(UEdGraph* Graph)
 	{
 		ResultNodeProperty->SetObjectPropertyValue_InContainer(Graph, nullptr);
 	}
-
-	// Blend stack graphs store their output root in ResultNode instead of
-	// MyResultNode. Clear it when rebuilding the graph so we don't keep a stale
-	// pointer to the previous default Output Pose node.
-	FObjectPropertyBase* BlendStackResultNodeProperty =
-		FindFProperty<FObjectPropertyBase>(Graph->GetClass(), TEXT("ResultNode"));
-	if (BlendStackResultNodeProperty &&
-		BlendStackResultNodeProperty->PropertyClass &&
-		BlendStackResultNodeProperty->PropertyClass->IsChildOf(UEdGraphNode::StaticClass()))
-	{
-		BlendStackResultNodeProperty->SetObjectPropertyValue_InContainer(Graph, nullptr);
-	}
 }
 
 void AssignAnimationGraphResultNode_ImportBpy(UEdGraph* Graph, UEdGraphNode* Node)
@@ -9859,22 +9170,14 @@ void AssignAnimationGraphResultNode_ImportBpy(UEdGraph* Graph, UEdGraphNode* Nod
 		Graph->IsA<UAnimationTransitionGraph>() && Node->IsA<UAnimGraphNode_TransitionResult>();
 	const bool bIsCustomTransitionGraphResult =
 		Graph->IsA<UAnimationCustomTransitionGraph>() && Node->IsA<UAnimGraphNode_CustomTransitionResult>();
-	const bool bIsBlendStackGraphResult =
-		Graph->GetClass() &&
-		Graph->GetClass()->GetName().Contains(TEXT("AnimationBlendStackGraph"), ESearchCase::IgnoreCase) &&
-		Node->GetClass() &&
-		Node->GetClass()->GetName().Contains(TEXT("AnimGraphNode_BlendStackResult"), ESearchCase::IgnoreCase);
-	if (!bIsStateGraphResult && !bIsTransitionGraphResult && !bIsCustomTransitionGraphResult && !bIsBlendStackGraphResult)
+	if (!bIsStateGraphResult && !bIsTransitionGraphResult && !bIsCustomTransitionGraphResult)
 	{
 		return;
 	}
 
-	const TCHAR* ResultPropertyName = bIsBlendStackGraphResult ? TEXT("ResultNode") : TEXT("MyResultNode");
 	FObjectPropertyBase* ResultNodeProperty =
-		FindFProperty<FObjectPropertyBase>(Graph->GetClass(), ResultPropertyName);
-	if (ResultNodeProperty &&
-		ResultNodeProperty->PropertyClass &&
-		ResultNodeProperty->PropertyClass->IsChildOf(UEdGraphNode::StaticClass()))
+		FindFProperty<FObjectPropertyBase>(Graph->GetClass(), TEXT("MyResultNode"));
+	if (ResultNodeProperty)
 	{
 		ResultNodeProperty->SetObjectPropertyValue_InContainer(Graph, Node);
 	}
@@ -10159,10 +9462,6 @@ static bool ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(
 		{
 			continue;
 		}
-		if (IsNodeOwnedNestedGraphJson_ImportBpy(GraphObj))
-		{
-			continue;
-		}
 
 		UEdGraph* Graph = nullptr;
 		FString GraphType;
@@ -10327,11 +9626,6 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 
 		for (const TSharedPtr<FJsonObject>& GraphObj : SortedGraphs)
 		{
-			if (IsNodeOwnedNestedGraphJson_ImportBpy(GraphObj))
-			{
-				continue;
-			}
-
 			UEdGraph* Graph = nullptr;
 			FString GraphType;
 			FString GraphName;
@@ -10342,41 +9636,23 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 		}
 
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
-		// Do not force skeleton regeneration mid-import for AnimBlueprints.
-		// Reconstruct during import can invalidate nested anim graphs we just restored.
-
-		for (const TSharedPtr<FJsonObject>& GraphObj : SortedGraphs)
+		if (Cast<UAnimBlueprint>(BP))
 		{
-			if (IsNodeOwnedNestedGraphJson_ImportBpy(GraphObj))
+			if (!FKismetEditorUtilities::GenerateBlueprintSkeleton(BP, true) && !BP->SkeletonGeneratedClass)
 			{
-				continue;
-			}
-
-			if (!CreateGraph(BP, GraphObj, OutError))
-			{
+				OutError = FString::Printf(
+					TEXT("Failed to regenerate skeleton for anim blueprint '%s' before graph population"),
+					*BP->GetPathName());
 				return false;
 			}
 		}
 
-		if (!RebindUnresolvedSelfContextCallsAndReplaySerializedPins_ImportBpy(BP, SortedGraphs, OutError))
+		for (const TSharedPtr<FJsonObject>& GraphObj : SortedGraphs)
 		{
-			return false;
-		}
-	}
-
-	// Keep chooser references identical to the exported source asset.
-	// Retargeting to *_For_* chooser copies introduces runtime divergence for cloned ABPs.
-	constexpr bool bEnableChooserRetargeting_ImportBpy = false;
-	if (bEnableChooserRetargeting_ImportBpy)
-	{
-		bool bRetargetedChooserTables = false;
-		if (!RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(BP, bRetargetedChooserTables, OutError))
-		{
-			return false;
-		}
-		if (bRetargetedChooserTables)
-		{
-			FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+			if (!CreateGraph(BP, GraphObj, OutError))
+			{
+				return false;
+			}
 		}
 	}
 
@@ -10432,191 +9708,6 @@ FString UBPDirectImporter::ImportBlueprintFromJsonDetailed(
 	ResultObj->SetStringField(TEXT("error"), OutError);
 	ResultObj->SetStringField(TEXT("asset_path"), TargetAssetPath);
 	ResultObj->SetBoolField(TEXT("compiled"), bSuccess && bCompileBlueprint);
-
-	FString ResultJson;
-	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ResultJson);
-	FJsonSerializer::Serialize(ResultObj, Writer);
-	return ResultJson;
-}
-
-static bool RestoreCreateDelegatesFromRootJson_ImportBpy(
-	UBlueprint* BP,
-	const TSharedPtr<FJsonObject>& Root,
-	int32& OutDelegateNodeCount,
-	int32& OutRestoredDelegateCount,
-	FString& OutError)
-{
-	OutDelegateNodeCount = 0;
-	OutRestoredDelegateCount = 0;
-
-	if (!BP || !Root.IsValid())
-	{
-		OutError = TEXT("Invalid blueprint or root json while restoring CreateDelegate bindings");
-		return false;
-	}
-
-	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
-	if (!Root->TryGetArrayField(TEXT("graphs"), GraphsArr) || !GraphsArr)
-	{
-		return true;
-	}
-
-	for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
-	{
-		const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
-		if (!GraphObj.IsValid())
-		{
-			continue;
-		}
-
-		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
-		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
-		{
-			continue;
-		}
-
-		TMap<FString, UEdGraphNode*> NodeMap;
-		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
-		{
-			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
-			if (!NodeObj.IsValid())
-			{
-				continue;
-			}
-
-			FString NodeClassName;
-			NodeObj->TryGetStringField(TEXT("node_class"), NodeClassName);
-			if (NodeClassName != TEXT("K2Node_CreateDelegate"))
-			{
-				continue;
-			}
-
-			++OutDelegateNodeCount;
-
-			FString NodeUid;
-			if (!NodeObj->TryGetStringField(TEXT("uid"), NodeUid) || NodeUid.IsEmpty())
-			{
-				OutError = TEXT("CreateDelegate node is missing uid in import json");
-				return false;
-			}
-
-			FGuid ParsedGuid;
-			UEdGraphNode* FoundNode = FindImportedNodeBySerializedUid_ImportBpy(BP, NodeUid);
-			if (!FoundNode && TryParseGuid_ImportBpy(NodeUid, ParsedGuid))
-			{
-				FoundNode = FindImportedNodeByGuidScan_ImportBpy(BP, ParsedGuid);
-			}
-			if (!FoundNode)
-			{
-				OutError = FString::Printf(
-					TEXT("Cannot locate imported CreateDelegate node by uid/guid: %s"),
-					*NodeUid);
-				return false;
-			}
-
-			if (!Cast<UK2Node_CreateDelegate>(FoundNode))
-			{
-				OutError = FString::Printf(
-					TEXT("Guid %s does not resolve to K2Node_CreateDelegate"),
-					*NodeUid);
-				return false;
-			}
-
-			NodeMap.Add(NodeUid, FoundNode);
-		}
-
-		if (NodeMap.Num() == 0)
-		{
-			continue;
-		}
-
-		if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, true, OutError))
-		{
-			return false;
-		}
-
-		for (const TPair<FString, UEdGraphNode*>& Pair : NodeMap)
-		{
-			if (const UK2Node_CreateDelegate* RestoredNode = Cast<UK2Node_CreateDelegate>(Pair.Value))
-			{
-				if (!RestoredNode->GetFunctionName().IsNone())
-				{
-					++OutRestoredDelegateCount;
-				}
-			}
-		}
-	}
-
-	return true;
-}
-
-bool UBPDirectImporter::RestoreCreateDelegatesFromJson(
-	const FString& JsonData,
-	const FString& TargetAssetPath,
-	FString& OutError)
-{
-	TSharedPtr<FJsonObject> Root;
-	{
-		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonData);
-		if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
-		{
-			OutError = TEXT("Failed to parse JSON while restoring CreateDelegate bindings");
-			return false;
-		}
-	}
-
-	UBlueprint* const BP = LoadBlueprintAsset_ImportBpy(TargetAssetPath);
-	if (!BP)
-	{
-		OutError = FString::Printf(TEXT("Unable to load blueprint asset for delegate restore: %s"), *TargetAssetPath);
-		return false;
-	}
-
-	int32 DelegateNodeCount = 0;
-	int32 RestoredDelegateCount = 0;
-	if (!RestoreCreateDelegatesFromRootJson_ImportBpy(BP, Root, DelegateNodeCount, RestoredDelegateCount, OutError))
-	{
-		return false;
-	}
-
-	if (DelegateNodeCount > 0 && RestoredDelegateCount != DelegateNodeCount)
-	{
-		OutError = FString::Printf(
-			TEXT("CreateDelegate restore mismatch: expected=%d restored=%d"),
-			DelegateNodeCount,
-			RestoredDelegateCount);
-		return false;
-	}
-
-	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
-	BP->MarkPackageDirty();
-	if (!SaveBlueprint(BP, OutError))
-	{
-		return false;
-	}
-
-	UE_LOG(
-		LogTemp,
-		Warning,
-		TEXT("[ExportBpy] RestoreCreateDelegatesFromJson target=%s delegates=%d restored=%d"),
-		*TargetAssetPath,
-		DelegateNodeCount,
-		RestoredDelegateCount);
-
-	return true;
-}
-
-FString UBPDirectImporter::RestoreCreateDelegatesFromJsonDetailed(
-	const FString& JsonData,
-	const FString& TargetAssetPath)
-{
-	FString OutError;
-	const bool bSuccess = RestoreCreateDelegatesFromJson(JsonData, TargetAssetPath, OutError);
-
-	TSharedRef<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-	ResultObj->SetBoolField(TEXT("success"), bSuccess);
-	ResultObj->SetStringField(TEXT("error"), OutError);
-	ResultObj->SetStringField(TEXT("asset_path"), TargetAssetPath);
 
 	FString ResultJson;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ResultJson);
@@ -10833,56 +9924,13 @@ bool UBPDirectImporter::PopulateGraph(
 
 	const FString GraphName = GraphJson->GetStringField(TEXT("name"));
 	const FString GraphType = GraphJson->GetStringField(TEXT("graph_type"));
-	const bool bIsBlendStackGraph = IsBlendStackGraphLike_ImportBpy(Graph);
-	const FString EffectiveGraphType =
-		(bIsBlendStackGraph && GraphType == TEXT("event_graph")) ? TEXT("blend_stack") : GraphType;
-	FString SerializedGraphOuterKind;
-	GraphJson->TryGetStringField(TEXT("graph_outer"), SerializedGraphOuterKind);
-	FString SerializedGraphGuidText;
-	if (GraphJson->TryGetStringField(TEXT("graph_guid"), SerializedGraphGuidText) &&
-		!SerializedGraphGuidText.IsEmpty())
-	{
-		FGuid SerializedGraphGuid;
-		if (TryParseGuid_ImportBpy(SerializedGraphGuidText, SerializedGraphGuid) &&
-			Graph->GraphGuid != SerializedGraphGuid)
-		{
-			Graph->Modify();
-			Graph->GraphGuid = SerializedGraphGuid;
-		}
-	}
-	if (bIsBlendStackGraph && SerializedGraphOuterKind.Equals(TEXT("Node"), ESearchCase::IgnoreCase))
-	{
-		if (!Graph->GetOuter() || !Graph->GetOuter()->IsA<UEdGraphNode>())
-		{
-			OutError = FString::Printf(
-				TEXT("BlendStack graph '%s' expects outer kind 'Node' from export, but resolved outer kind is '%s'."),
-				*Graph->GetName(),
-				*DescribeGraphOuterKind_ImportBpy(Graph));
-			return false;
-		}
-	}
 	const bool bTreatAsRegularFunctionGraph =
-		(EffectiveGraphType == TEXT("function")) &&
-		!IsAnimBlueprintFunctionGraph_ImportBpy(BP, Graph, GraphJson, EffectiveGraphType, GraphName);
+		(GraphType == TEXT("function")) &&
+		!IsAnimBlueprintFunctionGraph_ImportBpy(BP, Graph, GraphJson, GraphType, GraphName);
 
 	if (!GraphName.IsEmpty() && Graph->GetName() != GraphName)
 	{
-		const bool bIsNodeOwnedNestedGraph = Graph->GetOuter() && Graph->GetOuter()->IsA<UEdGraphNode>();
-		if (bIsNodeOwnedNestedGraph)
-		{
-			// Avoid blueprint-level graph rename broadcasts while importing nested anim graphs.
-			// UK2Node_AnimGetter listens to those events and can assert before ownership is fully restored.
-			FEdGraphUtilities::RenameGraphToNameOrCloseToName(Graph, *GraphName);
-		}
-		else
-		{
-			FBlueprintEditorUtils::RenameGraph(Graph, GraphName);
-		}
-	}
-
-	if (!RepairStateMachineSubgraphOwnershipBeforeClear_ImportBpy(Graph, OutError))
-	{
-		return false;
+		FBlueprintEditorUtils::RenameGraph(Graph, GraphName);
 	}
 
 	// Import is authoritative for a graph. Clear pre-existing/default nodes first so
@@ -11046,35 +10094,6 @@ bool UBPDirectImporter::PopulateGraph(
 
 	if (GraphJson->TryGetArrayField(TEXT("nodes"), NodesArr))
 	{
-		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
-		{
-			const TSharedPtr<FJsonObject> NodeObj = NodeValue->AsObject();
-			if (!NodeObj.IsValid())
-			{
-				continue;
-			}
-
-			const FString NodeClass = NodeObj->GetStringField(TEXT("node_class"));
-			if (NodeClass != TEXT("K2Node_EvaluateChooser") && NodeClass != TEXT("K2Node_EvaluateChooser2"))
-			{
-				continue;
-			}
-
-			FString MissingChooserProperties;
-			if (!HasEvaluateChooserMetadata_ImportBpy(NodeObj, MissingChooserProperties))
-			{
-				FString NodeUid;
-				NodeObj->TryGetStringField(TEXT("uid"), NodeUid);
-				OutError = FString::Printf(
-					TEXT("Legacy chooser export detected in graph '%s': node '%s' (uid=%s) is missing required metadata [%s]. Re-export the source Blueprint with the latest ExportBpy and retry import."),
-					*Graph->GetName(),
-					*NodeClass,
-					NodeUid.IsEmpty() ? TEXT("<none>") : *NodeUid,
-					MissingChooserProperties.IsEmpty() ? TEXT("Chooser, Mode") : *MissingChooserProperties);
-				return false;
-			}
-		}
-
 	if (bPreserveTunnelNodes)
 	{
 		bool bMappedEntryTunnel = false;
@@ -11120,7 +10139,7 @@ bool UBPDirectImporter::PopulateGraph(
 		}
 	}
 
-		if (EffectiveGraphType == TEXT("event_graph"))
+		if (GraphType == TEXT("event_graph"))
 		{
 			for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
 			{
@@ -11222,13 +10241,7 @@ bool UBPDirectImporter::PopulateGraph(
 
 	if (NodesArr)
 	{
-		const bool bIsTopLevelGraphForStructuralRefresh =
-			(Graph != nullptr) &&
-			(Graph->GetOuter() == BP);
-		if (bIsTopLevelGraphForStructuralRefresh)
-		{
-			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
-		}
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 
 		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
 		{
@@ -11245,41 +10258,14 @@ bool UBPDirectImporter::PopulateGraph(
 				continue;
 			}
 
-			UEdGraphNode* const ExistingNodePtr = *ExistingNode;
-			const bool bOwnsNestedAnimGraph =
-				Cast<UAnimGraphNode_StateMachineBase>(ExistingNodePtr) != nullptr ||
-				Cast<UAnimStateNode>(ExistingNodePtr) != nullptr ||
-				Cast<UAnimStateConduitNode>(ExistingNodePtr) != nullptr ||
-				Cast<UAnimStateTransitionNode>(ExistingNodePtr) != nullptr;
-			const bool bIsTopLevelAnimBlueprintGraphPass =
-				bIsTopLevelGraphForStructuralRefresh &&
-				Cast<UAnimBlueprint>(BP) != nullptr &&
-				(Graph->IsA<UAnimationGraph>() ||
-					(Graph->GetSchema() && Graph->GetSchema()->IsA<UAnimationGraphSchema>()));
-			const bool bDeferNestedImportsForStateMachineNode =
-				bIsTopLevelAnimBlueprintGraphPass &&
-				Cast<UAnimGraphNode_StateMachineBase>(ExistingNodePtr) != nullptr;
-			const UK2Node_AnimGetter* const AnimGetterNode = Cast<UK2Node_AnimGetter>(ExistingNodePtr);
-			const bool bSkipPreApplyReconstructForAnimGetter =
-				AnimGetterNode && !AnimGetterNode->HasValidBlueprint();
-			const bool bCanReconstructNow =
-				!bOwnsNestedAnimGraph &&
-				!bSkipPreApplyReconstructForAnimGetter &&
-				(bIsTopLevelGraphForStructuralRefresh ||
-				(FBlueprintEditorUtils::FindBlueprintForNode(ExistingNodePtr) != nullptr));
-			if (bCanReconstructNow)
-			{
-				ExistingNodePtr->ReconstructNode();
-			}
-			if (!ApplyNodeJsonToNode_ImportBpy(
-					ExistingNodePtr,
-					NodeObj,
-					OutError,
-					bDeferNestedImportsForStateMachineNode))
+			(*ExistingNode)->ReconstructNode();
+			if (!ApplyNodeJsonToNode_ImportBpy(*ExistingNode, NodeObj, OutError, false))
 			{
 				return false;
 			}
 		}
+
+		LogTrackedTraversalNodesFromMap_ImportBpy(TEXT("after_reconstruct_apply"), NodesArr, NodeMap);
 	}
 
 	if (!RestoreStateMachineAliasNodesAfterCreation_ImportBpy(NodesArr, NodeMap, OutError))
@@ -11294,24 +10280,18 @@ bool UBPDirectImporter::PopulateGraph(
 	const bool bIsAnimationGraph =
 		Graph->IsA<UAnimationGraph>() ||
 		(Graph->GetSchema() && Graph->GetSchema()->IsA<UAnimationGraphSchema>());
-	const bool bIsTopLevelBlueprintGraph =
-		(Graph != nullptr) &&
-		(Graph->GetOuter() == BP);
-	if (NodesArr &&
-		EffectiveGraphType == TEXT("event_graph") &&
-		!bIsAnimationGraph &&
-		!bIsBlendStackGraph &&
-		!Cast<UAnimBlueprint>(BP))
+	if (NodesArr && GraphType == TEXT("event_graph"))
 	{
 		FKismetEditorUtilities::GenerateBlueprintSkeleton(BP, true);
 		RebindUnresolvedSelfContextCallNodes_ImportBpy(NodeMap);
 	}
-	if (NodesArr && Cast<UAnimBlueprint>(BP) && bIsAnimationGraph && bIsTopLevelBlueprintGraph)
+	if (NodesArr && Cast<UAnimBlueprint>(BP) && bIsAnimationGraph)
 	{
-		RebindUnresolvedSelfContextCallNodes_ImportBpy(NodeMap);
+		FKismetEditorUtilities::GenerateBlueprintSkeleton(BP, true);
 
-		// Keep nested anim-node editor graphs stable during import. Skeleton rebuild here
-		// can recreate state-machine / blend-stack subgraphs and invalidate restored links.
+		// Anim blueprint skeleton generation can recreate editor state-machine graphs and
+		// silently replace their internal node GUIDs. Replay only state-machine nodes here
+		// so nested state graphs keep the serialized uid/node_guid values before export.
 		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
 		{
 			const TSharedPtr<FJsonObject> NodeObj = NodeValue->AsObject();
@@ -11322,20 +10302,12 @@ bool UBPDirectImporter::PopulateGraph(
 
 			const FString Uid = NodeObj->GetStringField(TEXT("uid"));
 			UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
-			if (!ExistingNode || !*ExistingNode)
+			if (!ExistingNode || !*ExistingNode || !Cast<UAnimGraphNode_StateMachineBase>(*ExistingNode))
 			{
 				continue;
 			}
 
-			UEdGraphNode* const ExistingNodePtr = *ExistingNode;
-			const bool bIsStateMachineNode = Cast<UAnimGraphNode_StateMachineBase>(ExistingNodePtr) != nullptr;
-			const bool bIsBlendStackNode = ResolveBlendStackGraph_ImportBpy(ExistingNodePtr) != nullptr;
-			if (!bIsStateMachineNode && !bIsBlendStackNode)
-			{
-				continue;
-			}
-
-			if (!ApplyNodeJsonToNode_ImportBpy(ExistingNodePtr, NodeObj, OutError, false))
+			if (!ApplyNodeJsonToNode_ImportBpy(*ExistingNode, NodeObj, OutError, false))
 			{
 				return false;
 			}
@@ -11350,17 +10322,217 @@ bool UBPDirectImporter::PopulateGraph(
 		}
 	}
 
+	BreakAllGraphLinks_ImportBpy(Graph);
+
 	const TArray<TSharedPtr<FJsonValue>>* ConnsArr = nullptr;
 	GraphJson->TryGetArrayField(TEXT("connections"), ConnsArr);
 
-	auto ReplaySerializedConnections = [&](const TCHAR* PhaseLabel, const bool bAllowUnresolvedAtStall) -> bool
+	struct FPendingConnection_ImportBpy
+	{
+		TSharedPtr<FJsonObject> Json;
+		int32 Priority = 2;
+		int32 OriginalIndex = INDEX_NONE;
+	};
+
+	const auto IsPromotableOperatorNode = [](const UEdGraphNode* Node) -> bool
+	{
+		const UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node);
+		if (!CallNode)
+		{
+			return false;
+		}
+
+		const FString NodeClassName = CallNode->GetClass()->GetName();
+		return NodeClassName == TEXT("K2Node_PromotableOperator") ||
+			NodeClassName == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
+	};
+
+	TSet<FString> PromotableNodesExpectingSplitDefaults;
+	if (NodesArr)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			FString NodeUid;
+			NodeObj->TryGetStringField(TEXT("uid"), NodeUid);
+			if (NodeUid.IsEmpty())
+			{
+				continue;
+			}
+
+			const TSharedPtr<FJsonObject>* DefaultsObj = nullptr;
+			if (!NodeObj->TryGetObjectField(TEXT("defaults"), DefaultsObj) || !DefaultsObj || !DefaultsObj->IsValid())
+			{
+				continue;
+			}
+
+			bool bExpectsSplitDefaults = false;
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& DefaultEntry : (*DefaultsObj)->Values)
+			{
+				const FString& PinName = DefaultEntry.Key;
+				if (PinName.EndsWith(TEXT("_X")) ||
+					PinName.EndsWith(TEXT("_Y")) ||
+					PinName.EndsWith(TEXT("_Z")) ||
+					PinName.EndsWith(TEXT("_W")))
+				{
+					bExpectsSplitDefaults = true;
+					break;
+				}
+			}
+
+			if (bExpectsSplitDefaults)
+			{
+				PromotableNodesExpectingSplitDefaults.Add(NodeUid);
+			}
+		}
+	}
+
+	// Connection order influences wildcard/promotion decisions.
+	// Stabilize by feeding promotable destinations from concrete sources first,
+	// then promotable->promotable links, then the rest.
+	auto ComputeConnectionPriority = [&](const TSharedPtr<FJsonObject>& ConnObj) -> int32
+	{
+		if (!ConnObj.IsValid())
+		{
+			return 200;
+		}
+
+		const FString SrcUid = ConnObj->GetStringField(TEXT("src_node"));
+		const FString DstUid = ConnObj->GetStringField(TEXT("dst_node"));
+
+		UEdGraphNode* const* SrcNodePtr = NodeMap.Find(SrcUid);
+		UEdGraphNode* const* DstNodePtr = NodeMap.Find(DstUid);
+		if (!SrcNodePtr || !*SrcNodePtr || !DstNodePtr || !*DstNodePtr)
+		{
+			return 200;
+		}
+
+		const bool bSrcPromotable = IsPromotableOperatorNode(*SrcNodePtr);
+		const bool bDstPromotable = IsPromotableOperatorNode(*DstNodePtr);
+		if (!bSrcPromotable && !bDstPromotable)
+		{
+			return 200;
+		}
+		const bool bDstPrefersStructInputs = PromotableNodesExpectingSplitDefaults.Contains(DstUid);
+
+		FString SrcPin = ConnObj->GetStringField(TEXT("src_pin"));
+		FString DstPin = ConnObj->GetStringField(TEXT("dst_pin"));
+		FString SrcPinFull;
+		FString DstPinFull;
+		FString SrcPinId;
+		FString DstPinId;
+		ConnObj->TryGetStringField(TEXT("src_pin_full"), SrcPinFull);
+		ConnObj->TryGetStringField(TEXT("dst_pin_full"), DstPinFull);
+		ConnObj->TryGetStringField(TEXT("src_pin_id"), SrcPinId);
+		ConnObj->TryGetStringField(TEXT("dst_pin_id"), DstPinId);
+
+		UEdGraphPin* ResolvedSrcPin = FindPinById_ImportBpy(*SrcNodePtr, SrcPinId);
+		if (!ResolvedSrcPin || ResolvedSrcPin->Direction != EGPD_Output)
+		{
+			ResolvedSrcPin = nullptr;
+		}
+		if (!ResolvedSrcPin)
+		{
+			ResolvedSrcPin = (*SrcNodePtr)->FindPin(FName(*SrcPinFull), EGPD_Output);
+		}
+		if (!ResolvedSrcPin)
+		{
+			ResolvedSrcPin = (*SrcNodePtr)->FindPin(FName(*SrcPin), EGPD_Output);
+		}
+		if (!ResolvedSrcPin)
+		{
+			ResolvedSrcPin = FindPinFlexible_ImportBpy(
+				*SrcNodePtr,
+				!SrcPinFull.IsEmpty() ? SrcPinFull : SrcPin,
+				EGPD_Output);
+		}
+
+		UEdGraphPin* ResolvedDstPin = FindPinById_ImportBpy(*DstNodePtr, DstPinId);
+		if (!ResolvedDstPin || ResolvedDstPin->Direction != EGPD_Input)
+		{
+			ResolvedDstPin = nullptr;
+		}
+		if (!ResolvedDstPin)
+		{
+			ResolvedDstPin = (*DstNodePtr)->FindPin(FName(*DstPinFull), EGPD_Input);
+		}
+		if (!ResolvedDstPin)
+		{
+			ResolvedDstPin = (*DstNodePtr)->FindPin(FName(*DstPin), EGPD_Input);
+		}
+		if (!ResolvedDstPin)
+		{
+			ResolvedDstPin = FindPinFlexible_ImportBpy(
+				*DstNodePtr,
+				!DstPinFull.IsEmpty() ? DstPinFull : DstPin,
+				EGPD_Input);
+		}
+
+		int32 Priority = 100;
+		if (bDstPromotable && !bSrcPromotable)
+		{
+			Priority = 30;
+		}
+		else if (bDstPromotable && bSrcPromotable)
+		{
+			Priority = 40;
+		}
+		else
+		{
+			Priority = 60;
+		}
+
+		const auto IsScalarCategory = [](const FName& Category) -> bool
+		{
+			return Category == UEdGraphSchema_K2::PC_Real ||
+				Category == UEdGraphSchema_K2::PC_Int ||
+				Category == UEdGraphSchema_K2::PC_Int64 ||
+				Category == UEdGraphSchema_K2::PC_Byte ||
+				Category == UEdGraphSchema_K2::PC_Boolean ||
+				Category == UEdGraphSchema_K2::PC_Name ||
+				Category == UEdGraphSchema_K2::PC_String ||
+				Category == UEdGraphSchema_K2::PC_Text;
+		};
+
+		if (ResolvedSrcPin)
+		{
+			const FName SrcCategory = ResolvedSrcPin->PinType.PinCategory;
+			if (IsScalarCategory(SrcCategory))
+			{
+				Priority += bDstPrefersStructInputs ? 20 : -15;
+			}
+			else if (SrcCategory == UEdGraphSchema_K2::PC_Struct)
+			{
+				Priority += bDstPrefersStructInputs ? -25 : 20;
+			}
+			else if (SrcCategory == UEdGraphSchema_K2::PC_Wildcard)
+			{
+				Priority += 25;
+			}
+		}
+
+		if (ResolvedDstPin && ResolvedDstPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard)
+		{
+			Priority -= 5;
+		}
+
+		return Priority;
+	};
+
+	auto ReplaySerializedConnections = [&](const TCHAR* PhaseLabel) -> bool
 	{
 		if (!ConnsArr)
 		{
 			return true;
 		}
 
-		TArray<TSharedPtr<FJsonObject>> PendingConnections;
+		TArray<FPendingConnection_ImportBpy> PendingConnections;
+		int32 PendingIndex = 0;
 		for (const TSharedPtr<FJsonValue>& CJ : *ConnsArr)
 		{
 			const TSharedPtr<FJsonObject> ConnObj = CJ->AsObject();
@@ -11369,18 +10541,34 @@ bool UBPDirectImporter::PopulateGraph(
 				continue;
 			}
 
-			PendingConnections.Add(ConnObj);
+			FPendingConnection_ImportBpy& PendingConnection = PendingConnections.AddDefaulted_GetRef();
+			PendingConnection.Json = ConnObj;
+			PendingConnection.OriginalIndex = PendingIndex++;
 		}
 
 		while (PendingConnections.Num() > 0)
 		{
+			for (FPendingConnection_ImportBpy& PendingConnection : PendingConnections)
+			{
+				PendingConnection.Priority = ComputeConnectionPriority(PendingConnection.Json);
+			}
+			PendingConnections.Sort([](const FPendingConnection_ImportBpy& A, const FPendingConnection_ImportBpy& B)
+			{
+				if (A.Priority != B.Priority)
+				{
+					return A.Priority < B.Priority;
+				}
+				return A.OriginalIndex < B.OriginalIndex;
+			});
+
 			bool bMadeProgress = false;
 			FString LastConnectError;
-			TArray<TSharedPtr<FJsonObject>> RemainingConnections;
-			RemainingConnections.Reserve(PendingConnections.Num());
+			int32 ConnectedIndex = INDEX_NONE;
 
-			for (const TSharedPtr<FJsonObject>& ConnObj : PendingConnections)
+			for (int32 PendingConnectionIndex = 0; PendingConnectionIndex < PendingConnections.Num(); ++PendingConnectionIndex)
 			{
+				const FPendingConnection_ImportBpy& PendingConnection = PendingConnections[PendingConnectionIndex];
+				const TSharedPtr<FJsonObject>& ConnObj = PendingConnection.Json;
 				if (!ConnObj.IsValid())
 				{
 					continue;
@@ -11415,27 +10603,15 @@ bool UBPDirectImporter::PopulateGraph(
 				if (ConnectPins(*SrcNodePtr, SrcPin, SrcPinFull, SrcPinId, *DstNodePtr, DstPin, DstPinFull, DstPinId, ConnectError))
 				{
 					bMadeProgress = true;
-					continue;
+					ConnectedIndex = PendingConnectionIndex;
+					break;
 				}
 
 				LastConnectError = ConnectError;
-				RemainingConnections.Add(ConnObj);
 			}
 
 			if (!bMadeProgress)
 			{
-				if (bAllowUnresolvedAtStall)
-				{
-					UE_LOG(
-						LogTemp,
-						Warning,
-						TEXT("[ExportBpy] [%s] Deferring unresolved connections (remaining=%d, last_error=%s)"),
-						PhaseLabel ? PhaseLabel : TEXT("connections"),
-						PendingConnections.Num(),
-						LastConnectError.IsEmpty() ? TEXT("<none>") : *LastConnectError);
-					return true;
-				}
-
 				if (LastConnectError.IsEmpty())
 				{
 					OutError = FString::Printf(
@@ -11452,19 +10628,22 @@ bool UBPDirectImporter::PopulateGraph(
 				return false;
 			}
 
-			PendingConnections = MoveTemp(RemainingConnections);
+			if (ConnectedIndex != INDEX_NONE)
+			{
+				PendingConnections.RemoveAt(ConnectedIndex);
+			}
 		}
 
 		return true;
 	};
 
-	BreakAllGraphLinks_ImportBpy(Graph);
-	if (!ReplaySerializedConnections(TEXT("initial"), true))
+	if (!ReplaySerializedConnections(TEXT("initial")))
 	{
 		return false;
 	}
+	LogTrackedTraversalNodesFromMap_ImportBpy(TEXT("after_connect_initial"), NodesArr, NodeMap);
 
-	if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, false, OutError))
+	if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, OutError))
 	{
 		return false;
 	}
@@ -11491,6 +10670,7 @@ bool UBPDirectImporter::PopulateGraph(
 				return false;
 			}
 		}
+		LogTrackedTraversalNodesFromMap_ImportBpy(TEXT("after_apply_defaults_post_initial_connect"), NodesArr, NodeMap);
 	}
 
 	if (Cast<UAnimBlueprint>(BP) && bIsAnimationGraph)
@@ -11528,32 +10708,13 @@ bool UBPDirectImporter::PopulateGraph(
 	{
 		return false;
 	}
-
-	if (!ReplaySerializedConnections(TEXT("post_promotable_rebind"), false))
+	LogTrackedTraversalNodesFromMap_ImportBpy(TEXT("after_promotable_rebind"), NodesArr, NodeMap);
+	if (!ReplaySerializedConnections(TEXT("post_promotable_rebind")))
 	{
 		return false;
 	}
-
-	// Replaying links can re-promote wildcard operators based on transient pin state.
-	// Run one final binding pass and stop reconnecting afterwards so exported function refs
-	// remain identical to the source blueprint signatures.
-	if (!RestorePromotableOperatorBindingsAfterConnections_ImportBpy(NodesArr, NodeMap, OutError))
-	{
-		return false;
-	}
-
-	if (!ReplaySerializedConnections(TEXT("post_delegate_rebind"), false))
-	{
-		return false;
-	}
-
-	// Keep CreateDelegate bindings as the final operation in graph population.
-	// Additional connection replay can transiently clear SelectedFunctionName
-	// when delegate pins are temporarily disconnected during node notifications.
-	if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, true, OutError))
-	{
-		return false;
-	}
+	LogTrackedTraversalNodesFromMap_ImportBpy(TEXT("after_connect_post_promotable_rebind"), NodesArr, NodeMap);
+	CleanupUnserializedDisconnectedConversionNodes_ImportBpy(BP, Graph, NodeMap);
 
 	return true;
 }
@@ -11923,79 +11084,13 @@ UEdGraphNode* UBPDirectImporter::CreateNode(
 		Graph->AddNode(SelectNode, false, false);
 		Result = SelectNode;
 	}
-	else if (NodeClass == TEXT("K2Node_AnimGetter"))
-	{
-		UK2Node_AnimGetter* GetterNode = NewObject<UK2Node_AnimGetter>(Graph);
-		if (UAnimBlueprint* OwningAnimBlueprint = ResolveOwningAnimBlueprintForGraph_ImportBpy(Graph))
-		{
-			GetterNode->SourceAnimBlueprint = OwningAnimBlueprint;
-		}
-		GetterNode->CreateNewGuid();
-		GetterNode->PostPlacedNewNode();
-		Graph->AddNode(GetterNode, false, false);
-
-		// Anim getter nodes require a valid owning blueprint during pin allocation.
-		if (!GetterNode->SourceAnimBlueprint)
-		{
-			if (UAnimBlueprint* OwningAnimBlueprint = ResolveOwningAnimBlueprintForGraph_ImportBpy(Graph))
-			{
-				GetterNode->SourceAnimBlueprint = OwningAnimBlueprint;
-			}
-		}
-
-		FString GetterFunctionRef = FunctionRef;
-		FString GetterFunctionName = GetterFunctionRef;
-		FString GetterFunctionOwnerClass;
-		UFunction* GetterFunction = nullptr;
-
-		if (GetterFunctionRef.Split(TEXT("::"), &GetterFunctionOwnerClass, &GetterFunctionName))
-		{
-			if (UClass* ExplicitOwnerClass = ResolveNamedObject_ImportBpy<UClass>(GetterFunctionOwnerClass))
-			{
-				GetterFunction = ExplicitOwnerClass->FindFunctionByName(FName(*GetterFunctionName));
-			}
-		}
-		else
-		{
-			const FString AnimGetterClassPath = GetNodePropString_ImportBpy(NodeJson, TEXT("AnimGetterClass"));
-			if (!AnimGetterClassPath.IsEmpty())
-			{
-				if (UClass* AnimGetterClass = ResolveNamedObject_ImportBpy<UClass>(AnimGetterClassPath))
-				{
-					GetterFunction = AnimGetterClass->FindFunctionByName(FName(*GetterFunctionName));
-				}
-			}
-
-			if (!GetterFunction)
-			{
-				GetterFunction = ResolveSelfContextFunction_ImportBpy(Graph, GetterFunctionName);
-			}
-
-			if (!GetterFunction && IsQualifiedFunctionReference_ImportBpy(GetterFunctionRef))
-			{
-				GetterFunction = ResolveNamedObject_ImportBpy<UFunction>(GetterFunctionRef);
-			}
-		}
-
-		if (GetterFunction)
-		{
-			GetterNode->SetFromFunction(GetterFunction);
-		}
-		else if (!GetterFunctionName.IsEmpty())
-		{
-			GetterNode->FunctionReference.SetSelfMember(FName(*GetterFunctionName));
-		}
-
-		GetterNode->AllocateDefaultPins();
-		Result = GetterNode;
-	}
 	else if (NodeClass == TEXT("K2Node_TransitionRuleGetter"))
 	{
 		UK2Node_TransitionRuleGetter* GetterNode = NewObject<UK2Node_TransitionRuleGetter>(Graph);
 		GetterNode->CreateNewGuid();
 		GetterNode->PostPlacedNewNode();
-		Graph->AddNode(GetterNode, false, false);
 		GetterNode->AllocateDefaultPins();
+		Graph->AddNode(GetterNode, false, false);
 		Result = GetterNode;
 	}
 	// ── Enum Equality / Inequality ───────────────────────────────────
@@ -12042,31 +11137,12 @@ UEdGraphNode* UBPDirectImporter::CreateNode(
 	// ── Set Fields In Struct ─────────────────────────────────────────
 	else if (NodeClass == TEXT("K2Node_SetFieldsInStruct"))
 	{
-		UK2Node_SetFieldsInStruct* SetFieldsNode = NewObject<UK2Node_SetFieldsInStruct>(Graph);
-		if (!SetFieldsNode)
-		{
-			OutError = TEXT("Failed to allocate K2Node_SetFieldsInStruct");
-			return nullptr;
-		}
-
-		if (!TargetType.IsEmpty())
-		{
-			SetFieldsNode->StructType = ResolveNamedObject_ImportBpy<UScriptStruct>(TargetType);
-			if (!SetFieldsNode->StructType)
-			{
-				OutError = FString::Printf(
-					TEXT("Cannot resolve set-fields struct target '%s'"),
-					*TargetType);
-				return nullptr;
-			}
-		}
-
-		SetFieldsNode->CreateNewGuid();
-		SetFieldsNode->PostPlacedNewNode();
-		Graph->AddNode(SetFieldsNode, false, false);
-		SetFieldsNode->AllocateDefaultPins();
-
-		Result = SetFieldsNode;
+		Result = CreateResolvedNodeWithDefaultPins_ImportBpy(
+			Graph,
+			NodeClass,
+			NodeJson,
+			{ TEXT("StructType") },
+			OutError);
 	}
 	// ── Make Array ───────────────────────────────────────────────────
 	else if (NodeClass == TEXT("K2Node_MakeArray"))
@@ -12172,19 +11248,6 @@ UEdGraphNode* UBPDirectImporter::CreateNode(
 	// ── Chooser Nodes ────────────────────────────────────────────────
 	else if (NodeClass == TEXT("K2Node_EvaluateChooser"))
 	{
-		FString MissingChooserProperties;
-		if (!HasEvaluateChooserMetadata_ImportBpy(NodeJson, MissingChooserProperties))
-		{
-			FString NodeUid;
-			NodeJson->TryGetStringField(TEXT("uid"), NodeUid);
-			OutError = FString::Printf(
-				TEXT("Chooser node '%s' (uid=%s) is missing required exported metadata [%s]. Re-export the source Blueprint with the latest ExportBpy and retry import."),
-				*NodeClass,
-				NodeUid.IsEmpty() ? TEXT("<none>") : *NodeUid,
-				MissingChooserProperties.IsEmpty() ? TEXT("Chooser, Mode") : *MissingChooserProperties);
-			return nullptr;
-		}
-
 		Result = CreateResolvedNodeWithDefaultPins_ImportBpy(
 			Graph,
 			NodeClass,
@@ -12194,19 +11257,6 @@ UEdGraphNode* UBPDirectImporter::CreateNode(
 	}
 	else if (NodeClass == TEXT("K2Node_EvaluateChooser2"))
 	{
-		FString MissingChooserProperties;
-		if (!HasEvaluateChooserMetadata_ImportBpy(NodeJson, MissingChooserProperties))
-		{
-			FString NodeUid;
-			NodeJson->TryGetStringField(TEXT("uid"), NodeUid);
-			OutError = FString::Printf(
-				TEXT("Chooser node '%s' (uid=%s) is missing required exported metadata [%s]. Re-export the source Blueprint with the latest ExportBpy and retry import."),
-				*NodeClass,
-				NodeUid.IsEmpty() ? TEXT("<none>") : *NodeUid,
-				MissingChooserProperties.IsEmpty() ? TEXT("Chooser, Mode") : *MissingChooserProperties);
-			return nullptr;
-		}
-
 		Result = CreateResolvedNodeWithDefaultPins_ImportBpy(
 			Graph,
 			NodeClass,
@@ -12640,6 +11690,22 @@ bool UBPDirectImporter::ConnectPins(
 	const FString& DstPinId,
 	FString& OutError)
 {
+	const auto IsPromotableCallNode = [](const UEdGraphNode* Node) -> bool
+	{
+		const UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node);
+		if (!CallNode)
+		{
+			return false;
+		}
+
+		const FString NodeClassName = CallNode->GetClass()->GetName();
+		return NodeClassName == TEXT("K2Node_PromotableOperator") ||
+			NodeClassName == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
+	};
+	const bool bTraceConnection =
+		IsTrackedTraversalNodeInstance_ImportBpy(SrcNode) ||
+		IsTrackedTraversalNodeInstance_ImportBpy(DstNode);
+
 	UEdGraphPin* SrcPin = FindPinById_ImportBpy(SrcNode, SrcPinId);
 	UEdGraphPin* DstPin = FindPinById_ImportBpy(DstNode, DstPinId);
 	if (SrcPin && SrcPin->Direction != EGPD_Output)
@@ -12673,17 +11739,6 @@ bool UBPDirectImporter::ConnectPins(
 
 	const FString RequestedSrcPin = !SrcPinFullName.IsEmpty() ? SrcPinFullName : SrcPinName;
 	const FString RequestedDstPin = !DstPinFullName.IsEmpty() ? DstPinFullName : DstPinName;
-	const auto IsPromotableOperatorCallNode = [](const UK2Node_CallFunction* CallNode) -> bool
-	{
-		if (!CallNode)
-		{
-			return false;
-		}
-
-		const FString NodeClassName = CallNode->GetClass()->GetName();
-		return NodeClassName == TEXT("K2Node_PromotableOperator") ||
-			NodeClassName == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
-	};
 	if (!SrcPin)
 	{
 		if (UK2Node_CallFunction* SrcCallNode = Cast<UK2Node_CallFunction>(SrcNode))
@@ -12709,14 +11764,14 @@ bool UBPDirectImporter::ConnectPins(
 			{
 				EnsureCallFunctionExecPins_ImportBpy(DstCallNode);
 			}
-			else if (
-				SrcPin &&
-				!NormalizedDstPin.IsEmpty() &&
-				!DstCallNode->FindPin(FName(*NormalizedDstPin), EGPD_Input) &&
-				!IsPromotableOperatorCallNode(DstCallNode) &&
-				DstCallNode->GetTargetFunction() == nullptr)
+			else if (SrcPin && !NormalizedDstPin.IsEmpty() && !DstCallNode->FindPin(FName(*NormalizedDstPin), EGPD_Input))
 			{
-				DstCallNode->CreatePin(EGPD_Input, SrcPin->PinType, FName(*NormalizedDstPin));
+				// Do not synthesize data pins on promotable operators. Their pin layout
+				// is schema-driven and ad-hoc pins can poison later promotion/reconstruct.
+				if (!IsPromotableCallNode(DstCallNode))
+				{
+					DstCallNode->CreatePin(EGPD_Input, SrcPin->PinType, FName(*NormalizedDstPin));
+				}
 			}
 			DstPin = FindPinFlexible_ImportBpy(DstNode, RequestedDstPin, EGPD_Input);
 		}
@@ -12724,87 +11779,57 @@ bool UBPDirectImporter::ConnectPins(
 
 	if (!SrcPin || !DstPin)
 	{
-		auto DescribePins = [](UEdGraphNode* Node, EEdGraphPinDirection Direction) -> FString
+		if (bTraceConnection)
 		{
-			if (!Node)
-			{
-				return TEXT("<null-node>");
-			}
-
-			TArray<FString> PinNames;
-			for (UEdGraphPin* Pin : Node->Pins)
-			{
-				if (!Pin || Pin->Direction != Direction)
-				{
-					continue;
-				}
-				PinNames.Add(Pin->PinName.ToString());
-			}
-			return PinNames.Num() > 0 ? FString::Join(PinNames, TEXT(", ")) : TEXT("<none>");
-		};
-
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[IBPY_TRACE] stage=connect_resolve_failed src_node=%s src_req=%s/%s dst_node=%s dst_req=%s/%s"),
+				*DescribeNode_ImportBpy(SrcNode),
+				*SrcPinName,
+				*SrcPinFullName,
+				*DescribeNode_ImportBpy(DstNode),
+				*DstPinName,
+				*DstPinFullName);
+		}
 		OutError = FString::Printf(
-			TEXT("Cannot resolve connection pins: %s.%s -> %s.%s | src_pin=%s src_pin_full=%s src_pin_id=%s | dst_pin=%s dst_pin_full=%s dst_pin_id=%s | src_available=[%s] dst_available=[%s]"),
+			TEXT("Cannot resolve connection pins: %s.%s -> %s.%s"),
 			*DescribeNode_ImportBpy(SrcNode),
 			*(!SrcPinFullName.IsEmpty() ? SrcPinFullName : SrcPinName),
 			*DescribeNode_ImportBpy(DstNode),
-			*(!DstPinFullName.IsEmpty() ? DstPinFullName : DstPinName),
-			*SrcPinName,
-			*SrcPinFullName,
-			*SrcPinId,
-			*DstPinName,
-			*DstPinFullName,
-			*DstPinId,
-			*DescribePins(SrcNode, EGPD_Output),
-			*DescribePins(DstNode, EGPD_Input));
+			*(!DstPinFullName.IsEmpty() ? DstPinFullName : DstPinName));
 		return false;
 	}
 
-	auto EnsureReciprocalLink = [&](const TCHAR* FailurePrefix) -> bool
+	if (SrcPin->LinkedTo.Contains(DstPin))
 	{
-		const bool bSrcHasDst = SrcPin->LinkedTo.Contains(DstPin);
-		const bool bDstHasSrc = DstPin->LinkedTo.Contains(SrcPin);
-		if (bSrcHasDst && bDstHasSrc)
+		if (bTraceConnection)
 		{
-			return true;
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[IBPY_TRACE] stage=connect_already_linked src=%s.%s dst=%s.%s"),
+				*DescribeNode_ImportBpy(SrcNode),
+				*SrcPin->GetName(),
+				*DescribeNode_ImportBpy(DstNode),
+				*DstPin->GetName());
 		}
+		return true;
+	}
 
-		SrcPin->Modify();
-		DstPin->Modify();
-		if (!bSrcHasDst)
-		{
-			SrcPin->LinkedTo.AddUnique(DstPin);
-		}
-		if (!bDstHasSrc)
-		{
-			DstPin->LinkedTo.AddUnique(SrcPin);
-		}
-
-		SrcNode->PinConnectionListChanged(SrcPin);
-		DstNode->PinConnectionListChanged(DstPin);
-		SrcNode->NodeConnectionListChanged();
-		DstNode->NodeConnectionListChanged();
-		if (UEdGraph* Graph = SrcNode->GetGraph())
-		{
-			Graph->NotifyGraphChanged();
-		}
-
-		if (SrcPin->LinkedTo.Contains(DstPin) && DstPin->LinkedTo.Contains(SrcPin))
-		{
-			return true;
-		}
-
-		OutError = FString::Printf(
-			TEXT("%s: %s.%s -> %s.%s | reciprocal=%d/%d"),
-			FailurePrefix,
+	if (bTraceConnection)
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[IBPY_TRACE] stage=connect_resolved src=%s.%s cat=%s dst=%s.%s cat=%s"),
 			*DescribeNode_ImportBpy(SrcNode),
 			*SrcPin->GetName(),
+			*SrcPin->PinType.PinCategory.ToString(),
 			*DescribeNode_ImportBpy(DstNode),
 			*DstPin->GetName(),
-			SrcPin->LinkedTo.Contains(DstPin) ? 1 : 0,
-			DstPin->LinkedTo.Contains(SrcPin) ? 1 : 0);
-		return false;
-	};
+			*DstPin->PinType.PinCategory.ToString());
+	}
 
 	const bool bIsStateMachineGraph =
 		SrcNode &&
@@ -12827,28 +11852,76 @@ bool UBPDirectImporter::ConnectPins(
 			Graph->NotifyGraphChanged();
 		}
 
-		return EnsureReciprocalLink(TEXT("Failed to create state machine link"));
+		if (!SrcPin->LinkedTo.Contains(DstPin))
+		{
+			OutError = FString::Printf(
+				TEXT("Failed to create state machine link: %s.%s -> %s.%s"),
+				*DescribeNode_ImportBpy(SrcNode),
+				*SrcPin->GetName(),
+				*DescribeNode_ImportBpy(DstNode),
+				*DstPin->GetName());
+			return false;
+		}
+
+		return true;
 	}
 
 	const UEdGraphSchema* Schema = SrcPin->GetSchema();
 	if (Schema && Schema->TryCreateConnection(SrcPin, DstPin))
 	{
-		return EnsureReciprocalLink(TEXT("Schema created non-reciprocal link"));
+		// Keep promotable/wildcard nodes in sync immediately after schema promotion.
+		SrcNode->PinConnectionListChanged(SrcPin);
+		DstNode->PinConnectionListChanged(DstPin);
+		SrcNode->NodeConnectionListChanged();
+		DstNode->NodeConnectionListChanged();
+		if (UEdGraph* Graph = SrcNode->GetGraph())
+		{
+			Graph->NotifyGraphChanged();
+		}
+
+		if (bTraceConnection)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[IBPY_TRACE] stage=connect_schema_success src=%s.%s dst=%s.%s"),
+				*DescribeNode_ImportBpy(SrcNode),
+				*SrcPin->GetName(),
+				*DescribeNode_ImportBpy(DstNode),
+				*DstPin->GetName());
+		}
+		return true;
 	}
 
-	const bool bBothExecPins =
-		SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec &&
-		DstPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
-	if (!bBothExecPins)
+	// K2 promotable operators and wildcard pins must be connected through schema-driven
+	// promotion. Forcing MakeLinkTo on a rejected schema connection creates transient links
+	// that are dropped on reconstruct/compile (observed in traversal math chains).
+	const bool bRequiresSchemaPromotion =
+		IsPromotableCallNode(SrcNode) ||
+		IsPromotableCallNode(DstNode) ||
+		SrcPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard ||
+		DstPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard;
+	if (Schema && bRequiresSchemaPromotion)
 	{
+		if (bTraceConnection)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[IBPY_TRACE] stage=connect_deferred_schema_promotion src=%s.%s cat=%s dst=%s.%s cat=%s"),
+				*DescribeNode_ImportBpy(SrcNode),
+				*SrcPin->GetName(),
+				*SrcPin->PinType.PinCategory.ToString(),
+				*DescribeNode_ImportBpy(DstNode),
+				*DstPin->GetName(),
+				*DstPin->PinType.PinCategory.ToString());
+		}
 		OutError = FString::Printf(
-			TEXT("Schema rejected typed connection: %s.%s (%s) -> %s.%s (%s)"),
+			TEXT("Deferred schema connection: %s.%s -> %s.%s"),
 			*DescribeNode_ImportBpy(SrcNode),
 			*SrcPin->GetName(),
-			*DescribePinType_ImportBpy(SrcPin->PinType),
 			*DescribeNode_ImportBpy(DstNode),
-			*DstPin->GetName(),
-			*DescribePinType_ImportBpy(DstPin->PinType));
+			*DstPin->GetName());
 		return false;
 	}
 
@@ -12863,7 +11936,29 @@ bool UBPDirectImporter::ConnectPins(
 		Graph->NotifyGraphChanged();
 	}
 
-	return EnsureReciprocalLink(TEXT("Schema rejected exec connection"));
+	if (!SrcPin->LinkedTo.Contains(DstPin))
+	{
+		if (bTraceConnection)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[IBPY_TRACE] stage=connect_schema_rejected src=%s.%s dst=%s.%s"),
+				*DescribeNode_ImportBpy(SrcNode),
+				*SrcPin->GetName(),
+				*DescribeNode_ImportBpy(DstNode),
+				*DstPin->GetName());
+		}
+		OutError = FString::Printf(
+			TEXT("Schema rejected connection: %s.%s -> %s.%s"),
+			*DescribeNode_ImportBpy(SrcNode),
+			*SrcPin->GetName(),
+			*DescribeNode_ImportBpy(DstNode),
+			*DstPin->GetName());
+		return false;
+	}
+
+	return true;
 }
 
 // ─── ParsePinType ─────────────────────────────────────────────────────────────

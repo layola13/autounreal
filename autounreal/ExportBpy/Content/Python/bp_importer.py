@@ -457,15 +457,15 @@ def _import_blueprint_object_with_details(
             payload,
             stage_label="pre-compile",
         )
-        if repair_ok and compile_blueprint:
+        if compile_blueprint:
             compiled_ok, compile_err = _compile_blueprint_with_bridge(bridge_asset_path)
-        if repair_ok and compiled_ok and compile_blueprint:
+        if compile_blueprint and compiled_ok:
             post_repair_ok, post_repair_err = _repair_imported_blueprint_pin_defaults(
                 bridge_asset_path,
                 payload,
                 stage_label="post-compile",
             )
-        if repair_ok and post_repair_ok and compile_blueprint and has_expected_delegate_bindings:
+        if compile_blueprint and has_expected_delegate_bindings:
             delegate_restore_ok, delegate_restore_err = _restore_create_delegate_bindings_with_bridge(
                 json_str,
                 bridge_asset_path,
@@ -480,8 +480,7 @@ def _import_blueprint_object_with_details(
                     bridge_asset_path,
                 )
         if (
-            repair_ok
-            and post_repair_ok
+            (not compile_blueprint or compiled_ok)
             and delegate_restore_ok
             and delegate_recompile_ok
             and delegate_final_restore_ok
@@ -502,11 +501,18 @@ def _import_blueprint_object_with_details(
         )
         if retried_summary:
             validation_summary = retried_summary
+    if validation_summary and isinstance(validation_summary, dict):
+        validation_warnings = validation_summary.get("warnings")
+        if not isinstance(validation_warnings, list):
+            validation_warnings = []
+            validation_summary["warnings"] = validation_warnings
+        if repair_err:
+            validation_warnings.append(f"pin repair (pre-compile) diagnostics: {repair_err}")
+        if post_repair_err:
+            validation_warnings.append(f"pin repair (post-compile) diagnostics: {post_repair_err}")
     validation_ok = bool(validation_summary.get("ok", False)) if validation_summary else False
     success = bool(
         ok
-        and repair_ok
-        and post_repair_ok
         and (compiled_ok if compile_blueprint else True)
         and delegate_restore_ok
         and delegate_recompile_ok
@@ -517,9 +523,7 @@ def _import_blueprint_object_with_details(
         part
         for part in (
             err,
-            repair_err,
             compile_err,
-            post_repair_err,
             delegate_restore_err,
             delegate_recompile_err,
             delegate_final_restore_err,
@@ -1581,6 +1585,9 @@ def _validate_imported_blueprint(
         "component_socket_mismatches": [],
         "inherited_component_mobility_mismatches": [],
         "class_default_mismatches": [],
+        "missing_default_keys": [],
+        "default_mismatches": [],
+        "default_compare_mode": "cpp_bridge_strict",
         "warnings": [],
     }
 
@@ -1610,6 +1617,34 @@ def _validate_imported_blueprint(
     else:
         live_stats = _collect_expected_import_stats(live_payload)
     summary["live_stats"] = live_stats
+
+    bridge_validation_payload: Dict[str, Any] = {}
+    try:
+        source_json_text = json.dumps(payload, ensure_ascii=False)
+    except Exception as exc:
+        source_json_text = ""
+        summary["warnings"].append(f"Failed to serialize payload for default validation: {exc}")
+
+    if source_json_text:
+        bridge_validation_payload, bridge_validation_error = _validate_imported_defaults_with_bridge(
+            source_json_text,
+            _normalize_bridge_blueprint_path(asset_path),
+        )
+        if bridge_validation_error:
+            summary["warnings"].append(bridge_validation_error)
+        if isinstance(bridge_validation_payload, dict):
+            missing_default_keys = bridge_validation_payload.get("missing_default_keys", [])
+            default_mismatches = bridge_validation_payload.get("default_mismatches", [])
+            if isinstance(missing_default_keys, list):
+                summary["missing_default_keys"] = missing_default_keys
+            if isinstance(default_mismatches, list):
+                summary["default_mismatches"] = default_mismatches
+            for key in ("missing_graphs",):
+                value = bridge_validation_payload.get(key)
+                if isinstance(value, list) and value:
+                    existing = summary.get(key, [])
+                    if isinstance(existing, list):
+                        summary[key] = existing + value
 
     expected_graph_node_counts = expected_stats.get("expected_graph_node_counts", {})
     live_graph_node_counts = live_stats.get("expected_graph_node_counts", {})
@@ -1990,6 +2025,8 @@ def _validate_imported_blueprint(
             "component_socket_mismatches",
             "inherited_component_mobility_mismatches",
             "class_default_mismatches",
+            "missing_default_keys",
+            "default_mismatches",
         )
     )
 
@@ -3079,6 +3116,59 @@ def _restore_create_delegate_bindings_with_bridge(json_str: str, asset_path: str
         return True, error_text
     except Exception as exc:
         return False, str(exc)
+
+
+def _validate_imported_defaults_with_bridge(
+    json_str: str,
+    asset_path: str,
+) -> Tuple[Dict[str, Any], str]:
+    try:
+        import unreal
+
+        if (
+            hasattr(unreal, "BPDirectImporter")
+            and hasattr(unreal.BPDirectImporter, "validate_imported_blueprint_against_json_detailed")
+        ):
+            result = unreal.BPDirectImporter.validate_imported_blueprint_against_json_detailed(
+                json_str,
+                asset_path,
+            )
+        elif hasattr(unreal, "call_function"):
+            result = unreal.call_function(
+                "BPDirectImporter",
+                "ValidateImportedBlueprintAgainstJsonDetailed",
+                json_str,
+                asset_path,
+            )
+        else:
+            return {}, (
+                "Unreal Python bridge cannot call "
+                "BPDirectImporter.ValidateImportedBlueprintAgainstJsonDetailed"
+            )
+
+        if isinstance(result, str):
+            try:
+                payload = json.loads(result)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                error_text = str(payload.get("error", "") or "")
+                return payload, error_text
+            return {}, "C++ default validation did not return a JSON payload"
+
+        if isinstance(result, tuple):
+            if result:
+                success = bool(result[0])
+                error_text = str(result[1]) if len(result) > 1 and result[1] is not None else ""
+                return {"success": success}, error_text
+            return {}, "C++ default validation returned an empty tuple"
+
+        if isinstance(result, bool):
+            return {"success": bool(result)}, ""
+
+        return {}, "C++ default validation returned an unsupported payload type"
+    except Exception as exc:
+        return {}, str(exc)
 
 
 def _call_cpp_importer(json_str: str, asset_path: str, compile_blueprint: bool = True) -> Tuple[bool, str]:

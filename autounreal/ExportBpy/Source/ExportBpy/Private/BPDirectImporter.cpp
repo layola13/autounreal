@@ -182,6 +182,35 @@ bool RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(
 	UBlueprint* BP,
 	bool& bOutAnyRetargeted,
 	FString& OutError);
+bool ApplyPinIds_ImportBpy(UEdGraphNode* Node, const TSharedPtr<FJsonObject>& NodeJson, FString& OutError);
+UEdGraphPin* ResolvePinForSerializedDefault_ImportBpy(
+	UEdGraphNode* Node,
+	const TSharedPtr<FJsonObject>& NodeJson,
+	const FString& SerializedPinName);
+FString ReadPinRawDefaultValue_ImportBpy(const UEdGraphPin* Pin);
+bool AreSerializedDefaultValuesEquivalent_ImportBpy(const FString& ExpectedValue, const FString& ActualValue);
+bool ReplayAndValidateSerializedNodeDefaults_ImportBpy(
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
+	const TMap<FString, UEdGraphNode*>& NodeMap,
+	const FString& GraphName,
+	FString& OutError);
+void AppendDefaultValidationIssue_ImportBpy(
+	TArray<TSharedPtr<FJsonValue>>& OutIssues,
+	const FString& GraphName,
+	const FString& NodeClass,
+	const FString& NodeGuid,
+	const FString& NodeLabel,
+	const FString& PinName,
+	const FString& ExpectedValue,
+	const FString& ActualValue,
+	const FString& IssueType);
+bool ValidateBlueprintDefaultsAgainstRootJson_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	TArray<TSharedPtr<FJsonValue>>& OutMissingGraphs,
+	TArray<TSharedPtr<FJsonValue>>& OutMissingDefaultKeys,
+	TArray<TSharedPtr<FJsonValue>>& OutDefaultMismatches,
+	FString& OutError);
 
 template <typename TObject>
 TObject* ResolveNamedObject_ImportBpy(const FString& Name)
@@ -6074,6 +6103,222 @@ UEdGraphPin* FindSerializedPinOnNode_ImportBpy(
 	return FindPinFlexible_ImportBpy(Node, SerializedPinName, Direction);
 }
 
+FString NormalizeGuidForTracking_ImportBpy(const FString& GuidText)
+{
+	FString Normalized = GuidText;
+	Normalized.TrimStartAndEndInline();
+	Normalized.ReplaceInline(TEXT("-"), TEXT(""));
+	Normalized.ToUpperInline();
+	return Normalized;
+}
+
+bool IsPromotableTraceEnabled_ImportBpy()
+{
+	static const FString EnvValue =
+		FPlatformMisc::GetEnvironmentVariable(TEXT("EXPORTBPY_TRACE_PROMOTABLE_IMPORT"));
+	return EnvValue.Equals(TEXT("1"), ESearchCase::IgnoreCase) ||
+		EnvValue.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
+		EnvValue.Equals(TEXT("yes"), ESearchCase::IgnoreCase) ||
+		EnvValue.Equals(TEXT("on"), ESearchCase::IgnoreCase);
+}
+
+bool IsConnectionTraceEnabled_ImportBpy()
+{
+	static const FString EnvValue =
+		FPlatformMisc::GetEnvironmentVariable(TEXT("EXPORTBPY_TRACE_CONNECTION_IMPORT"));
+	return EnvValue.Equals(TEXT("1"), ESearchCase::IgnoreCase) ||
+		EnvValue.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
+		EnvValue.Equals(TEXT("yes"), ESearchCase::IgnoreCase) ||
+		EnvValue.Equals(TEXT("on"), ESearchCase::IgnoreCase);
+}
+
+bool IsTrackedTraversalConnection_ImportBpy(const FString& SrcUid, const FString& DstUid)
+{
+	const FString SrcGuid = NormalizeGuidForTracking_ImportBpy(SrcUid);
+	const FString DstGuid = NormalizeGuidForTracking_ImportBpy(DstUid);
+
+	return
+		(SrcGuid == TEXT("21A313E74ECF345881D695A0E01EF5C1") && DstGuid == TEXT("704CEB6C48B936A1AB62BAA12C1C11CC")) ||
+		(SrcGuid == TEXT("2D1BE5F04CC49B225D3A6DBEDE484870") && DstGuid == TEXT("9488168A47D712B10795B49BB0910A69")) ||
+		(SrcGuid == TEXT("2C7F4536451C956EFBFE379EC7FE82FF") && DstGuid == TEXT("F4B688874906C3B912AF3988FB783B4D"));
+}
+
+bool IsTrackedTraversalGuid_ImportBpy(const FString& GuidText)
+{
+	const FString Normalized = NormalizeGuidForTracking_ImportBpy(GuidText);
+	return Normalized == TEXT("21A313E74ECF345881D695A0E01EF5C1") ||
+		Normalized == TEXT("2D1BE5F04CC49B225D3A6DBEDE484870") ||
+		Normalized == TEXT("2C7F4536451C956EFBFE379EC7FE82FF");
+}
+
+bool IsTrackedTraversalNodeJson_ImportBpy(
+	const TSharedPtr<FJsonObject>& NodeJson,
+	FString* OutMatchedGuid = nullptr)
+{
+	if (!NodeJson.IsValid())
+	{
+		return false;
+	}
+
+	FString GuidCandidate;
+	if (NodeJson->TryGetStringField(TEXT("node_guid"), GuidCandidate) &&
+		IsTrackedTraversalGuid_ImportBpy(GuidCandidate))
+	{
+		if (OutMatchedGuid)
+		{
+			*OutMatchedGuid = NormalizeGuidForTracking_ImportBpy(GuidCandidate);
+		}
+		return true;
+	}
+
+	if (NodeJson->TryGetStringField(TEXT("uid"), GuidCandidate) &&
+		IsTrackedTraversalGuid_ImportBpy(GuidCandidate))
+	{
+		if (OutMatchedGuid)
+		{
+			*OutMatchedGuid = NormalizeGuidForTracking_ImportBpy(GuidCandidate);
+		}
+		return true;
+	}
+
+	return false;
+}
+
+bool IsTrackedTraversalNode_ImportBpy(const UEdGraphNode* Node)
+{
+	if (!Node)
+	{
+		return false;
+	}
+
+	return IsTrackedTraversalGuid_ImportBpy(Node->NodeGuid.ToString(EGuidFormats::Digits));
+}
+
+FString DescribeTrackedPinState_ImportBpy(const UEdGraphPin* Pin)
+{
+	if (!Pin)
+	{
+		return TEXT("<missing>");
+	}
+
+	const FString DefaultObjectPath = Pin->DefaultObject ? Pin->DefaultObject->GetPathName() : TEXT("");
+	return FString::Printf(
+		TEXT("name=%s type=%s links=%d default='%s' auto='%s' obj='%s' ignored=%d"),
+		*Pin->GetName(),
+		*DescribePinType_ImportBpy(Pin->PinType),
+		Pin->LinkedTo.Num(),
+		*Pin->DefaultValue,
+		*Pin->AutogeneratedDefaultValue,
+		*DefaultObjectPath,
+		Pin->bDefaultValueIsIgnored ? 1 : 0);
+}
+
+void LogTrackedPromotableNodeState_ImportBpy(
+	const TCHAR* PhaseLabel,
+	UK2Node_CallFunction* CallNode,
+	const TSharedPtr<FJsonObject>& NodeJson)
+{
+	if (!IsPromotableTraceEnabled_ImportBpy())
+	{
+		return;
+	}
+
+	if (!CallNode)
+	{
+		return;
+	}
+
+	FString TrackedGuid;
+	const bool bTrackedFromJson = IsTrackedTraversalNodeJson_ImportBpy(NodeJson, &TrackedGuid);
+	if (!bTrackedFromJson && !IsTrackedTraversalNode_ImportBpy(CallNode))
+	{
+		return;
+	}
+
+	if (TrackedGuid.IsEmpty())
+	{
+		TrackedGuid = NormalizeGuidForTracking_ImportBpy(CallNode->NodeGuid.ToString(EGuidFormats::Digits));
+	}
+
+	FString FunctionRef;
+	if (NodeJson.IsValid())
+	{
+		NodeJson->TryGetStringField(TEXT("function_ref"), FunctionRef);
+	}
+
+	const UFunction* TargetFunction = CallNode->GetTargetFunction();
+	const FString TargetFunctionPath = TargetFunction ? TargetFunction->GetPathName() : TEXT("<null>");
+	const FString NodeTitle = CallNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
+
+	UEdGraphPin* PinA = NodeJson.IsValid()
+		? FindSerializedPinOnNode_ImportBpy(CallNode, NodeJson, TEXT("A"), EGPD_Input)
+		: FindPinFlexible_ImportBpy(CallNode, TEXT("A"), EGPD_Input);
+	UEdGraphPin* PinB = NodeJson.IsValid()
+		? FindSerializedPinOnNode_ImportBpy(CallNode, NodeJson, TEXT("B"), EGPD_Input)
+		: FindPinFlexible_ImportBpy(CallNode, TEXT("B"), EGPD_Input);
+	UEdGraphPin* ReturnPin = NodeJson.IsValid()
+		? FindSerializedPinOnNode_ImportBpy(CallNode, NodeJson, TEXT("ReturnValue"), EGPD_Output)
+		: FindPinFlexible_ImportBpy(CallNode, TEXT("ReturnValue"), EGPD_Output);
+
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[ExportBpy][PromotableTrace][%s] guid=%s node=%s class=%s title='%s' function_ref='%s' target='%s' A={%s} B={%s} Return={%s}"),
+		PhaseLabel ? PhaseLabel : TEXT("<unknown>"),
+		*TrackedGuid,
+		*DescribeNode_ImportBpy(CallNode),
+		*CallNode->GetClass()->GetName(),
+		*NodeTitle,
+		*FunctionRef,
+		*TargetFunctionPath,
+		*DescribeTrackedPinState_ImportBpy(PinA),
+		*DescribeTrackedPinState_ImportBpy(PinB),
+		*DescribeTrackedPinState_ImportBpy(ReturnPin));
+}
+
+void LogTrackedPromotableNodesFromMap_ImportBpy(
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
+	const TMap<FString, UEdGraphNode*>& NodeMap,
+	const TCHAR* PhaseLabel)
+{
+	if (!IsPromotableTraceEnabled_ImportBpy())
+	{
+		return;
+	}
+
+	if (!NodesArr)
+	{
+		return;
+	}
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		if (!IsTrackedTraversalNodeJson_ImportBpy(NodeObj))
+		{
+			continue;
+		}
+
+		FString Uid;
+		NodeObj->TryGetStringField(TEXT("uid"), Uid);
+		UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
+		if (!ExistingNode || !*ExistingNode)
+		{
+			continue;
+		}
+
+		if (UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(*ExistingNode))
+		{
+			LogTrackedPromotableNodeState_ImportBpy(PhaseLabel, CallNode, NodeObj);
+		}
+	}
+}
+
 UEdGraphPin* FindPinById_ImportBpy(UEdGraphNode* Node, const FString& PinIdText)
 {
 	if (!Node)
@@ -8751,6 +8996,489 @@ bool ApplyPinDefaults_ImportBpy(
 	return true;
 }
 
+UEdGraphPin* ResolvePinForSerializedDefault_ImportBpy(
+	UEdGraphNode* Node,
+	const TSharedPtr<FJsonObject>& NodeJson,
+	const FString& SerializedPinName)
+{
+	if (!Node)
+	{
+		return nullptr;
+	}
+
+	if (UEdGraphPin* InputPin =
+			FindSerializedPinOnNode_ImportBpy(Node, NodeJson, SerializedPinName, EGPD_Input))
+	{
+		return InputPin;
+	}
+
+	if (Node->IsA<UK2Node_FunctionEntry>())
+	{
+		if (UEdGraphPin* OutputPin =
+				FindSerializedPinOnNode_ImportBpy(Node, NodeJson, SerializedPinName, EGPD_Output))
+		{
+			return OutputPin;
+		}
+	}
+
+	return nullptr;
+}
+
+FString ReadPinRawDefaultValue_ImportBpy(const UEdGraphPin* Pin)
+{
+	if (!Pin || Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+	{
+		return FString();
+	}
+
+	if (Pin->DefaultObject)
+	{
+		return Pin->DefaultObject->GetPathName();
+	}
+
+	if (!Pin->DefaultTextValue.IsEmpty())
+	{
+		return Pin->DefaultTextValue.ToString();
+	}
+
+	return Pin->DefaultValue;
+}
+
+bool TryParseBooleanText_ImportBpy(const FString& Text, bool& OutValue)
+{
+	FString Normalized = Text;
+	Normalized.TrimStartAndEndInline();
+	if (Normalized.Equals(TEXT("true"), ESearchCase::IgnoreCase) || Normalized == TEXT("1"))
+	{
+		OutValue = true;
+		return true;
+	}
+	if (Normalized.Equals(TEXT("false"), ESearchCase::IgnoreCase) || Normalized == TEXT("0"))
+	{
+		OutValue = false;
+		return true;
+	}
+	return false;
+}
+
+bool TryParseNumericText_ImportBpy(const FString& Text, double& OutValue)
+{
+	FString Normalized = Text;
+	Normalized.TrimStartAndEndInline();
+	if (Normalized.IsEmpty())
+	{
+		return false;
+	}
+
+	if (Normalized.StartsWith(TEXT("\"")) && Normalized.EndsWith(TEXT("\"")) && Normalized.Len() >= 2)
+	{
+		Normalized = Normalized.Mid(1, Normalized.Len() - 2);
+		Normalized.TrimStartAndEndInline();
+	}
+
+	return LexTryParseString(OutValue, *Normalized);
+}
+
+bool AreSerializedDefaultValuesEquivalent_ImportBpy(const FString& ExpectedValue, const FString& ActualValue)
+{
+	FString Expected = ExpectedValue;
+	FString Actual = ActualValue;
+	Expected.TrimStartAndEndInline();
+	Actual.TrimStartAndEndInline();
+
+	if (Expected.Equals(Actual, ESearchCase::CaseSensitive))
+	{
+		return true;
+	}
+
+	bool ExpectedBool = false;
+	bool ActualBool = false;
+	if (TryParseBooleanText_ImportBpy(Expected, ExpectedBool) &&
+		TryParseBooleanText_ImportBpy(Actual, ActualBool))
+	{
+		return ExpectedBool == ActualBool;
+	}
+
+	double ExpectedNumber = 0.0;
+	double ActualNumber = 0.0;
+	if (TryParseNumericText_ImportBpy(Expected, ExpectedNumber) &&
+		TryParseNumericText_ImportBpy(Actual, ActualNumber))
+	{
+		return FMath::IsNearlyEqual(ExpectedNumber, ActualNumber, KINDA_SMALL_NUMBER);
+	}
+
+	return false;
+}
+
+bool ReplayAndValidateSerializedNodeDefaults_ImportBpy(
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
+	const TMap<FString, UEdGraphNode*>& NodeMap,
+	const FString& GraphName,
+	FString& OutError)
+{
+	if (!NodesArr)
+	{
+		return true;
+	}
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue->AsObject();
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		const FString Uid = NodeObj->GetStringField(TEXT("uid"));
+		UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
+		if (!ExistingNode || !*ExistingNode)
+		{
+			continue;
+		}
+
+		if (!ApplyPinDefaults_ImportBpy(*ExistingNode, NodeObj, OutError, false))
+		{
+			return false;
+		}
+		if (!ApplyPinIds_ImportBpy(*ExistingNode, NodeObj, OutError))
+		{
+			return false;
+		}
+	}
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue->AsObject();
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		const TSharedPtr<FJsonObject>* DefaultsObj = nullptr;
+		if (!NodeObj->TryGetObjectField(TEXT("defaults"), DefaultsObj) || !DefaultsObj || !(*DefaultsObj).IsValid())
+		{
+			continue;
+		}
+
+		const FString Uid = NodeObj->GetStringField(TEXT("uid"));
+		UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
+		if (!ExistingNode || !*ExistingNode)
+		{
+			continue;
+		}
+
+		UEdGraphNode* const Node = *ExistingNode;
+		const FString NodeGuidText = Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*DefaultsObj)->Values)
+		{
+			const FString& SerializedPinName = Entry.Key;
+			UEdGraphPin* Pin = ResolvePinForSerializedDefault_ImportBpy(Node, NodeObj, SerializedPinName);
+			if (!Pin)
+			{
+				OutError = FString::Printf(
+					TEXT("[%s] Missing default pin '%s' on node %s (guid=%s) during final defaults validation"),
+					*GraphName,
+					*SerializedPinName,
+					*DescribeNode_ImportBpy(Node),
+					*NodeGuidText);
+				return false;
+			}
+
+			const FString ExpectedValue = JsonValueToDefaultString_ImportBpy(Entry.Value);
+			const FString ActualValue = ReadPinRawDefaultValue_ImportBpy(Pin);
+			if (!AreSerializedDefaultValuesEquivalent_ImportBpy(ExpectedValue, ActualValue))
+			{
+				const FString NormalizedNodeGuid = NormalizeGuidForTracking_ImportBpy(NodeGuidText);
+				if (IsTrackedTraversalGuid_ImportBpy(NormalizedNodeGuid))
+				{
+					UE_LOG(
+						LogTemp,
+						Warning,
+						TEXT("[ExportBpy][PromotableTrace][strict_default_mismatch] graph=%s guid=%s node=%s pin=%s expected='%s' actual='%s' pin_state={%s}"),
+						*GraphName,
+						*NormalizedNodeGuid,
+						*DescribeNode_ImportBpy(Node),
+						*SerializedPinName,
+						*ExpectedValue,
+						*ActualValue,
+						*DescribeTrackedPinState_ImportBpy(Pin));
+				}
+
+				OutError = FString::Printf(
+					TEXT("[%s] Default mismatch on node %s (guid=%s), pin '%s': expected='%s' actual='%s'"),
+					*GraphName,
+					*DescribeNode_ImportBpy(Node),
+					*NodeGuidText,
+					*SerializedPinName,
+					*ExpectedValue,
+					*ActualValue);
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+bool ShouldSkipStrictDefaultValidation_ImportBpy()
+{
+	static const FString EnvValue =
+		FPlatformMisc::GetEnvironmentVariable(TEXT("EXPORTBPY_SKIP_STRICT_DEFAULT_VALIDATION"));
+	return EnvValue.Equals(TEXT("1"), ESearchCase::IgnoreCase) ||
+		EnvValue.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
+		EnvValue.Equals(TEXT("yes"), ESearchCase::IgnoreCase) ||
+		EnvValue.Equals(TEXT("on"), ESearchCase::IgnoreCase);
+}
+
+void AppendDefaultValidationIssue_ImportBpy(
+	TArray<TSharedPtr<FJsonValue>>& OutIssues,
+	const FString& GraphName,
+	const FString& NodeClass,
+	const FString& NodeGuid,
+	const FString& NodeLabel,
+	const FString& PinName,
+	const FString& ExpectedValue,
+	const FString& ActualValue,
+	const FString& IssueType)
+{
+	const TSharedRef<FJsonObject> IssueObj = MakeShared<FJsonObject>();
+	IssueObj->SetStringField(TEXT("type"), IssueType);
+	IssueObj->SetStringField(TEXT("graph"), GraphName);
+	IssueObj->SetStringField(TEXT("node_class"), NodeClass);
+	IssueObj->SetStringField(TEXT("node_guid"), NodeGuid);
+	IssueObj->SetStringField(TEXT("node"), NodeLabel);
+	IssueObj->SetStringField(TEXT("pin"), PinName);
+	IssueObj->SetStringField(TEXT("expected"), ExpectedValue);
+	IssueObj->SetStringField(TEXT("actual"), ActualValue);
+	OutIssues.Add(MakeShared<FJsonValueObject>(IssueObj));
+}
+
+bool ValidateBlueprintDefaultsAgainstRootJson_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	TArray<TSharedPtr<FJsonValue>>& OutMissingGraphs,
+	TArray<TSharedPtr<FJsonValue>>& OutMissingDefaultKeys,
+	TArray<TSharedPtr<FJsonValue>>& OutDefaultMismatches,
+	FString& OutError)
+{
+	if (!BP || !Root.IsValid())
+	{
+		OutError = TEXT("Invalid validation context (blueprint/root)");
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
+	if (!Root->TryGetArrayField(TEXT("graphs"), GraphsArr) || !GraphsArr)
+	{
+		return true;
+	}
+
+	TArray<UEdGraph*> ReachableGraphs;
+	TSet<UEdGraph*> VisitedGraphs;
+	for (UEdGraph* Graph : BP->UbergraphPages)
+	{
+		GatherReachableGraphs_ImportBpy(Graph, VisitedGraphs, ReachableGraphs);
+	}
+	for (UEdGraph* Graph : BP->FunctionGraphs)
+	{
+		GatherReachableGraphs_ImportBpy(Graph, VisitedGraphs, ReachableGraphs);
+	}
+	for (UEdGraph* Graph : BP->MacroGraphs)
+	{
+		GatherReachableGraphs_ImportBpy(Graph, VisitedGraphs, ReachableGraphs);
+	}
+	for (UEdGraph* Graph : BP->DelegateSignatureGraphs)
+	{
+		GatherReachableGraphs_ImportBpy(Graph, VisitedGraphs, ReachableGraphs);
+	}
+
+	auto FindGraphByGuid = [&](const FGuid& Guid) -> UEdGraph*
+	{
+		for (UEdGraph* Graph : ReachableGraphs)
+		{
+			if (Graph && Graph->GraphGuid == Guid)
+			{
+				return Graph;
+			}
+		}
+		return nullptr;
+	};
+
+	auto FindGraphByNameAndOuterKind = [&](const FString& Name, const FString& OuterKind) -> UEdGraph*
+	{
+		for (UEdGraph* Graph : ReachableGraphs)
+		{
+			if (!Graph || !Graph->GetName().Equals(Name, ESearchCase::CaseSensitive))
+			{
+				continue;
+			}
+
+			if (OuterKind.IsEmpty())
+			{
+				return Graph;
+			}
+
+			const FString ExistingOuterKind = DescribeGraphOuterKind_ImportBpy(Graph);
+			if (ExistingOuterKind.Equals(OuterKind, ESearchCase::IgnoreCase))
+			{
+				return Graph;
+			}
+		}
+		return nullptr;
+	};
+
+	auto FindNodeByGuid = [](UEdGraph* Graph, const FGuid& Guid) -> UEdGraphNode*
+	{
+		if (!Graph)
+		{
+			return nullptr;
+		}
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (Node && Node->NodeGuid == Guid)
+			{
+				return Node;
+			}
+		}
+		return nullptr;
+	};
+
+	for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
+	{
+		const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
+		if (!GraphObj.IsValid())
+		{
+			continue;
+		}
+
+		FString GraphName;
+		GraphObj->TryGetStringField(TEXT("name"), GraphName);
+		FString GraphOuterKind;
+		GraphObj->TryGetStringField(TEXT("graph_outer"), GraphOuterKind);
+
+		UEdGraph* LiveGraph = nullptr;
+		FString GraphGuidText;
+		if (GraphObj->TryGetStringField(TEXT("graph_guid"), GraphGuidText) && !GraphGuidText.IsEmpty())
+		{
+			FGuid GraphGuid;
+			if (TryParseGuid_ImportBpy(GraphGuidText, GraphGuid))
+			{
+				LiveGraph = FindGraphByGuid(GraphGuid);
+			}
+		}
+		if (!LiveGraph)
+		{
+			LiveGraph = FindGraphByNameAndOuterKind(GraphName, GraphOuterKind);
+		}
+
+		if (!LiveGraph)
+		{
+			const TSharedRef<FJsonObject> MissingGraphObj = MakeShared<FJsonObject>();
+			MissingGraphObj->SetStringField(TEXT("graph"), GraphName);
+			MissingGraphObj->SetStringField(TEXT("graph_guid"), GraphGuidText);
+			MissingGraphObj->SetStringField(TEXT("graph_outer"), GraphOuterKind);
+			OutMissingGraphs.Add(MakeShared<FJsonValueObject>(MissingGraphObj));
+			continue;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+		{
+			continue;
+		}
+
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			const TSharedPtr<FJsonObject>* DefaultsObj = nullptr;
+			if (!NodeObj->TryGetObjectField(TEXT("defaults"), DefaultsObj) || !DefaultsObj || !(*DefaultsObj).IsValid())
+			{
+				continue;
+			}
+
+			FString NodeGuidText;
+			NodeObj->TryGetStringField(TEXT("node_guid"), NodeGuidText);
+			FString NodeClass;
+			NodeObj->TryGetStringField(TEXT("node_class"), NodeClass);
+			FString NodeLabel;
+			NodeObj->TryGetStringField(TEXT("readable_name"), NodeLabel);
+			if (NodeLabel.IsEmpty())
+			{
+				NodeObj->TryGetStringField(TEXT("uid"), NodeLabel);
+			}
+
+			UEdGraphNode* LiveNode = nullptr;
+			if (!NodeGuidText.IsEmpty())
+			{
+				FGuid NodeGuid;
+				if (TryParseGuid_ImportBpy(NodeGuidText, NodeGuid))
+				{
+					LiveNode = FindNodeByGuid(LiveGraph, NodeGuid);
+				}
+			}
+
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*DefaultsObj)->Values)
+			{
+				const FString& SerializedPinName = Entry.Key;
+				const FString ExpectedValue = JsonValueToDefaultString_ImportBpy(Entry.Value);
+
+				if (!LiveNode)
+				{
+					AppendDefaultValidationIssue_ImportBpy(
+						OutMissingDefaultKeys,
+						GraphName,
+						NodeClass,
+						NodeGuidText,
+						NodeLabel,
+						SerializedPinName,
+						ExpectedValue,
+						TEXT("__MISSING_NODE__"),
+						TEXT("missing_node"));
+					continue;
+				}
+
+				UEdGraphPin* Pin = ResolvePinForSerializedDefault_ImportBpy(LiveNode, NodeObj, SerializedPinName);
+				if (!Pin)
+				{
+					AppendDefaultValidationIssue_ImportBpy(
+						OutMissingDefaultKeys,
+						GraphName,
+						NodeClass,
+						NodeGuidText,
+						NodeLabel,
+						SerializedPinName,
+						ExpectedValue,
+						TEXT("__MISSING__"),
+						TEXT("missing_pin"));
+					continue;
+				}
+
+				const FString ActualValue = ReadPinRawDefaultValue_ImportBpy(Pin);
+				if (!AreSerializedDefaultValuesEquivalent_ImportBpy(ExpectedValue, ActualValue))
+				{
+					AppendDefaultValidationIssue_ImportBpy(
+						OutDefaultMismatches,
+						GraphName,
+						NodeClass,
+						NodeGuidText,
+						NodeLabel,
+						SerializedPinName,
+						ExpectedValue,
+						ActualValue,
+						TEXT("default_mismatch"));
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
 bool ApplyPinIds_ImportBpy(UEdGraphNode* Node, const TSharedPtr<FJsonObject>& NodeJson, FString& OutError)
 {
 	if (!Node || !NodeJson.IsValid())
@@ -9009,9 +9737,69 @@ bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
 	return true;
 }
 
+bool HasSerializedPinTypeContract_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson)
+{
+	if (!NodeJson.IsValid())
+	{
+		return false;
+	}
+
+	const auto HasNonEmptyObjectField = [&](const TCHAR* FieldName) -> bool
+	{
+		const TSharedPtr<FJsonObject>* FieldObj = nullptr;
+		return NodeJson->TryGetObjectField(FieldName, FieldObj) &&
+			FieldObj &&
+			FieldObj->IsValid() &&
+			(*FieldObj)->Values.Num() > 0;
+	};
+
+	return HasNonEmptyObjectField(TEXT("input_pin_types")) ||
+		HasNonEmptyObjectField(TEXT("output_pin_types"));
+}
+
+bool HasPromotableDefaultContractHint_ImportBpy(
+	UK2Node_CallFunction* CallNode,
+	const TSharedPtr<FJsonObject>& NodeJson)
+{
+	if (!CallNode || !NodeJson.IsValid())
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* DefaultsObj = nullptr;
+	if (!NodeJson->TryGetObjectField(TEXT("defaults"), DefaultsObj) || !DefaultsObj || !DefaultsObj->IsValid())
+	{
+		return false;
+	}
+
+	for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*DefaultsObj)->Values)
+	{
+		if (!Entry.Value.IsValid())
+		{
+			continue;
+		}
+
+		UEdGraphPin* InputPin =
+			FindSerializedPinOnNode_ImportBpy(CallNode, NodeJson, Entry.Key, EGPD_Input);
+		if (!InputPin || InputPin->LinkedTo.Num() > 0)
+		{
+			continue;
+		}
+
+		const FString DefaultValue = JsonValueToDefaultString_ImportBpy(Entry.Value);
+		if (IsSimpleLiteralDefaultForPromotable_ImportBpy(DefaultValue))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 bool RestoreCallFunctionBindingFromJson_ImportBpy(
 	UK2Node_CallFunction* CallNode,
 	const TSharedPtr<FJsonObject>& NodeJson,
+	bool bAllowPromotableFunctionRebind,
 	FString& OutError)
 {
 	if (!CallNode || !NodeJson.IsValid())
@@ -9069,6 +9857,10 @@ bool RestoreCallFunctionBindingFromJson_ImportBpy(
 	const bool bIsPromotableOperator =
 		CallNode->GetClass()->GetName() == TEXT("K2Node_PromotableOperator") ||
 		CallNode->GetClass()->GetName() == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
+	if (bIsPromotableOperator)
+	{
+		LogTrackedPromotableNodeState_ImportBpy(TEXT("restore_binding_before"), CallNode, NodeJson);
+	}
 
 	if (!ResolvedFunction)
 	{
@@ -9084,6 +9876,20 @@ bool RestoreCallFunctionBindingFromJson_ImportBpy(
 	}
 
 	const UFunction* ExistingTargetFunction = CallNode->GetTargetFunction();
+	const bool bHasDefaultContractHint =
+		bIsPromotableOperator && HasPromotableDefaultContractHint_ImportBpy(CallNode, NodeJson);
+	if (bIsPromotableOperator &&
+		!bAllowPromotableFunctionRebind &&
+		!bHasDefaultContractHint &&
+		ExistingTargetFunction)
+	{
+		// .bp.py + _meta payloads do not serialize full promotable pin-type contracts.
+		// In that mode, preserve the live promoted overload inferred from links/defaults
+		// instead of forcing the raw function_ref overload back onto the node.
+		LogTrackedPromotableNodeState_ImportBpy(TEXT("restore_binding_skip_rebind"), CallNode, NodeJson);
+		return true;
+	}
+
 	const bool bShouldRebindFunction =
 		ExistingTargetFunction == nullptr ||
 		ExistingTargetFunction != ResolvedFunction;
@@ -9100,6 +9906,17 @@ bool RestoreCallFunctionBindingFromJson_ImportBpy(
 				FName(*FuncName),
 				ResolvedOwnerClass ? ResolvedOwnerClass : ResolvedFunction->GetOwnerClass());
 		}
+
+		// Promotable operators can keep stale promoted pin shapes after SetFromFunction.
+		// Force a reconstruct so pin categories/default channels match the restored overload.
+		if (bIsPromotableOperator)
+		{
+			CallNode->ReconstructNode();
+		}
+	}
+	if (bIsPromotableOperator)
+	{
+		LogTrackedPromotableNodeState_ImportBpy(TEXT("restore_binding_after"), CallNode, NodeJson);
 	}
 
 	return true;
@@ -9108,6 +9925,7 @@ bool RestoreCallFunctionBindingFromJson_ImportBpy(
 bool RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
 	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
 	const TMap<FString, UEdGraphNode*>& NodeMap,
+	const TCHAR* PhaseLabel,
 	FString& OutError)
 {
 	if (!NodesArr)
@@ -9151,7 +9969,14 @@ bool RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
 			continue;
 		}
 
-		if (!RestoreCallFunctionBindingFromJson_ImportBpy(CallNode, NodeObj, OutError))
+		LogTrackedPromotableNodeState_ImportBpy(PhaseLabel, CallNode, NodeObj);
+
+		const bool bHasSerializedPinTypeContract = HasSerializedPinTypeContract_ImportBpy(NodeObj);
+		if (!RestoreCallFunctionBindingFromJson_ImportBpy(
+				CallNode,
+				NodeObj,
+				bHasSerializedPinTypeContract,
+				OutError))
 		{
 			return false;
 		}
@@ -9205,6 +10030,8 @@ bool RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
 		{
 			return false;
 		}
+
+		LogTrackedPromotableNodeState_ImportBpy(PhaseLabel, CallNode, NodeObj);
 	}
 
 	return true;
@@ -10143,6 +10970,361 @@ static UEdGraphNode* FindImportedTopLevelGraphNodeBySerializedUid_ImportBpy(
 	return nullptr;
 }
 
+static bool ReplayTopLevelGraphSerializedConnectionsAfterCompile_ImportBpy(
+	UBlueprint* BP,
+	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs,
+	const bool bRepairMissingConnections,
+	bool& bOutAnyGraphRepaired,
+	FString& OutError)
+{
+	bOutAnyGraphRepaired = false;
+	if (!BP)
+	{
+		return true;
+	}
+
+	auto ResolveExistingConnectionPin = [](
+		UEdGraphNode* Node,
+		const FString& PinName,
+		const FString& PinFullName,
+		const FString& PinId,
+		EEdGraphPinDirection Direction) -> UEdGraphPin*
+	{
+		if (!Node)
+		{
+			return nullptr;
+		}
+
+		UEdGraphPin* Pin = FindPinById_ImportBpy(Node, PinId);
+		if (Pin && Pin->Direction != Direction)
+		{
+			Pin = nullptr;
+		}
+		if (!Pin && !PinFullName.IsEmpty())
+		{
+			Pin = FindExistingPinFlexible_ImportBpy(Node, PinFullName, Direction);
+		}
+		if (!Pin && !PinName.IsEmpty())
+		{
+			Pin = FindExistingPinFlexible_ImportBpy(Node, PinName, Direction);
+		}
+		return Pin;
+	};
+
+	for (const TSharedPtr<FJsonObject>& GraphObj : SortedGraphs)
+	{
+		if (!GraphObj.IsValid())
+		{
+			continue;
+		}
+		if (IsNodeOwnedNestedGraphJson_ImportBpy(GraphObj))
+		{
+			continue;
+		}
+
+		UEdGraph* Graph = nullptr;
+		FString GraphType;
+		FString GraphName;
+		if (!EnsureGraphExists_ImportBpy(BP, GraphObj, Graph, GraphType, GraphName, OutError))
+		{
+			return false;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+		{
+			continue;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* ConnsArr = nullptr;
+		if (!GraphObj->TryGetArrayField(TEXT("connections"), ConnsArr) || !ConnsArr || ConnsArr->Num() == 0)
+		{
+			continue;
+		}
+
+		TMap<FString, UEdGraphNode*> NodeMap;
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			FString Uid;
+			NodeObj->TryGetStringField(TEXT("uid"), Uid);
+			if (Uid.IsEmpty())
+			{
+				continue;
+			}
+
+			UEdGraphNode* ExistingNode = FindImportedTopLevelGraphNodeBySerializedUid_ImportBpy(BP, Graph, Uid);
+			if (ExistingNode)
+			{
+				NodeMap.Add(Uid, ExistingNode);
+			}
+		}
+
+		auto CountMissingConnections = [&]() -> int32
+		{
+			int32 MissingCount = 0;
+			for (const TSharedPtr<FJsonValue>& ConnValue : *ConnsArr)
+			{
+				const TSharedPtr<FJsonObject> ConnObj = ConnValue.IsValid() ? ConnValue->AsObject() : nullptr;
+				if (!ConnObj.IsValid())
+				{
+					continue;
+				}
+
+				FString SrcUid;
+				FString DstUid;
+				FString SrcPin;
+				FString DstPin;
+				FString SrcPinFull;
+				FString DstPinFull;
+				FString SrcPinId;
+				FString DstPinId;
+				ConnObj->TryGetStringField(TEXT("src_node"), SrcUid);
+				ConnObj->TryGetStringField(TEXT("dst_node"), DstUid);
+				ConnObj->TryGetStringField(TEXT("src_pin"), SrcPin);
+				ConnObj->TryGetStringField(TEXT("dst_pin"), DstPin);
+				ConnObj->TryGetStringField(TEXT("src_pin_full"), SrcPinFull);
+				ConnObj->TryGetStringField(TEXT("dst_pin_full"), DstPinFull);
+				ConnObj->TryGetStringField(TEXT("src_pin_id"), SrcPinId);
+				ConnObj->TryGetStringField(TEXT("dst_pin_id"), DstPinId);
+
+				UEdGraphNode* const* SrcNodePtr = NodeMap.Find(SrcUid);
+				UEdGraphNode* const* DstNodePtr = NodeMap.Find(DstUid);
+				UEdGraphPin* SrcLivePin = ResolveExistingConnectionPin(
+					SrcNodePtr ? *SrcNodePtr : nullptr,
+					SrcPin,
+					SrcPinFull,
+					SrcPinId,
+					EGPD_Output);
+				UEdGraphPin* DstLivePin = ResolveExistingConnectionPin(
+					DstNodePtr ? *DstNodePtr : nullptr,
+					DstPin,
+					DstPinFull,
+					DstPinId,
+					EGPD_Input);
+
+				const bool bConnected =
+					SrcLivePin &&
+					DstLivePin &&
+					SrcLivePin->LinkedTo.Contains(DstLivePin) &&
+					DstLivePin->LinkedTo.Contains(SrcLivePin);
+				if (!bConnected)
+				{
+					++MissingCount;
+				}
+			}
+			return MissingCount;
+		};
+
+		const int32 MissingBeforeReplay = CountMissingConnections();
+		if (MissingBeforeReplay == 0)
+		{
+			continue;
+		}
+
+		if (!bRepairMissingConnections)
+		{
+			OutError = FString::Printf(
+				TEXT("Post-compile connection parity mismatch in graph %s: missing=%d"),
+				*Graph->GetName(),
+				MissingBeforeReplay);
+			return false;
+		}
+
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy] Replaying top-level graph connections after compile: graph=%s missing_before=%d"),
+			*Graph->GetName(),
+			MissingBeforeReplay);
+
+		BreakAllGraphLinks_ImportBpy(Graph);
+
+		TArray<TSharedPtr<FJsonObject>> PendingConnections;
+		for (const TSharedPtr<FJsonValue>& ConnValue : *ConnsArr)
+		{
+			const TSharedPtr<FJsonObject> ConnObj = ConnValue.IsValid() ? ConnValue->AsObject() : nullptr;
+			if (ConnObj.IsValid())
+			{
+				PendingConnections.Add(ConnObj);
+			}
+		}
+
+		auto ConnectPinsForReplay = [&](const TSharedPtr<FJsonObject>& ConnObj, FString& ConnectError) -> bool
+		{
+			if (!ConnObj.IsValid())
+			{
+				ConnectError = TEXT("invalid connection payload");
+				return false;
+			}
+
+			FString SrcUid;
+			FString SrcPin;
+			FString DstUid;
+			FString DstPin;
+			FString SrcPinFull;
+			FString DstPinFull;
+			FString SrcPinId;
+			FString DstPinId;
+			ConnObj->TryGetStringField(TEXT("src_node"), SrcUid);
+			ConnObj->TryGetStringField(TEXT("src_pin"), SrcPin);
+			ConnObj->TryGetStringField(TEXT("dst_node"), DstUid);
+			ConnObj->TryGetStringField(TEXT("dst_pin"), DstPin);
+			ConnObj->TryGetStringField(TEXT("src_pin_full"), SrcPinFull);
+			ConnObj->TryGetStringField(TEXT("dst_pin_full"), DstPinFull);
+			ConnObj->TryGetStringField(TEXT("src_pin_id"), SrcPinId);
+			ConnObj->TryGetStringField(TEXT("dst_pin_id"), DstPinId);
+
+			UEdGraphNode** SrcNodePtr = NodeMap.Find(SrcUid);
+			UEdGraphNode** DstNodePtr = NodeMap.Find(DstUid);
+			if (!SrcNodePtr || !DstNodePtr || !*SrcNodePtr || !*DstNodePtr)
+			{
+				ConnectError = FString::Printf(TEXT("missing node(s): %s -> %s"), *SrcUid, *DstUid);
+				return false;
+			}
+
+			UEdGraphNode* SrcNode = *SrcNodePtr;
+			UEdGraphNode* DstNode = *DstNodePtr;
+
+			UEdGraphPin* SrcLivePin = FindPinById_ImportBpy(SrcNode, SrcPinId);
+			UEdGraphPin* DstLivePin = FindPinById_ImportBpy(DstNode, DstPinId);
+			if (SrcLivePin && SrcLivePin->Direction != EGPD_Output)
+			{
+				SrcLivePin = nullptr;
+			}
+			if (DstLivePin && DstLivePin->Direction != EGPD_Input)
+			{
+				DstLivePin = nullptr;
+			}
+			if (!SrcLivePin && !SrcPinFull.IsEmpty())
+			{
+				SrcLivePin = FindPinFlexible_ImportBpy(SrcNode, SrcPinFull, EGPD_Output);
+			}
+			if (!SrcLivePin && !SrcPin.IsEmpty())
+			{
+				SrcLivePin = FindPinFlexible_ImportBpy(SrcNode, SrcPin, EGPD_Output);
+			}
+			if (!DstLivePin && !DstPinFull.IsEmpty())
+			{
+				DstLivePin = FindPinFlexible_ImportBpy(DstNode, DstPinFull, EGPD_Input);
+			}
+			if (!DstLivePin && !DstPin.IsEmpty())
+			{
+				DstLivePin = FindPinFlexible_ImportBpy(DstNode, DstPin, EGPD_Input);
+			}
+
+			if (!SrcLivePin || !DstLivePin)
+			{
+				ConnectError = FString::Printf(
+					TEXT("cannot resolve pins: %s.%s -> %s.%s"),
+					*DescribeNode_ImportBpy(SrcNode),
+					*(!SrcPinFull.IsEmpty() ? SrcPinFull : SrcPin),
+					*DescribeNode_ImportBpy(DstNode),
+					*(!DstPinFull.IsEmpty() ? DstPinFull : DstPin));
+				return false;
+			}
+
+			const bool bAlreadyConnected =
+				SrcLivePin->LinkedTo.Contains(DstLivePin) &&
+				DstLivePin->LinkedTo.Contains(SrcLivePin);
+			if (bAlreadyConnected)
+			{
+				return true;
+			}
+
+			const UEdGraphSchema* Schema = SrcLivePin->GetSchema();
+			if (Schema && Schema->TryCreateConnection(SrcLivePin, DstLivePin))
+			{
+				return SrcLivePin->LinkedTo.Contains(DstLivePin) &&
+					DstLivePin->LinkedTo.Contains(SrcLivePin);
+			}
+
+			const bool bBothExecPins =
+				SrcLivePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec &&
+				DstLivePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
+			if (!bBothExecPins)
+			{
+				ConnectError = FString::Printf(
+					TEXT("schema rejected typed connection: %s.%s -> %s.%s"),
+					*DescribeNode_ImportBpy(SrcNode),
+					*SrcLivePin->GetName(),
+					*DescribeNode_ImportBpy(DstNode),
+					*DstLivePin->GetName());
+				return false;
+			}
+
+			SrcLivePin->MakeLinkTo(DstLivePin);
+			SrcNode->PinConnectionListChanged(SrcLivePin);
+			DstNode->PinConnectionListChanged(DstLivePin);
+			SrcNode->NodeConnectionListChanged();
+			DstNode->NodeConnectionListChanged();
+			if (UEdGraph* SrcGraph = SrcNode->GetGraph())
+			{
+				SrcGraph->NotifyGraphChanged();
+			}
+
+			return SrcLivePin->LinkedTo.Contains(DstLivePin) &&
+				DstLivePin->LinkedTo.Contains(SrcLivePin);
+		};
+
+		while (PendingConnections.Num() > 0)
+		{
+			bool bMadeProgress = false;
+			FString LastConnectError;
+			TArray<TSharedPtr<FJsonObject>> RemainingConnections;
+			RemainingConnections.Reserve(PendingConnections.Num());
+
+			for (const TSharedPtr<FJsonObject>& ConnObj : PendingConnections)
+			{
+				if (!ConnObj.IsValid())
+				{
+					continue;
+				}
+
+				FString ConnectError;
+				if (ConnectPinsForReplay(ConnObj, ConnectError))
+				{
+					bMadeProgress = true;
+					continue;
+				}
+
+				LastConnectError = ConnectError;
+				RemainingConnections.Add(ConnObj);
+			}
+
+			if (!bMadeProgress)
+			{
+				OutError = FString::Printf(
+					TEXT("Post-compile replay failed for graph %s: %s"),
+					*Graph->GetName(),
+					LastConnectError.IsEmpty() ? TEXT("no progress") : *LastConnectError);
+				return false;
+			}
+
+			PendingConnections = MoveTemp(RemainingConnections);
+		}
+
+		const int32 MissingAfterReplay = CountMissingConnections();
+		if (MissingAfterReplay > 0)
+		{
+			OutError = FString::Printf(
+				TEXT("Post-compile replay incomplete for graph %s: missing_after=%d"),
+				*Graph->GetName(),
+				MissingAfterReplay);
+			return false;
+		}
+
+		bOutAnyGraphRepaired = true;
+	}
+
+	return true;
+}
+
 static bool ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(
 	UBlueprint* BP,
 	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs,
@@ -10414,6 +11596,44 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 				return false;
 			}
 		}
+
+		bool bReplayedTopLevelConnections = false;
+		if (!ReplayTopLevelGraphSerializedConnectionsAfterCompile_ImportBpy(
+				BP,
+				SortedGraphs,
+				true,
+				bReplayedTopLevelConnections,
+				OutError))
+		{
+			return false;
+		}
+
+		if (bReplayedTopLevelConnections)
+		{
+			CompileBlueprint(BP);
+
+			if (!ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(BP, SortedGraphs, OutError))
+			{
+				return false;
+			}
+
+			if (ComponentsArr &&
+				!ReplayComponentTemplatePropertiesAfterCompile_ImportBpy(BP, *ComponentsArr, nullptr, OutError))
+			{
+				return false;
+			}
+		}
+
+		bool bUnexpectedMissingConnections = false;
+		if (!ReplayTopLevelGraphSerializedConnectionsAfterCompile_ImportBpy(
+				BP,
+				SortedGraphs,
+				false,
+				bUnexpectedMissingConnections,
+				OutError))
+		{
+			return false;
+		}
 	}
 
 	return SaveBlueprint(BP, OutError);
@@ -10432,6 +11652,115 @@ FString UBPDirectImporter::ImportBlueprintFromJsonDetailed(
 	ResultObj->SetStringField(TEXT("error"), OutError);
 	ResultObj->SetStringField(TEXT("asset_path"), TargetAssetPath);
 	ResultObj->SetBoolField(TEXT("compiled"), bSuccess && bCompileBlueprint);
+
+	FString ResultJson;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ResultJson);
+	FJsonSerializer::Serialize(ResultObj, Writer);
+	return ResultJson;
+}
+
+bool UBPDirectImporter::ValidateImportedBlueprintAgainstJson(
+	const FString& JsonData,
+	const FString& TargetAssetPath,
+	FString& OutError)
+{
+	TSharedPtr<FJsonObject> Root;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonData);
+	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+	{
+		OutError = TEXT("Failed to parse JSON for validation");
+		return false;
+	}
+
+	UBlueprint* const BP = LoadBlueprintAsset_ImportBpy(TargetAssetPath);
+	if (!BP)
+	{
+		OutError = FString::Printf(TEXT("Unable to load blueprint for validation: %s"), *TargetAssetPath);
+		return false;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> MissingGraphs;
+	TArray<TSharedPtr<FJsonValue>> MissingDefaultKeys;
+	TArray<TSharedPtr<FJsonValue>> DefaultMismatches;
+	if (!ValidateBlueprintDefaultsAgainstRootJson_ImportBpy(
+			BP,
+			Root,
+			MissingGraphs,
+			MissingDefaultKeys,
+			DefaultMismatches,
+			OutError))
+	{
+		return false;
+	}
+
+	if (MissingGraphs.Num() > 0 || MissingDefaultKeys.Num() > 0 || DefaultMismatches.Num() > 0)
+	{
+		OutError = FString::Printf(
+			TEXT("Import defaults validation failed: missing_graphs=%d missing_default_keys=%d default_mismatches=%d"),
+			MissingGraphs.Num(),
+			MissingDefaultKeys.Num(),
+			DefaultMismatches.Num());
+		return false;
+	}
+
+	return true;
+}
+
+FString UBPDirectImporter::ValidateImportedBlueprintAgainstJsonDetailed(
+	const FString& JsonData,
+	const FString& TargetAssetPath)
+{
+	FString OutError;
+	TArray<TSharedPtr<FJsonValue>> MissingGraphs;
+	TArray<TSharedPtr<FJsonValue>> MissingDefaultKeys;
+	TArray<TSharedPtr<FJsonValue>> DefaultMismatches;
+
+	bool bSuccess = false;
+	{
+		TSharedPtr<FJsonObject> Root;
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonData);
+		if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+		{
+			OutError = TEXT("Failed to parse JSON for validation");
+		}
+		else if (UBlueprint* BP = LoadBlueprintAsset_ImportBpy(TargetAssetPath))
+		{
+			const bool bValidated = ValidateBlueprintDefaultsAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				MissingGraphs,
+				MissingDefaultKeys,
+				DefaultMismatches,
+				OutError);
+			bSuccess = bValidated &&
+				MissingGraphs.Num() == 0 &&
+				MissingDefaultKeys.Num() == 0 &&
+				DefaultMismatches.Num() == 0;
+			if (bValidated && !bSuccess && OutError.IsEmpty())
+			{
+				OutError = FString::Printf(
+					TEXT("Import defaults validation failed: missing_graphs=%d missing_default_keys=%d default_mismatches=%d"),
+					MissingGraphs.Num(),
+					MissingDefaultKeys.Num(),
+					DefaultMismatches.Num());
+			}
+		}
+		else
+		{
+			OutError = FString::Printf(TEXT("Unable to load blueprint for validation: %s"), *TargetAssetPath);
+		}
+	}
+
+	TSharedRef<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetBoolField(TEXT("success"), bSuccess);
+	ResultObj->SetStringField(TEXT("error"), OutError);
+	ResultObj->SetStringField(TEXT("asset_path"), TargetAssetPath);
+	ResultObj->SetArrayField(TEXT("missing_graphs"), MissingGraphs);
+	ResultObj->SetArrayField(TEXT("missing_default_keys"), MissingDefaultKeys);
+	ResultObj->SetArrayField(TEXT("default_mismatches"), DefaultMismatches);
+	ResultObj->SetNumberField(TEXT("missing_graph_count"), MissingGraphs.Num());
+	ResultObj->SetNumberField(TEXT("missing_default_key_count"), MissingDefaultKeys.Num());
+	ResultObj->SetNumberField(TEXT("default_mismatch_count"), DefaultMismatches.Num());
 
 	FString ResultJson;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ResultJson);
@@ -11352,6 +12681,169 @@ bool UBPDirectImporter::PopulateGraph(
 
 	const TArray<TSharedPtr<FJsonValue>>* ConnsArr = nullptr;
 	GraphJson->TryGetArrayField(TEXT("connections"), ConnsArr);
+	const bool bTraceConnectionAudit = IsConnectionTraceEnabled_ImportBpy();
+
+	auto ResolveExistingConnectionPin = [](
+		UEdGraphNode* Node,
+		const FString& PinName,
+		const FString& PinFullName,
+		const FString& PinId,
+		EEdGraphPinDirection Direction) -> UEdGraphPin*
+	{
+		if (!Node)
+		{
+			return nullptr;
+		}
+
+		UEdGraphPin* Pin = FindPinById_ImportBpy(Node, PinId);
+		if (Pin && Pin->Direction != Direction)
+		{
+			Pin = nullptr;
+		}
+
+		if (!Pin && !PinFullName.IsEmpty())
+		{
+			Pin = FindExistingPinFlexible_ImportBpy(Node, PinFullName, Direction);
+		}
+		if (!Pin && !PinName.IsEmpty())
+		{
+			Pin = FindExistingPinFlexible_ImportBpy(Node, PinName, Direction);
+		}
+
+		return Pin;
+	};
+
+	auto AuditSerializedConnections = [&](const TCHAR* PhaseLabel, const bool bRequireAll) -> bool
+	{
+		if (!ConnsArr)
+		{
+			return true;
+		}
+
+		int32 PresentConnections = 0;
+		int32 MissingConnections = 0;
+		int32 TrackedPresent = 0;
+		int32 TrackedMissing = 0;
+		FString FirstMissingDetail;
+
+		for (const TSharedPtr<FJsonValue>& ConnValue : *ConnsArr)
+		{
+			const TSharedPtr<FJsonObject> ConnObj = ConnValue.IsValid() ? ConnValue->AsObject() : nullptr;
+			if (!ConnObj.IsValid())
+			{
+				continue;
+			}
+
+			FString SrcUid;
+			FString DstUid;
+			FString SrcPin;
+			FString DstPin;
+			FString SrcPinFull;
+			FString DstPinFull;
+			FString SrcPinId;
+			FString DstPinId;
+			ConnObj->TryGetStringField(TEXT("src_node"), SrcUid);
+			ConnObj->TryGetStringField(TEXT("dst_node"), DstUid);
+			ConnObj->TryGetStringField(TEXT("src_pin"), SrcPin);
+			ConnObj->TryGetStringField(TEXT("dst_pin"), DstPin);
+			ConnObj->TryGetStringField(TEXT("src_pin_full"), SrcPinFull);
+			ConnObj->TryGetStringField(TEXT("dst_pin_full"), DstPinFull);
+			ConnObj->TryGetStringField(TEXT("src_pin_id"), SrcPinId);
+			ConnObj->TryGetStringField(TEXT("dst_pin_id"), DstPinId);
+
+			const bool bTrackedConnection = IsTrackedTraversalConnection_ImportBpy(SrcUid, DstUid);
+
+			UEdGraphNode* const* SrcNodePtr = NodeMap.Find(SrcUid);
+			UEdGraphNode* const* DstNodePtr = NodeMap.Find(DstUid);
+			const UEdGraphNode* SrcNode = (SrcNodePtr && *SrcNodePtr) ? *SrcNodePtr : nullptr;
+			const UEdGraphNode* DstNode = (DstNodePtr && *DstNodePtr) ? *DstNodePtr : nullptr;
+
+			UEdGraphPin* ResolvedSrcPin =
+				ResolveExistingConnectionPin(const_cast<UEdGraphNode*>(SrcNode), SrcPin, SrcPinFull, SrcPinId, EGPD_Output);
+			UEdGraphPin* ResolvedDstPin =
+				ResolveExistingConnectionPin(const_cast<UEdGraphNode*>(DstNode), DstPin, DstPinFull, DstPinId, EGPD_Input);
+
+			const bool bConnected =
+				ResolvedSrcPin &&
+				ResolvedDstPin &&
+				ResolvedSrcPin->LinkedTo.Contains(ResolvedDstPin) &&
+				ResolvedDstPin->LinkedTo.Contains(ResolvedSrcPin);
+
+			if (bConnected)
+			{
+				++PresentConnections;
+				if (bTrackedConnection)
+				{
+					++TrackedPresent;
+				}
+			}
+			else
+			{
+				++MissingConnections;
+				if (bTrackedConnection)
+				{
+					++TrackedMissing;
+				}
+
+				if (FirstMissingDetail.IsEmpty())
+				{
+					FirstMissingDetail = FString::Printf(
+						TEXT("%s.%s -> %s.%s | src_resolved=%d dst_resolved=%d"),
+						*SrcUid,
+						*(!SrcPinFull.IsEmpty() ? SrcPinFull : SrcPin),
+						*DstUid,
+						*(!DstPinFull.IsEmpty() ? DstPinFull : DstPin),
+						ResolvedSrcPin ? 1 : 0,
+						ResolvedDstPin ? 1 : 0);
+				}
+			}
+
+			if (bTraceConnectionAudit && bTrackedConnection)
+			{
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("[ExportBpy][ConnectionAudit][%s] tracked src=%s pin=%s dst=%s pin=%s connected=%d src_pin=%s dst_pin=%s src_links=%d dst_links=%d"),
+					PhaseLabel ? PhaseLabel : TEXT("connections"),
+					*SrcUid,
+					*(!SrcPinFull.IsEmpty() ? SrcPinFull : SrcPin),
+					*DstUid,
+					*(!DstPinFull.IsEmpty() ? DstPinFull : DstPin),
+					bConnected ? 1 : 0,
+					ResolvedSrcPin ? *ResolvedSrcPin->GetName() : TEXT("<missing>"),
+					ResolvedDstPin ? *ResolvedDstPin->GetName() : TEXT("<missing>"),
+					ResolvedSrcPin ? ResolvedSrcPin->LinkedTo.Num() : -1,
+					ResolvedDstPin ? ResolvedDstPin->LinkedTo.Num() : -1);
+			}
+		}
+
+		if (bTraceConnectionAudit || TrackedMissing > 0)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[ExportBpy][ConnectionAudit][%s] graph=%s present=%d missing=%d tracked_present=%d tracked_missing=%d"),
+				PhaseLabel ? PhaseLabel : TEXT("connections"),
+				*Graph->GetName(),
+				PresentConnections,
+				MissingConnections,
+				TrackedPresent,
+				TrackedMissing);
+		}
+
+		if (bRequireAll && MissingConnections > 0)
+		{
+			OutError = FString::Printf(
+				TEXT("[%s] Serialized connection parity mismatch: graph=%s missing=%d first_missing=%s"),
+				PhaseLabel ? PhaseLabel : TEXT("connections"),
+				*Graph->GetName(),
+				MissingConnections,
+				FirstMissingDetail.IsEmpty() ? TEXT("<none>") : *FirstMissingDetail);
+			return false;
+		}
+
+		return true;
+	};
 
 	auto ReplaySerializedConnections = [&](const TCHAR* PhaseLabel, const bool bAllowUnresolvedAtStall) -> bool
 	{
@@ -11463,6 +12955,11 @@ bool UBPDirectImporter::PopulateGraph(
 	{
 		return false;
 	}
+	if (!AuditSerializedConnections(TEXT("after_initial_connections"), false))
+	{
+		return false;
+	}
+	LogTrackedPromotableNodesFromMap_ImportBpy(NodesArr, NodeMap, TEXT("after_initial_connections"));
 
 	if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, false, OutError))
 	{
@@ -11524,12 +13021,21 @@ bool UBPDirectImporter::PopulateGraph(
 		}
 	}
 
-	if (!RestorePromotableOperatorBindingsAfterConnections_ImportBpy(NodesArr, NodeMap, OutError))
+	if (!RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
+			NodesArr,
+			NodeMap,
+			TEXT("promotable_pass_1"),
+			OutError))
 	{
 		return false;
 	}
+	LogTrackedPromotableNodesFromMap_ImportBpy(NodesArr, NodeMap, TEXT("after_promotable_pass_1"));
 
 	if (!ReplaySerializedConnections(TEXT("post_promotable_rebind"), false))
+	{
+		return false;
+	}
+	if (!AuditSerializedConnections(TEXT("after_post_promotable_rebind"), true))
 	{
 		return false;
 	}
@@ -11537,12 +13043,25 @@ bool UBPDirectImporter::PopulateGraph(
 	// Replaying links can re-promote wildcard operators based on transient pin state.
 	// Run one final binding pass and stop reconnecting afterwards so exported function refs
 	// remain identical to the source blueprint signatures.
-	if (!RestorePromotableOperatorBindingsAfterConnections_ImportBpy(NodesArr, NodeMap, OutError))
+	if (!RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
+			NodesArr,
+			NodeMap,
+			TEXT("promotable_pass_2"),
+			OutError))
+	{
+		return false;
+	}
+	LogTrackedPromotableNodesFromMap_ImportBpy(NodesArr, NodeMap, TEXT("after_promotable_pass_2"));
+	if (!AuditSerializedConnections(TEXT("after_promotable_pass_2"), false))
 	{
 		return false;
 	}
 
 	if (!ReplaySerializedConnections(TEXT("post_delegate_rebind"), false))
+	{
+		return false;
+	}
+	if (!AuditSerializedConnections(TEXT("after_post_delegate_rebind"), true))
 	{
 		return false;
 	}
@@ -11553,6 +13072,52 @@ bool UBPDirectImporter::PopulateGraph(
 	if (!RestoreCreateDelegateNodesAfterConnections_ImportBpy(NodesArr, NodeMap, true, OutError))
 	{
 		return false;
+	}
+
+	// Re-applying serialized graph links for delegate recovery can still trigger
+	// late wildcard promotion on arithmetic operator nodes. Lock promotable operator
+	// function/type bindings one last time before final defaults replay/validation.
+	if (!RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
+			NodesArr,
+			NodeMap,
+			TEXT("promotable_pass_3"),
+			OutError))
+	{
+		return false;
+	}
+	LogTrackedPromotableNodesFromMap_ImportBpy(NodesArr, NodeMap, TEXT("after_promotable_pass_3"));
+	if (!AuditSerializedConnections(TEXT("after_promotable_pass_3"), false))
+	{
+		return false;
+	}
+
+	// Final stabilization pass: post-bind reconstructs can silently drop typed links
+	// on promotable arithmetic nodes. Replaying serialized connections here restores
+	// the exported topology before strict default validation and compile.
+	if (!ReplaySerializedConnections(TEXT("final_connection_stabilize"), false))
+	{
+		return false;
+	}
+	if (!AuditSerializedConnections(TEXT("after_final_connection_stabilize"), true))
+	{
+		return false;
+	}
+
+	if (!ShouldSkipStrictDefaultValidation_ImportBpy())
+	{
+		LogTrackedPromotableNodesFromMap_ImportBpy(NodesArr, NodeMap, TEXT("before_strict_default_validation"));
+		if (!ReplayAndValidateSerializedNodeDefaults_ImportBpy(NodesArr, NodeMap, Graph->GetName(), OutError))
+		{
+			return false;
+		}
+	}
+	else
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy] Skip strict default validation for graph %s (EXPORTBPY_SKIP_STRICT_DEFAULT_VALIDATION enabled)"),
+			*Graph->GetName());
 	}
 
 	return true;
@@ -12412,20 +13977,23 @@ UEdGraphNode* UBPDirectImporter::CreateCallFunctionNode(
 	Node->SetFlags(RF_Transactional);
 	Graph->AddNode(Node, false, false);
 
-	if (Func)
+	const bool bIsPromotableOperatorNode =
+		NodeClassName == TEXT("K2Node_PromotableOperator") ||
+		NodeClassName == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
+	const bool bHasSerializedPinTypeContract = HasSerializedPinTypeContract_ImportBpy(NodeJson);
+	const bool bShouldBindCallNodeFromFunction =
+		Func != nullptr &&
+		(!bIsPromotableOperatorNode || bHasSerializedPinTypeContract);
+	if (bShouldBindCallNodeFromFunction)
 	{
 		Node->SetFromFunction(Func);
 	}
 
 	if (bSelfContextCall)
 	{
-		if (!Func)
-		{
-			// Keep unresolved bare calls as self members so later reconstruct/compile
-			// can bind them against the current blueprint rather than some globally
-			// discovered function on a different generated class.
-			Node->FunctionReference.SetSelfMember(FName(*FuncName));
-		}
+		// Keep self-context members explicitly marked as self. This is also required
+		// for promotable nodes when SetFromFunction is intentionally skipped.
+		Node->FunctionReference.SetSelfMember(FName(*FuncName));
 	}
 	else
 	{
@@ -12454,6 +14022,7 @@ UEdGraphNode* UBPDirectImporter::CreateCallFunctionNode(
 	{
 		EnsureCallFunctionExecPins_ImportBpy(Node);
 	}
+	LogTrackedPromotableNodeState_ImportBpy(TEXT("create_call_node"), Node, NodeJson);
 	return Node;
 }
 

@@ -59,6 +59,17 @@ public:
 		const FString& JsonData,
 		const FString& TargetAssetPath);
 
+	UFUNCTION(BlueprintCallable, Category = "ExportBpy")
+	static bool ValidateImportedBlueprintAgainstJson(
+		const FString& JsonData,
+		const FString& TargetAssetPath,
+		FString& OutError);
+
+	UFUNCTION(BlueprintCallable, Category = "ExportBpy")
+	static FString ValidateImportedBlueprintAgainstJsonDetailed(
+		const FString& JsonData,
+		const FString& TargetAssetPath);
+
 	/**
 	 * 将独立资产（InputAction / InputMappingContext / Chooser / PoseSearchDatabase 等）
 	 * 从旧的扁平属性 JSON，或新的 standalone asset meta JSON，导入到目标资产。

@@ -604,6 +604,8 @@ class UpperPackageCompiler(ast.NodeVisitor):
         node_props_map = self.graph_spec.meta.get("node_props", {})
         pin_alias_map = self.graph_spec.meta.get("pin_alias", {})
         pin_id_map = self.graph_spec.meta.get("pin_id", {})
+        input_pin_types_map = self.graph_spec.meta.get("input_pin_types", {})
+        output_pin_types_map = self.graph_spec.meta.get("output_pin_types", {})
 
         if readable_name in node_guid_map:
             node.set_node_guid(str(node_guid_map[readable_name]))
@@ -628,6 +630,14 @@ class UpperPackageCompiler(ast.NodeVisitor):
         for pin_key, pin_id in pin_id_map.items():
             if isinstance(pin_key, str) and pin_key.startswith(prefix):
                 node.set_pin_id(pin_key.split(".", 1)[1], str(pin_id))
+
+        for pin_key, pin_type in input_pin_types_map.items():
+            if isinstance(pin_key, str) and pin_key.startswith(prefix):
+                node.set_input_pin_type(pin_key.split(".", 1)[1], str(pin_type))
+
+        for pin_key, pin_type in output_pin_types_map.items():
+            if isinstance(pin_key, str) and pin_key.startswith(prefix):
+                node.set_output_pin_type(pin_key.split(".", 1)[1], str(pin_type))
 
     def _apply_call_owner(self, node: NodeProxy, ue_ref: str) -> None:
         owner_class = self._owner_class_for_ue_ref(ue_ref)

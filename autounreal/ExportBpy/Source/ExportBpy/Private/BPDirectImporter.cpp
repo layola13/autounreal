@@ -6148,7 +6148,10 @@ bool IsTrackedTraversalGuid_ImportBpy(const FString& GuidText)
 	const FString Normalized = NormalizeGuidForTracking_ImportBpy(GuidText);
 	return Normalized == TEXT("21A313E74ECF345881D695A0E01EF5C1") ||
 		Normalized == TEXT("2D1BE5F04CC49B225D3A6DBEDE484870") ||
-		Normalized == TEXT("2C7F4536451C956EFBFE379EC7FE82FF");
+		Normalized == TEXT("2C7F4536451C956EFBFE379EC7FE82FF") ||
+		Normalized == TEXT("704CEB6C48B936A1AB62BAA12C1C11CC") ||
+		Normalized == TEXT("9488168A47D712B10795B49BB0910A69") ||
+		Normalized == TEXT("F4B688874906C3B912AF3988FB783B4D");
 }
 
 bool IsTrackedTraversalNodeJson_ImportBpy(
@@ -12949,6 +12952,48 @@ bool UBPDirectImporter::PopulateGraph(
 
 		return true;
 	};
+
+	// Prime promotable operator literal defaults before any link replay. For round-tripped
+	// .bp.py payloads we may not have explicit pin-type contracts, so wildcard operators
+	// can lock into the wrong overload if links are restored before scalar defaults (e.g. +2).
+	if (NodesArr)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue->AsObject();
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			const FString Uid = NodeObj->GetStringField(TEXT("uid"));
+			UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
+			if (!ExistingNode || !*ExistingNode)
+			{
+				continue;
+			}
+
+			UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(*ExistingNode);
+			if (!CallNode)
+			{
+				continue;
+			}
+
+			const FString NodeClassName = CallNode->GetClass()->GetName();
+			const bool bIsPromotableOperator =
+				NodeClassName == TEXT("K2Node_PromotableOperator") ||
+				NodeClassName == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
+			if (!bIsPromotableOperator)
+			{
+				continue;
+			}
+
+			if (!ApplyPinDefaults_ImportBpy(CallNode, NodeObj, OutError, true))
+			{
+				return false;
+			}
+		}
+	}
 
 	BreakAllGraphLinks_ImportBpy(Graph);
 	if (!ReplaySerializedConnections(TEXT("initial"), true))

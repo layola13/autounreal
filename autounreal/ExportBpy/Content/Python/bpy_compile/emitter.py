@@ -191,6 +191,8 @@ def _write_meta_file(path: str, graph: Any) -> None:
         "node_pos": _sorted_dict(_graph_node_pos_map(graph)),
         "pin_alias": _sorted_dict(_graph_pin_alias_map(graph)),
         "pin_id": _sorted_dict(_graph_pin_id_map(graph)),
+        "input_pin_types": _sorted_dict(_graph_input_pin_type_map(graph)),
+        "output_pin_types": _sorted_dict(_graph_output_pin_type_map(graph)),
         "node_props": _sorted_nested_dict(_graph_node_props_map(graph)),
     }
     lines = [
@@ -240,6 +242,28 @@ def _graph_pin_id_map(graph: Any) -> Dict[str, str]:
         for pin_name, pin_id in getattr(node, "pin_ids", {}).items():
             pin_id_map[f"{readable_name}.{pin_name}"] = str(pin_id)
     return pin_id_map
+
+
+def _graph_input_pin_type_map(graph: Any) -> Dict[str, str]:
+    input_pin_type_map: Dict[str, str] = {}
+    for node in getattr(graph, "nodes", []):
+        readable_name = getattr(node, "readable_name", "")
+        if not readable_name:
+            continue
+        for pin_name, pin_type in getattr(node, "input_pin_types", {}).items():
+            input_pin_type_map[f"{readable_name}.{pin_name}"] = str(pin_type)
+    return input_pin_type_map
+
+
+def _graph_output_pin_type_map(graph: Any) -> Dict[str, str]:
+    output_pin_type_map: Dict[str, str] = {}
+    for node in getattr(graph, "nodes", []):
+        readable_name = getattr(node, "readable_name", "")
+        if not readable_name:
+            continue
+        for pin_name, pin_type in getattr(node, "output_pin_types", {}).items():
+            output_pin_type_map[f"{readable_name}.{pin_name}"] = str(pin_type)
+    return output_pin_type_map
 
 
 def _graph_node_props_map(graph: Any) -> Dict[str, Dict[str, Any]]:

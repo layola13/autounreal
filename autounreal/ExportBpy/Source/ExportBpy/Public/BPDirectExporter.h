@@ -27,6 +27,8 @@ struct FNodeInfo
 	FVector2D Position;     // canvas position
 	TArray<TPair<FString, FString>> CustomParams; // custom event param name -> type
 	TMap<FString, FString> DefaultValues; // pin name → default value string
+	TMap<FString, FString> InputPinTypes; // input pin name → normalized type string
+	TMap<FString, FString> OutputPinTypes; // output pin name → normalized type string
 	TMap<FString, FString> PinAliases;    // logical pin name → raw UE pin name
 	TMap<FString, FString> PinIds;        // logical pin name → original pin guid
 	TMap<FString, FString> NodeProps;     // extra node properties not encoded in DSL

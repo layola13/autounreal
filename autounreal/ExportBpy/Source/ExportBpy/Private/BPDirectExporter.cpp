@@ -2649,6 +2649,16 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 	{
 		const FString RawPinName = Pin->PinName.ToString();
 		const FString LogicalPinName = GetLogicalPinName_ExportBpy(Node, Pin);
+		const FString PinNameForMetadata = LogicalPinName.IsEmpty() ? RawPinName : LogicalPinName;
+		const FString PinTypeString = NormalizeTypeString_ExportBpy(Pin->PinType);
+		if (Pin->Direction == EGPD_Input)
+		{
+			Info.InputPinTypes.Add(PinNameForMetadata, PinTypeString);
+		}
+		else if (Pin->Direction == EGPD_Output)
+		{
+			Info.OutputPinTypes.Add(PinNameForMetadata, PinTypeString);
+		}
 
 		if (const UK2Node_CustomEvent* CustomEventNode = Cast<UK2Node_CustomEvent>(Node))
 		{
@@ -2675,7 +2685,7 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		const FString PinDefaultValue = GetPinDefaultValueForExport_ExportBpy(Pin);
 		if (!PinDefaultValue.IsEmpty())
 		{
-			Info.DefaultValues.Add(LogicalPinName.IsEmpty() ? RawPinName : LogicalPinName, PinDefaultValue);
+			Info.DefaultValues.Add(PinNameForMetadata, PinDefaultValue);
 		}
 	}
 
@@ -3866,6 +3876,8 @@ bool UBPDirectExporter::GenerateGraphFile(
 	TMap<FString, FVector2D> NodePosMap;
 	TMap<FString, FString> PinAliasMap;
 	TMap<FString, FString> PinIdMap;
+	TMap<FString, FString> InputPinTypeMap;
+	TMap<FString, FString> OutputPinTypeMap;
 	TMap<FString, TMap<FString, FString>> NodePropsMap;
 	for (int32 i = 0; i < K2Nodes.Num() && i < NodeInfos.Num(); i++)
 	{
@@ -3880,6 +3892,14 @@ bool UBPDirectExporter::GenerateGraphFile(
 		for (const TPair<FString, FString>& PinIdEntry : NodeInfos[i].PinIds)
 		{
 			PinIdMap.Add(NodeInfos[i].VarName + TEXT(".") + PinIdEntry.Key, PinIdEntry.Value);
+		}
+		for (const TPair<FString, FString>& PinTypeEntry : NodeInfos[i].InputPinTypes)
+		{
+			InputPinTypeMap.Add(NodeInfos[i].VarName + TEXT(".") + PinTypeEntry.Key, PinTypeEntry.Value);
+		}
+		for (const TPair<FString, FString>& PinTypeEntry : NodeInfos[i].OutputPinTypes)
+		{
+			OutputPinTypeMap.Add(NodeInfos[i].VarName + TEXT(".") + PinTypeEntry.Key, PinTypeEntry.Value);
 		}
 		if (NodeInfos[i].NodeProps.Num() > 0)
 		{
@@ -4173,6 +4193,8 @@ bool UBPDirectExporter::GenerateGraphFile(
 	AppendVectorMapSection_ExportBpy(MetaLines, TEXT("node_pos"), NodePosMap);
 	AppendStringMapSection_ExportBpy(MetaLines, TEXT("pin_alias"), PinAliasMap);
 	AppendStringMapSection_ExportBpy(MetaLines, TEXT("pin_id"), PinIdMap);
+	AppendStringMapSection_ExportBpy(MetaLines, TEXT("input_pin_types"), InputPinTypeMap);
+	AppendStringMapSection_ExportBpy(MetaLines, TEXT("output_pin_types"), OutputPinTypeMap);
 	AppendNestedMapSection_ExportBpy(MetaLines, TEXT("node_props"), NodePropsMap, false);
 	MetaLines += TEXT("}\n");
 

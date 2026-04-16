@@ -29,3 +29,6 @@ opencode.json
 
 # Exported blueprint text (transient output)
 ExportedBlueprints/
+
+# UnrealMCP runtime log (local only)
+autounreal/UnrealMCP/Python/unreal_mcp_advanced.log

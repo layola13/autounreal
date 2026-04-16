@@ -854,6 +854,8 @@ def _apply_graph_source_info(
     node_props_map = graph.metadata.get("node_props", {})
     pin_alias_map = graph.metadata.get("pin_alias", {})
     pin_id_map = graph.metadata.get("pin_id", {})
+    input_pin_types_map = graph.metadata.get("input_pin_types", {})
+    output_pin_types_map = graph.metadata.get("output_pin_types", {})
 
     node_by_name = {
         node.readable_name: node
@@ -903,6 +905,26 @@ def _apply_graph_source_info(
             pin_id_value = str(pin_id)
             for pin_variant in _exec_pin_variants(pin_name):
                 node.pin_ids[pin_variant] = pin_id_value
+
+    for pin_key, pin_type in input_pin_types_map.items():
+        if "." not in pin_key:
+            continue
+        readable_name, pin_name = pin_key.split(".", 1)
+        node = node_by_name.get(readable_name)
+        if node is not None:
+            pin_type_value = str(pin_type)
+            for pin_variant in _exec_pin_variants(pin_name):
+                node.input_pin_types[pin_variant] = pin_type_value
+
+    for pin_key, pin_type in output_pin_types_map.items():
+        if "." not in pin_key:
+            continue
+        readable_name, pin_name = pin_key.split(".", 1)
+        node = node_by_name.get(readable_name)
+        if node is not None:
+            pin_type_value = str(pin_type)
+            for pin_variant in _exec_pin_variants(pin_name):
+                node.output_pin_types[pin_variant] = pin_type_value
 
 
 _MISSING_NODE_RE = re.compile(

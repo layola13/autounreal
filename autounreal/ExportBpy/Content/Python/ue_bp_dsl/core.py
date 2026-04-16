@@ -71,6 +71,8 @@ class _Node:
     extra_props:  Dict[str, Any]    = field(default_factory=dict)
     pin_aliases:  Dict[str, str]    = field(default_factory=dict)
     pin_ids:      Dict[str, str]    = field(default_factory=dict)
+    input_pin_types: Dict[str, str] = field(default_factory=dict)
+    output_pin_types: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -222,6 +224,14 @@ class NodeProxy:
 
     def set_pin_id(self, pin_name: str, pin_id: str) -> "NodeProxy":
         self._node.pin_ids[pin_name] = pin_id
+        return self
+
+    def set_input_pin_type(self, pin_name: str, type_name: str) -> "NodeProxy":
+        self._node.input_pin_types[pin_name] = type_name
+        return self
+
+    def set_output_pin_type(self, pin_name: str, type_name: str) -> "NodeProxy":
+        self._node.output_pin_types[pin_name] = type_name
         return self
 
     def _auto_pin(self, pin_name: str) -> PinRef:
@@ -776,6 +786,8 @@ def _serialize_graph(g: _Graph) -> Dict[str, Any]:
                 "node_props":   _normalize_var_get_metadata(n)[0],
                 "pin_aliases":  _normalize_var_get_metadata(n)[1],
                 "pin_ids":      _normalize_var_get_metadata(n)[2],
+                "input_pin_types": dict(n.input_pin_types),
+                "output_pin_types": dict(n.output_pin_types),
             }
             for n in g.nodes
         ],

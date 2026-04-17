@@ -5009,6 +5009,17 @@ bool IsObjectLikePinCategory_ImportBpy(const FName& PinCategory)
 		PinCategory == UEdGraphSchema_K2::PC_SoftClass;
 }
 
+bool IsScalarLiteralPinCategory_ImportBpy(const FName& PinCategory)
+{
+	return PinCategory == UEdGraphSchema_K2::PC_Boolean ||
+		PinCategory == UEdGraphSchema_K2::PC_Byte ||
+		PinCategory == UEdGraphSchema_K2::PC_Int ||
+		PinCategory == UEdGraphSchema_K2::PC_Int64 ||
+		PinCategory == UEdGraphSchema_K2::PC_Real ||
+		PinCategory == UEdGraphSchema_K2::PC_Float ||
+		PinCategory == UEdGraphSchema_K2::PC_Double;
+}
+
 bool IsSimpleLiteralDefaultForPromotable_ImportBpy(const FString& DefaultValue)
 {
 	if (DefaultValue.IsEmpty())
@@ -5026,15 +5037,6 @@ bool IsSimpleLiteralDefaultForPromotable_ImportBpy(const FString& DefaultValue)
 	return LexTryParseString(ParsedNumber, *DefaultValue);
 }
 
-bool IsScalarLiteralPinCategory_ImportBpy(const FName& PinCategory)
-{
-	return PinCategory == UEdGraphSchema_K2::PC_Boolean ||
-		PinCategory == UEdGraphSchema_K2::PC_Byte ||
-		PinCategory == UEdGraphSchema_K2::PC_Int ||
-		PinCategory == UEdGraphSchema_K2::PC_Int64 ||
-		PinCategory == UEdGraphSchema_K2::PC_Real;
-}
-
 void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>& Value)
 {
 	if (!Pin || !Value.IsValid())
@@ -5043,6 +5045,7 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 	}
 
 	const FString DefaultValue = JsonValueToDefaultString_ImportBpy(Value);
+	FString EffectiveDefaultValue = DefaultValue;
 	const UEdGraphSchema* Schema = Pin->GetSchema();
 	const FName& PinCategory = Pin->PinType.PinCategory;
 	const bool bIsWildcardPin = PinCategory == UEdGraphSchema_K2::PC_Wildcard;
@@ -5053,17 +5056,42 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 	const bool bIsPromotableOperatorPin =
 		OwningNodeClassName == TEXT("K2Node_PromotableOperator") ||
 		OwningNodeClassName == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
+	bool bAppliedUniformVectorFallback = false;
 
-	if (IsObjectLikePinCategory_ImportBpy(PinCategory) && !DefaultValue.IsEmpty())
+	// Some promotable math nodes in .bp.py payloads carry scalar literals on vector pins
+	// (for example `B=5` on vector multiply). Promote these to explicit FVector text.
+	if (bIsPromotableOperatorPin &&
+		Pin->Direction == EGPD_Input &&
+		Pin->LinkedTo.Num() == 0 &&
+		PinCategory == UEdGraphSchema_K2::PC_Struct &&
+		Pin->PinType.PinSubCategoryObject == TBaseStructure<FVector>::Get() &&
+		!DefaultValue.Contains(TEXT(",")) &&
+		!DefaultValue.Contains(TEXT("(")) &&
+		!DefaultValue.Contains(TEXT("=")))
+	{
+		double ScalarValue = 0.0;
+		if (LexTryParseString(ScalarValue, *DefaultValue))
+		{
+			const FString ScalarText = FString::SanitizeFloat(ScalarValue);
+			EffectiveDefaultValue = FString::Printf(
+				TEXT("%s,%s,%s"),
+				*ScalarText,
+				*ScalarText,
+				*ScalarText);
+			bAppliedUniformVectorFallback = true;
+		}
+	}
+
+	if (IsObjectLikePinCategory_ImportBpy(PinCategory) && !EffectiveDefaultValue.IsEmpty())
 	{
 		UObject* DefaultObject = nullptr;
 		if (PinCategory == UEdGraphSchema_K2::PC_Class || PinCategory == UEdGraphSchema_K2::PC_SoftClass)
 		{
-			DefaultObject = ResolveNamedObject_ImportBpy<UClass>(DefaultValue);
+			DefaultObject = ResolveNamedObject_ImportBpy<UClass>(EffectiveDefaultValue);
 		}
 		else
 		{
-			DefaultObject = ResolveNamedObject_ImportBpy<UObject>(DefaultValue);
+			DefaultObject = ResolveNamedObject_ImportBpy<UObject>(EffectiveDefaultValue);
 		}
 
 		if (DefaultObject)
@@ -5085,7 +5113,7 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 
 	if (PinCategory == UEdGraphSchema_K2::PC_Text)
 	{
-		const FText TextValue = FText::FromString(DefaultValue);
+		const FText TextValue = FText::FromString(EffectiveDefaultValue);
 		if (Schema)
 		{
 			Schema->TrySetDefaultText(*Pin, TextValue, false);
@@ -5099,19 +5127,19 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 
 	if (Schema)
 	{
-		Schema->TrySetDefaultValue(*Pin, DefaultValue, false);
+		Schema->TrySetDefaultValue(*Pin, EffectiveDefaultValue, false);
 		if (!bIsWildcardPin &&
 			!bIsPromotableOperatorPin &&
-			!Pin->DefaultValue.Equals(DefaultValue, ESearchCase::CaseSensitive))
+			!Pin->DefaultValue.Equals(EffectiveDefaultValue, ESearchCase::CaseSensitive))
 		{
-			Pin->DefaultValue = DefaultValue;
+			Pin->DefaultValue = EffectiveDefaultValue;
 		}
 	}
 	else
 	{
 		if (!bIsWildcardPin && !bIsPromotableOperatorPin)
 		{
-			Pin->DefaultValue = DefaultValue;
+			Pin->DefaultValue = EffectiveDefaultValue;
 		}
 	}
 
@@ -5121,13 +5149,29 @@ void ApplyDefaultToPin_ImportBpy(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 	const bool bCanForcePromotableDefault =
 		bIsPromotableOperatorPin &&
 		Pin->Direction == EGPD_Input &&
-		IsScalarLiteralPinCategory_ImportBpy(Pin->PinType.PinCategory) &&
 		Pin->LinkedTo.Num() == 0 &&
-		IsSimpleLiteralDefaultForPromotable_ImportBpy(DefaultValue) &&
-		!Pin->DefaultValue.Equals(DefaultValue, ESearchCase::CaseSensitive);
+		Pin->SubPins.Num() == 0 &&
+		(bIsWildcardPin || IsScalarLiteralPinCategory_ImportBpy(Pin->PinType.PinCategory)) &&
+		!IsObjectLikePinCategory_ImportBpy(Pin->PinType.PinCategory) &&
+		Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec &&
+		IsSimpleLiteralDefaultForPromotable_ImportBpy(EffectiveDefaultValue) &&
+		!Pin->DefaultValue.Equals(EffectiveDefaultValue, ESearchCase::CaseSensitive);
 	if (bCanForcePromotableDefault)
 	{
-		Pin->DefaultValue = DefaultValue;
+		Pin->DefaultValue = EffectiveDefaultValue;
+	}
+
+	const bool bCanForcePromotableVectorDefault =
+		bAppliedUniformVectorFallback &&
+		bIsPromotableOperatorPin &&
+		Pin->Direction == EGPD_Input &&
+		Pin->LinkedTo.Num() == 0 &&
+		PinCategory == UEdGraphSchema_K2::PC_Struct &&
+		Pin->PinType.PinSubCategoryObject == TBaseStructure<FVector>::Get() &&
+		!Pin->DefaultValue.Equals(EffectiveDefaultValue, ESearchCase::CaseSensitive);
+	if (bCanForcePromotableVectorDefault)
+	{
+		Pin->DefaultValue = EffectiveDefaultValue;
 	}
 
 	Pin->bDefaultValueIsIgnored = false;
@@ -9082,12 +9126,41 @@ bool TryParseNumericText_ImportBpy(const FString& Text, double& OutValue)
 	return LexTryParseString(OutValue, *Normalized);
 }
 
+FString CanonicalizeSerializedDefaultValue_ImportBpy(const FString& Value)
+{
+	FString Normalized = Value;
+	Normalized.TrimStartAndEndInline();
+	if (Normalized.StartsWith(TEXT("\"")) && Normalized.EndsWith(TEXT("\"")) && Normalized.Len() >= 2)
+	{
+		Normalized = Normalized.Mid(1, Normalized.Len() - 2);
+		Normalized.TrimStartAndEndInline();
+	}
+
+	// UE 5.7 may emit equivalent empty-array forms as "Samples=()" or "Samples=".
+	int32 SearchStart = 0;
+	const FString SamplesToken = TEXT("Samples=");
+	while (true)
+	{
+		const int32 TokenIndex = Normalized.Find(SamplesToken, ESearchCase::CaseSensitive, ESearchDir::FromStart, SearchStart);
+		if (TokenIndex == INDEX_NONE)
+		{
+			break;
+		}
+		const int32 ValueStart = TokenIndex + SamplesToken.Len();
+		if (ValueStart + 1 < Normalized.Len() &&
+			Normalized.Mid(ValueStart, 2).Equals(TEXT("()"), ESearchCase::CaseSensitive))
+		{
+			Normalized.RemoveAt(ValueStart, 2, EAllowShrinking::No);
+		}
+		SearchStart = ValueStart + 1;
+	}
+	return Normalized;
+}
+
 bool AreSerializedDefaultValuesEquivalent_ImportBpy(const FString& ExpectedValue, const FString& ActualValue)
 {
-	FString Expected = ExpectedValue;
-	FString Actual = ActualValue;
-	Expected.TrimStartAndEndInline();
-	Actual.TrimStartAndEndInline();
+	FString Expected = CanonicalizeSerializedDefaultValue_ImportBpy(ExpectedValue);
+	FString Actual = CanonicalizeSerializedDefaultValue_ImportBpy(ActualValue);
 
 	if (Expected.Equals(Actual, ESearchCase::CaseSensitive))
 	{
@@ -9293,6 +9366,13 @@ bool ValidateBlueprintDefaultsAgainstRootJson_ImportBpy(
 	for (UEdGraph* Graph : BP->DelegateSignatureGraphs)
 	{
 		GatherReachableGraphs_ImportBpy(Graph, VisitedGraphs, ReachableGraphs);
+	}
+	for (const FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
+	{
+		for (UEdGraph* Graph : InterfaceDesc.Graphs)
+		{
+			GatherReachableGraphs_ImportBpy(Graph, VisitedGraphs, ReachableGraphs);
+		}
 	}
 
 	auto FindGraphByGuid = [&](const FGuid& Guid) -> UEdGraph*
@@ -9799,6 +9879,93 @@ bool HasPromotableDefaultContractHint_ImportBpy(
 	return false;
 }
 
+bool HasWildcardPins_ImportBpy(const UK2Node_CallFunction* CallNode)
+{
+	if (!CallNode)
+	{
+		return false;
+	}
+
+	for (const UEdGraphPin* Pin : CallNode->Pins)
+	{
+		if (!Pin || Pin->Direction == EGPD_MAX)
+		{
+			continue;
+		}
+		if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool HydrateWildcardPinsFromTargetFunction_ImportBpy(UK2Node_CallFunction* CallNode)
+{
+	if (!CallNode)
+	{
+		return false;
+	}
+
+	const UFunction* TargetFunction = CallNode->GetTargetFunction();
+	if (!TargetFunction)
+	{
+		return false;
+	}
+
+	const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
+	if (!K2Schema)
+	{
+		return false;
+	}
+
+	bool bAnyPinHydrated = false;
+	for (UEdGraphPin* Pin : CallNode->Pins)
+	{
+		if (!Pin || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Wildcard)
+		{
+			continue;
+		}
+
+		FEdGraphPinType ResolvedPinType;
+		bool bResolved = false;
+		for (TFieldIterator<FProperty> It(TargetFunction); It && (It->PropertyFlags & CPF_Parm); ++It)
+		{
+			const FProperty* Property = *It;
+			if (!Property)
+			{
+				continue;
+			}
+
+			const bool bMatchesByName = Property->GetFName() == Pin->PinName;
+			const bool bMatchesReturnAlias =
+				Property->HasAnyPropertyFlags(CPF_ReturnParm) &&
+				Pin->PinName == UEdGraphSchema_K2::PN_ReturnValue;
+			if (!bMatchesByName && !bMatchesReturnAlias)
+			{
+				continue;
+			}
+
+			if (K2Schema->ConvertPropertyToPinType(Property, ResolvedPinType))
+			{
+				bResolved = true;
+				break;
+			}
+		}
+
+		if (!bResolved)
+		{
+			continue;
+		}
+
+		Pin->PinType = ResolvedPinType;
+		bAnyPinHydrated = true;
+	}
+
+	return bAnyPinHydrated;
+}
+
 bool RestoreCallFunctionBindingFromJson_ImportBpy(
 	UK2Node_CallFunction* CallNode,
 	const TSharedPtr<FJsonObject>& NodeJson,
@@ -9881,9 +10048,11 @@ bool RestoreCallFunctionBindingFromJson_ImportBpy(
 	const UFunction* ExistingTargetFunction = CallNode->GetTargetFunction();
 	const bool bHasDefaultContractHint =
 		bIsPromotableOperator && HasPromotableDefaultContractHint_ImportBpy(CallNode, NodeJson);
+	const bool bHasWildcardPins = bIsPromotableOperator && HasWildcardPins_ImportBpy(CallNode);
 	if (bIsPromotableOperator &&
 		!bAllowPromotableFunctionRebind &&
 		!bHasDefaultContractHint &&
+		!bHasWildcardPins &&
 		ExistingTargetFunction)
 	{
 		// .bp.py + _meta payloads do not serialize full promotable pin-type contracts.
@@ -9895,7 +10064,8 @@ bool RestoreCallFunctionBindingFromJson_ImportBpy(
 
 	const bool bShouldRebindFunction =
 		ExistingTargetFunction == nullptr ||
-		ExistingTargetFunction != ResolvedFunction;
+		ExistingTargetFunction != ResolvedFunction ||
+		(bIsPromotableOperator && bHasWildcardPins);
 	if (bShouldRebindFunction)
 	{
 		CallNode->SetFromFunction(ResolvedFunction);
@@ -10023,6 +10193,11 @@ bool RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
 			return false;
 		}
 
+		if (HasWildcardPins_ImportBpy(CallNode))
+		{
+			HydrateWildcardPinsFromTargetFunction_ImportBpy(CallNode);
+		}
+
 		// SetFromFunction can rebuild pins; replay serialized defaults and pin IDs so
 		// promotable operators stay bit-identical to exported call signatures.
 		if (!ApplyPinDefaults_ImportBpy(CallNode, NodeObj, OutError, false))
@@ -10032,6 +10207,40 @@ bool RestorePromotableOperatorBindingsAfterConnections_ImportBpy(
 		if (!ApplyPinIds_ImportBpy(CallNode, NodeObj, OutError))
 		{
 			return false;
+		}
+
+		if (IsPromotableTraceEnabled_ImportBpy() && HasWildcardPins_ImportBpy(CallNode))
+		{
+			FString FunctionRefText;
+			NodeObj->TryGetStringField(TEXT("function_ref"), FunctionRefText);
+
+			TArray<FString> WildcardPins;
+			WildcardPins.Reserve(CallNode->Pins.Num());
+			for (const UEdGraphPin* Pin : CallNode->Pins)
+			{
+				if (!Pin || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Wildcard)
+				{
+					continue;
+				}
+
+				WildcardPins.Add(FString::Printf(
+					TEXT("%s(dir=%s links=%d default='%s')"),
+					*Pin->GetName(),
+					Pin->Direction == EGPD_Input ? TEXT("In") : TEXT("Out"),
+					Pin->LinkedTo.Num(),
+					*Pin->DefaultValue));
+			}
+
+			const UFunction* TargetFunction = CallNode->GetTargetFunction();
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[ExportBpy][PromotableWildcard] phase=%s node=%s function_ref='%s' target='%s' wildpins=[%s]"),
+				PhaseLabel ? PhaseLabel : TEXT("<unknown>"),
+				*DescribeNode_ImportBpy(CallNode),
+				*FunctionRefText,
+				TargetFunction ? *TargetFunction->GetPathName() : TEXT("<null>"),
+				WildcardPins.Num() > 0 ? *FString::Join(WildcardPins, TEXT("; ")) : TEXT("<none>"));
 		}
 
 		LogTrackedPromotableNodeState_ImportBpy(PhaseLabel, CallNode, NodeObj);
@@ -14025,10 +14234,8 @@ UEdGraphNode* UBPDirectImporter::CreateCallFunctionNode(
 	const bool bIsPromotableOperatorNode =
 		NodeClassName == TEXT("K2Node_PromotableOperator") ||
 		NodeClassName == TEXT("K2Node_CommutativeAssociativeBinaryOperator");
-	const bool bHasSerializedPinTypeContract = HasSerializedPinTypeContract_ImportBpy(NodeJson);
 	const bool bShouldBindCallNodeFromFunction =
-		Func != nullptr &&
-		(!bIsPromotableOperatorNode || bHasSerializedPinTypeContract);
+		Func != nullptr;
 	if (bShouldBindCallNodeFromFunction)
 	{
 		Node->SetFromFunction(Func);

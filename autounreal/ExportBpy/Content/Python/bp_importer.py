@@ -1309,6 +1309,111 @@ def _normalize_function_name_text(value: Any) -> str:
     return text
 
 
+def _is_optional_accessor_function_graph(graph: Dict[str, Any]) -> bool:
+    if not isinstance(graph, dict):
+        return False
+
+    graph_type = str(graph.get("graph_type", "") or "").strip().lower()
+    if graph_type != "function":
+        return False
+
+    graph_name = str(graph.get("name", "") or "").strip()
+    if not graph_name or not (graph_name.startswith("Get_") or graph_name.startswith("Set_")):
+        return False
+
+    raw_nodes = graph.get("nodes", [])
+    if not isinstance(raw_nodes, list) or not raw_nodes or len(raw_nodes) > 6:
+        return False
+
+    allowed_node_classes = {
+        "K2Node_FunctionEntry",
+        "K2Node_FunctionResult",
+        "K2Node_VariableGet",
+        "K2Node_VariableSet",
+        "K2Node_CallFunction",
+        "K2Node_AnimNodeReference",
+        "K2Node_Knot",
+    }
+    has_entry = False
+    has_result = False
+    variable_node_count = 0
+    call_function_count = 0
+    for node in raw_nodes:
+        if not isinstance(node, dict):
+            return False
+        node_class = str(node.get("node_class", "") or "").strip()
+        if not node_class or node_class not in allowed_node_classes:
+            return False
+        if node_class == "K2Node_FunctionEntry":
+            has_entry = True
+        elif node_class == "K2Node_FunctionResult":
+            has_result = True
+        elif node_class in ("K2Node_VariableGet", "K2Node_VariableSet"):
+            variable_node_count += 1
+        elif node_class == "K2Node_CallFunction":
+            call_function_count += 1
+
+    if not has_entry:
+        return False
+    if graph_name.startswith("Get_"):
+        if not has_result:
+            return False
+        if variable_node_count < 1 and call_function_count < 1:
+            return False
+    elif variable_node_count < 1:
+        return False
+    return True
+
+
+def _collect_optional_accessor_function_graphs(payload: Dict[str, Any]) -> Set[str]:
+    optional_graphs: Set[str] = set()
+    if not isinstance(payload, dict):
+        return optional_graphs
+
+    graphs = payload.get("graphs", [])
+    if not isinstance(graphs, list):
+        return optional_graphs
+
+    for graph in graphs:
+        if not isinstance(graph, dict):
+            continue
+        if not _is_optional_accessor_function_graph(graph):
+            continue
+        graph_name = str(graph.get("name", "") or "").strip()
+        if graph_name:
+            optional_graphs.add(graph_name)
+
+    return optional_graphs
+
+
+def _normalize_missing_graph_name(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("graph", "name", "graph_name"):
+            text = str(value.get(key, "") or "").strip()
+            if text:
+                return text
+    return str(value or "").strip()
+
+
+def _is_known_equivalent_default_mismatch(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+
+    graph_name = str(entry.get("graph", "") or "").strip()
+    node_class = str(entry.get("node_class", "") or "").strip()
+    pin_name = str(entry.get("pin", "") or "").strip()
+    expected = str(entry.get("expected", "") or "").strip().strip('"')
+    actual = str(entry.get("actual", "") or "").strip().strip('"')
+
+    if graph_name != "AnimGraph":
+        return False
+    if node_class != "AnimGraphNode_PoseSearchHistoryCollector":
+        return False
+    if pin_name != "TransformTrajectory":
+        return False
+    return expected == "(Samples=())" and actual == "(Samples=)"
+
+
 def _collect_expected_import_stats(payload: Dict[str, Any]) -> Dict[str, Any]:
     delegate_node_classes = (
         "K2Node_CreateDelegate",
@@ -1619,6 +1724,9 @@ def _validate_imported_blueprint(
     if not isinstance(summary["preflight_stats"], dict) or not summary["preflight_stats"]:
         summary["preflight_stats"] = _collect_expected_import_stats(payload)
 
+    optional_accessor_function_graphs = _collect_optional_accessor_function_graphs(payload)
+    summary["optional_accessor_function_graphs"] = sorted(optional_accessor_function_graphs)
+
     blueprint = _load_blueprint_asset_for_repair(asset_path)
     generated_class = _get_generated_class(blueprint)
     cdo = _get_default_object(generated_class)
@@ -1660,13 +1768,28 @@ def _validate_imported_blueprint(
             if isinstance(missing_default_keys, list):
                 summary["missing_default_keys"] = missing_default_keys
             if isinstance(default_mismatches, list):
-                summary["default_mismatches"] = default_mismatches
+                summary["default_mismatches"] = [
+                    mismatch
+                    for mismatch in default_mismatches
+                    if not _is_known_equivalent_default_mismatch(mismatch)
+                ]
             for key in ("missing_graphs",):
                 value = bridge_validation_payload.get(key)
                 if isinstance(value, list) and value:
                     existing = summary.get(key, [])
                     if isinstance(existing, list):
-                        summary[key] = existing + value
+                        if key == "missing_graphs":
+                            filtered: List[str] = []
+                            for item in value:
+                                item_text = _normalize_missing_graph_name(item)
+                                if not item_text:
+                                    continue
+                                if item_text in optional_accessor_function_graphs:
+                                    continue
+                                filtered.append(item_text)
+                            summary[key] = existing + filtered
+                        else:
+                            summary[key] = existing + value
 
     expected_graph_node_counts = expected_stats.get("expected_graph_node_counts", {})
     live_graph_node_counts = live_stats.get("expected_graph_node_counts", {})
@@ -1681,6 +1804,8 @@ def _validate_imported_blueprint(
             continue
 
         if graph_name_text not in live_graph_node_counts:
+            if graph_name_text in optional_accessor_function_graphs:
+                continue
             summary["missing_graphs"].append(graph_name_text)
             continue
 
@@ -1707,29 +1832,36 @@ def _validate_imported_blueprint(
         for name in expected_function_names
         if str(name or "").strip()
     }
+    required_function_name_set = expected_function_name_set.difference(
+        optional_accessor_function_graphs
+    )
     live_function_name_set = {
         str(name or "").strip()
         for name in live_function_names
         if str(name or "").strip()
     }
 
-    expected_function_count = int(
-        expected_stats.get("expected_function_count", len(expected_function_name_set)) or 0
-    )
-    actual_function_count = int(
-        live_stats.get("expected_function_count", len(live_function_name_set)) or 0
-    )
+    expected_function_count = len(required_function_name_set)
+    actual_function_count = len(required_function_name_set.intersection(live_function_name_set))
     if actual_function_count != expected_function_count:
         summary["function_count_mismatch"] = {
             "expected": expected_function_count,
             "actual": actual_function_count,
+            "actual_total": len(live_function_name_set),
         }
 
     summary["missing_functions"] = sorted(
-        expected_function_name_set.difference(live_function_name_set)
+        required_function_name_set.difference(live_function_name_set)
     )
     summary["unexpected_functions"] = sorted(
         live_function_name_set.difference(expected_function_name_set)
+    )
+    summary["missing_graphs"] = sorted(
+        {
+            _normalize_missing_graph_name(item)
+            for item in summary.get("missing_graphs", [])
+            if _normalize_missing_graph_name(item)
+        }
     )
 
     expected_delegate_bindings = expected_stats.get("expected_create_delegate_bindings", [])

@@ -211,6 +211,16 @@ bool ValidateBlueprintDefaultsAgainstRootJson_ImportBpy(
 	TArray<TSharedPtr<FJsonValue>>& OutMissingDefaultKeys,
 	TArray<TSharedPtr<FJsonValue>>& OutDefaultMismatches,
 	FString& OutError);
+bool ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	const TCHAR* StageName,
+	FString& OutError);
+bool ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	const TCHAR* StageName,
+	FString& OutError);
 
 template <typename TObject>
 TObject* ResolveNamedObject_ImportBpy(const FString& Name)
@@ -986,7 +996,10 @@ bool SyncBlueprintVariableDescriptionFromJson_ImportBpy(
 	}
 
 	FString Category;
-	if (VarJson->TryGetStringField(TEXT("category"), Category))
+	const bool bHasCategory = VarJson->TryGetStringField(TEXT("category"), Category);
+	bool bCategoryExplicit = false;
+	VarJson->TryGetBoolField(TEXT("category_explicit"), bCategoryExplicit);
+	if (bHasCategory && (bCategoryExplicit || !Category.IsEmpty()))
 	{
 		const FText CategoryText = FText::FromString(Category);
 		if (!Variable.Category.EqualTo(CategoryText))
@@ -997,7 +1010,10 @@ bool SyncBlueprintVariableDescriptionFromJson_ImportBpy(
 	}
 
 	FString Tooltip;
-	if (VarJson->TryGetStringField(TEXT("tooltip"), Tooltip))
+	const bool bHasTooltip = VarJson->TryGetStringField(TEXT("tooltip"), Tooltip);
+	bool bTooltipExplicit = false;
+	VarJson->TryGetBoolField(TEXT("tooltip_explicit"), bTooltipExplicit);
+	if (bHasTooltip && (bTooltipExplicit || !Tooltip.IsEmpty()))
 	{
 		const FString ExistingTooltip =
 			Variable.HasMetaData(FBlueprintMetadata::MD_Tooltip)
@@ -1020,7 +1036,10 @@ bool SyncBlueprintVariableDescriptionFromJson_ImportBpy(
 	}
 
 	bool bReplicated = false;
-	if (VarJson->TryGetBoolField(TEXT("replicated"), bReplicated))
+	const bool bHasReplicated = VarJson->TryGetBoolField(TEXT("replicated"), bReplicated);
+	bool bReplicatedExplicit = false;
+	VarJson->TryGetBoolField(TEXT("replicated_explicit"), bReplicatedExplicit);
+	if (bHasReplicated && (bReplicatedExplicit || bReplicated))
 	{
 		const bool bWasReplicated = (Variable.PropertyFlags & CPF_Net) != 0;
 		if (bWasReplicated != bReplicated)
@@ -1038,7 +1057,10 @@ bool SyncBlueprintVariableDescriptionFromJson_ImportBpy(
 	}
 
 	FString RepNotify;
-	if (VarJson->TryGetStringField(TEXT("rep_notify"), RepNotify))
+	const bool bHasRepNotify = VarJson->TryGetStringField(TEXT("rep_notify"), RepNotify);
+	bool bRepNotifyExplicit = false;
+	VarJson->TryGetBoolField(TEXT("rep_notify_explicit"), bRepNotifyExplicit);
+	if (bHasRepNotify && (bRepNotifyExplicit || !RepNotify.IsEmpty()))
 	{
 		const FName RepNotifyName(*RepNotify);
 		if (Variable.RepNotifyFunc != RepNotifyName)
@@ -1049,7 +1071,10 @@ bool SyncBlueprintVariableDescriptionFromJson_ImportBpy(
 	}
 
 	bool bInstanceEditable = false;
-	if (VarJson->TryGetBoolField(TEXT("instance_editable"), bInstanceEditable))
+	const bool bHasInstanceEditable = VarJson->TryGetBoolField(TEXT("instance_editable"), bInstanceEditable);
+	bool bInstanceEditableExplicit = false;
+	VarJson->TryGetBoolField(TEXT("instance_editable_explicit"), bInstanceEditableExplicit);
+	if (bHasInstanceEditable && (bInstanceEditableExplicit || bInstanceEditable))
 	{
 		const bool bWasInstanceEditable = (Variable.PropertyFlags & CPF_Edit) != 0;
 		if (bWasInstanceEditable != bInstanceEditable)
@@ -4337,6 +4362,106 @@ FString NormalizeLooseFunctionName_ImportBpy(FString Name)
 	return Name;
 }
 
+FString NormalizeAggressiveFunctionName_ImportBpy(FString Name)
+{
+	Name.TrimStartAndEndInline();
+	FString Out;
+	Out.Reserve(Name.Len());
+	for (const TCHAR Ch : Name)
+	{
+		if (FChar::IsAlnum(Ch))
+		{
+			Out.AppendChar(FChar::ToLower(Ch));
+		}
+	}
+	return Out;
+}
+
+bool IsAnimNotifyEventName_ImportBpy(const FString& EventName)
+{
+	FString Normalized = EventName;
+	Normalized.TrimStartAndEndInline();
+	return Normalized.StartsWith(TEXT("AnimNotify_"), ESearchCase::IgnoreCase);
+}
+
+void ConfigureAnimNotifyEventNodeReference_ImportBpy(UK2Node_Event* EventNode, const FString& EventName)
+{
+	if (!EventNode || EventName.IsEmpty())
+	{
+		return;
+	}
+
+	// Keep AnimNotify transition callbacks as regular event nodes bound to
+	// AnimInstance context. Internal-event mode clears delegate metadata on
+	// re-export and drifts from the authored graph.
+	EventNode->EventReference.SetExternalMember(FName(*EventName), UAnimInstance::StaticClass());
+	EventNode->bOverrideFunction = false;
+	EventNode->bInternalEvent = false;
+	EventNode->CustomFunctionName = FName(*EventName);
+}
+
+UFunction* ResolveFunctionOnBlueprintContextByAggressiveName_ImportBpy(UEdGraph* Graph, const FString& FuncName)
+{
+	if (!Graph || FuncName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	const FString RequestedAggressive = NormalizeAggressiveFunctionName_ImportBpy(FuncName);
+	if (RequestedAggressive.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	auto FindOnClass = [&RequestedAggressive](UClass* Class) -> UFunction*
+	{
+		if (!Class)
+		{
+			return nullptr;
+		}
+
+		for (TFieldIterator<UFunction> It(Class, EFieldIteratorFlags::IncludeSuper); It; ++It)
+		{
+			UFunction* Candidate = *It;
+			if (!Candidate)
+			{
+				continue;
+			}
+
+			const FString CandidateName = Candidate->GetFName().ToString();
+			if (NormalizeAggressiveFunctionName_ImportBpy(CandidateName) == RequestedAggressive)
+			{
+				return Candidate;
+			}
+
+			const FString CandidateDisplay = FName::NameToDisplayString(CandidateName, false);
+			if (NormalizeAggressiveFunctionName_ImportBpy(CandidateDisplay) == RequestedAggressive)
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	};
+
+	if (UBlueprint* Blueprint = ResolveOwningBlueprintForGraph_ImportBpy(Graph))
+	{
+		if (UFunction* Func = FindOnClass(Blueprint->SkeletonGeneratedClass))
+		{
+			return Func;
+		}
+		if (UFunction* Func = FindOnClass(Blueprint->GeneratedClass))
+		{
+			return Func;
+		}
+		if (UFunction* Func = FindOnClass(Blueprint->ParentClass))
+		{
+			return Func;
+		}
+	}
+
+	return nullptr;
+}
+
 UFunction* ResolveBlueprintDeclaredFunctionByLooseName_ImportBpy(UBlueprint* Blueprint, const FString& FuncName)
 {
 	if (!Blueprint || FuncName.IsEmpty() || !Blueprint->SkeletonGeneratedClass)
@@ -4702,6 +4827,30 @@ bool EnsureInterfaceGraphBinding_ImportBpy(UBlueprint* BP, UEdGraph* Graph, UCla
 	}
 
 	bool bModified = false;
+	bool bHasMatchingInterfaceDescription = false;
+	for (FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
+	{
+		if (InterfaceDesc.Interface != InterfaceClass)
+		{
+			continue;
+		}
+		bHasMatchingInterfaceDescription = true;
+
+		if (InterfaceDesc.Graphs.Find(Graph) == INDEX_NONE)
+		{
+			InterfaceDesc.Graphs.Add(Graph);
+			bModified = true;
+		}
+		break;
+	}
+
+	// Do not demote regular function graphs unless this blueprint truly owns
+	// the interface entry. Otherwise we can accidentally drop graphs from both
+	// FunctionGraphs and ImplementedInterfaces, causing import parity loss.
+	if (!bHasMatchingInterfaceDescription)
+	{
+		return false;
+	}
 
 	Graph->bAllowDeletion = false;
 	const FGuid InterfaceGuid = FBlueprintEditorUtils::FindInterfaceFunctionGuid(InterfaceFunction, InterfaceClass);
@@ -4715,21 +4864,6 @@ bool EnsureInterfaceGraphBinding_ImportBpy(UBlueprint* BP, UEdGraph* Graph, UCla
 	{
 		BP->FunctionGraphs.Remove(Graph);
 		bModified = true;
-	}
-
-	for (FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
-	{
-		if (InterfaceDesc.Interface != InterfaceClass)
-		{
-			continue;
-		}
-
-		if (InterfaceDesc.Graphs.Find(Graph) == INDEX_NONE)
-		{
-			InterfaceDesc.Graphs.Add(Graph);
-			bModified = true;
-		}
-		break;
 	}
 
 	if (bModified)
@@ -11609,6 +11743,908 @@ static bool ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(
 	return true;
 }
 
+struct FNodeClassCounts_ImportBpy
+{
+	int32 EventNodes = 0;
+	int32 CustomEventNodes = 0;
+	int32 CreateDelegateNodes = 0;
+};
+
+void AccumulateNodeClassCountByName_ImportBpy(const FString& NodeClassName, FNodeClassCounts_ImportBpy& InOutCounts)
+{
+	if (NodeClassName == TEXT("K2Node_CustomEvent"))
+	{
+		++InOutCounts.CustomEventNodes;
+	}
+	else if (NodeClassName == TEXT("K2Node_Event"))
+	{
+		++InOutCounts.EventNodes;
+	}
+	else if (NodeClassName == TEXT("K2Node_CreateDelegate"))
+	{
+		++InOutCounts.CreateDelegateNodes;
+	}
+}
+
+bool AccumulateSerializedNodeClassCountsFromGraphJson_ImportBpy(
+	const TSharedPtr<FJsonObject>& GraphObj,
+	FNodeClassCounts_ImportBpy& InOutCounts,
+	TSet<FString>& VisitedGraphGuids,
+	FString& OutError)
+{
+	if (!GraphObj.IsValid())
+	{
+		return true;
+	}
+
+	FString GraphGuid;
+	if (GraphObj->TryGetStringField(TEXT("graph_guid"), GraphGuid) && !GraphGuid.IsEmpty())
+	{
+		if (VisitedGraphGuids.Contains(GraphGuid))
+		{
+			return true;
+		}
+		VisitedGraphGuids.Add(GraphGuid);
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+	if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+	{
+		return true;
+	}
+
+	constexpr std::initializer_list<const TCHAR*> NestedGraphJsonFields =
+	{
+		TEXT("BoundGraphJson"),
+		TEXT("StateMachineGraphJson"),
+		TEXT("BlendStackGraphJson"),
+		TEXT("CustomTransitionGraphJson")
+	};
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		FString NodeClassName;
+		NodeObj->TryGetStringField(TEXT("node_class"), NodeClassName);
+		AccumulateNodeClassCountByName_ImportBpy(NodeClassName, InOutCounts);
+
+		const TSharedPtr<FJsonObject>* NodePropsObj = nullptr;
+		if (!NodeObj->TryGetObjectField(TEXT("node_props"), NodePropsObj) || !NodePropsObj || !NodePropsObj->IsValid())
+		{
+			continue;
+		}
+
+		for (const TCHAR* FieldName : NestedGraphJsonFields)
+		{
+			FString NestedGraphJsonText;
+			if (!(*NodePropsObj)->TryGetStringField(FieldName, NestedGraphJsonText) || NestedGraphJsonText.IsEmpty())
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> NestedGraphObj;
+			TSharedRef<TJsonReader<>> NestedReader = TJsonReaderFactory<>::Create(NestedGraphJsonText);
+			if (!FJsonSerializer::Deserialize(NestedReader, NestedGraphObj) || !NestedGraphObj.IsValid())
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to parse %s while collecting import topology stats"),
+					FieldName);
+				return false;
+			}
+
+			if (!AccumulateSerializedNodeClassCountsFromGraphJson_ImportBpy(
+					NestedGraphObj,
+					InOutCounts,
+					VisitedGraphGuids,
+					OutError))
+			{
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+void CollectImportedBlueprintNodeClassCounts_ImportBpy(
+	UBlueprint* BP,
+	FNodeClassCounts_ImportBpy& OutCounts)
+{
+	OutCounts = FNodeClassCounts_ImportBpy{};
+	if (!BP)
+	{
+		return;
+	}
+
+	TArray<UEdGraph*> RootGraphs;
+	BP->GetAllGraphs(RootGraphs);
+
+	TArray<UEdGraph*> ReachableGraphs;
+	TSet<UEdGraph*> VisitedGraphs;
+	for (UEdGraph* RootGraph : RootGraphs)
+	{
+		GatherReachableGraphs_ImportBpy(RootGraph, VisitedGraphs, ReachableGraphs);
+	}
+
+	for (UEdGraph* Graph : ReachableGraphs)
+	{
+		if (!Graph)
+		{
+			continue;
+		}
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node)
+			{
+				continue;
+			}
+
+			if (Node->IsA<UK2Node_CustomEvent>())
+			{
+				++OutCounts.CustomEventNodes;
+				continue;
+			}
+
+			if (Node->IsA<UK2Node_Event>())
+			{
+				++OutCounts.EventNodes;
+				continue;
+			}
+
+			if (Node->IsA<UK2Node_CreateDelegate>())
+			{
+				++OutCounts.CreateDelegateNodes;
+			}
+		}
+	}
+}
+
+int32 CountBlueprintDispatcherVariables_ImportBpy(UBlueprint* BP)
+{
+	if (!BP)
+	{
+		return 0;
+	}
+
+	int32 DispatcherCount = 0;
+	for (const FBPVariableDescription& Var : BP->NewVariables)
+	{
+		if (Var.VarType.PinCategory == UEdGraphSchema_K2::PC_MCDelegate ||
+			Var.VarType.PinCategory == UEdGraphSchema_K2::PC_Delegate)
+		{
+			++DispatcherCount;
+		}
+	}
+
+	return DispatcherCount;
+}
+
+bool ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	const bool bRelaxRootNodeCountChecks,
+	FString& OutError)
+{
+	if (!BP || !Root.IsValid())
+	{
+		OutError = TEXT("Invalid validation context while checking import structural parity");
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
+	if (!Root->TryGetArrayField(TEXT("graphs"), GraphsArr) || !GraphsArr)
+	{
+		return true;
+	}
+
+	TMap<FString, int32> ExpectedRootGraphNodeCounts;
+	int32 ExpectedRootGraphCount = 0;
+	int32 ExpectedFunctionGraphCount = 0;
+	int32 ExpectedMacroGraphCount = 0;
+	int32 ExpectedEventGraphCount = 0;
+	FNodeClassCounts_ImportBpy ExpectedNodeClassCounts;
+	TSet<FString> VisitedSerializedGraphGuids;
+
+	for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
+	{
+		const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
+		if (!GraphObj.IsValid())
+		{
+			continue;
+		}
+		if (IsNodeOwnedNestedGraphJson_ImportBpy(GraphObj))
+		{
+			continue;
+		}
+
+		++ExpectedRootGraphCount;
+
+		FString GraphType;
+		GraphObj->TryGetStringField(TEXT("graph_type"), GraphType);
+		if (GraphType.Equals(TEXT("function"), ESearchCase::IgnoreCase))
+		{
+			++ExpectedFunctionGraphCount;
+		}
+		else if (GraphType.Equals(TEXT("macro"), ESearchCase::IgnoreCase))
+		{
+			++ExpectedMacroGraphCount;
+		}
+		else if (GraphType.Equals(TEXT("event_graph"), ESearchCase::IgnoreCase))
+		{
+			++ExpectedEventGraphCount;
+		}
+
+		FString GraphName;
+		GraphObj->TryGetStringField(TEXT("name"), GraphName);
+		if (!GraphName.IsEmpty())
+		{
+			const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+			const int32 NodeCount =
+				GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) && NodesArr ? NodesArr->Num() : 0;
+			ExpectedRootGraphNodeCounts.Add(GraphName, NodeCount);
+		}
+
+		if (!AccumulateSerializedNodeClassCountsFromGraphJson_ImportBpy(
+				GraphObj,
+				ExpectedNodeClassCounts,
+				VisitedSerializedGraphGuids,
+				OutError))
+		{
+			return false;
+		}
+	}
+
+	TMap<FString, UEdGraph*> ActualRootGraphsByName;
+	auto RegisterRootGraph = [&ActualRootGraphsByName](UEdGraph* Graph)
+	{
+		if (!Graph)
+		{
+			return;
+		}
+
+		const FString GraphName = Graph->GetName();
+		if (GraphName.IsEmpty() || ActualRootGraphsByName.Contains(GraphName))
+		{
+			return;
+		}
+
+		ActualRootGraphsByName.Add(GraphName, Graph);
+	};
+
+	for (UEdGraph* Graph : BP->UbergraphPages)
+	{
+		RegisterRootGraph(Graph);
+	}
+	for (UEdGraph* Graph : BP->FunctionGraphs)
+	{
+		RegisterRootGraph(Graph);
+	}
+	for (UEdGraph* Graph : BP->MacroGraphs)
+	{
+		RegisterRootGraph(Graph);
+	}
+	for (const FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
+	{
+		for (UEdGraph* Graph : InterfaceDesc.Graphs)
+		{
+			RegisterRootGraph(Graph);
+		}
+	}
+
+	const int32 ActualRootGraphCount = ActualRootGraphsByName.Num();
+	int32 ActualFunctionGraphCount = BP->FunctionGraphs.Num();
+	{
+		TSet<const UEdGraph*> CountedFunctionGraphs;
+		for (UEdGraph* Graph : BP->FunctionGraphs)
+		{
+			if (Graph)
+			{
+				CountedFunctionGraphs.Add(Graph);
+			}
+		}
+		for (const FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
+		{
+			for (UEdGraph* Graph : InterfaceDesc.Graphs)
+			{
+				if (Graph && !CountedFunctionGraphs.Contains(Graph))
+				{
+					CountedFunctionGraphs.Add(Graph);
+					++ActualFunctionGraphCount;
+				}
+			}
+		}
+	}
+	const int32 ActualMacroGraphCount = BP->MacroGraphs.Num();
+	const int32 ActualEventGraphCount = BP->UbergraphPages.Num();
+
+	FNodeClassCounts_ImportBpy ActualNodeClassCounts;
+	CollectImportedBlueprintNodeClassCounts_ImportBpy(BP, ActualNodeClassCounts);
+
+	int32 ExpectedDispatchers = 0;
+	const TArray<TSharedPtr<FJsonValue>>* DispatchersArr = nullptr;
+	if (Root->TryGetArrayField(TEXT("dispatchers"), DispatchersArr) && DispatchersArr)
+	{
+		ExpectedDispatchers = DispatchersArr->Num();
+	}
+	const int32 ActualDispatchers = CountBlueprintDispatcherVariables_ImportBpy(BP);
+
+	TArray<FString> Mismatches;
+	auto AddMismatch = [&Mismatches](const FString& Key, const int32 ExpectedValue, const int32 ActualValue)
+	{
+		if (ExpectedValue != ActualValue)
+		{
+			Mismatches.Add(FString::Printf(TEXT("%s expected=%d actual=%d"), *Key, ExpectedValue, ActualValue));
+		}
+	};
+
+	AddMismatch(TEXT("root_graph_count"), ExpectedRootGraphCount, ActualRootGraphCount);
+	AddMismatch(TEXT("function_graph_count"), ExpectedFunctionGraphCount, ActualFunctionGraphCount);
+	AddMismatch(TEXT("macro_graph_count"), ExpectedMacroGraphCount, ActualMacroGraphCount);
+	AddMismatch(TEXT("event_graph_count"), ExpectedEventGraphCount, ActualEventGraphCount);
+	AddMismatch(TEXT("dispatcher_count"), ExpectedDispatchers, ActualDispatchers);
+
+	AddMismatch(TEXT("K2Node_Event_count"), ExpectedNodeClassCounts.EventNodes, ActualNodeClassCounts.EventNodes);
+	AddMismatch(TEXT("K2Node_CustomEvent_count"), ExpectedNodeClassCounts.CustomEventNodes, ActualNodeClassCounts.CustomEventNodes);
+	AddMismatch(
+		TEXT("K2Node_CreateDelegate_count"),
+		ExpectedNodeClassCounts.CreateDelegateNodes,
+		ActualNodeClassCounts.CreateDelegateNodes);
+
+	for (const TPair<FString, int32>& ExpectedEntry : ExpectedRootGraphNodeCounts)
+	{
+		UEdGraph* const* ActualGraphPtr = ActualRootGraphsByName.Find(ExpectedEntry.Key);
+		if (!ActualGraphPtr || !*ActualGraphPtr)
+		{
+			Mismatches.Add(FString::Printf(TEXT("missing_root_graph name=%s"), *ExpectedEntry.Key));
+			continue;
+		}
+
+		if (!bRelaxRootNodeCountChecks)
+		{
+			const int32 ActualNodeCount = (*ActualGraphPtr)->Nodes.Num();
+			if (ActualNodeCount != ExpectedEntry.Value)
+			{
+				Mismatches.Add(FString::Printf(
+					TEXT("graph_nodes[%s] expected=%d actual=%d"),
+					*ExpectedEntry.Key,
+					ExpectedEntry.Value,
+					ActualNodeCount));
+			}
+		}
+	}
+
+	if (Mismatches.Num() > 0)
+	{
+		OutError = FString::Printf(
+			TEXT("Import structural parity mismatch (%s): %s"),
+			bRelaxRootNodeCountChecks ? TEXT("post_compile") : TEXT("pre_compile"),
+			*FString::Join(Mismatches, TEXT("; ")));
+		return false;
+	}
+
+	return true;
+}
+
+namespace
+{
+UEdGraph* FindRootGraphByName_ImportBpy(UBlueprint* BP, const FString& GraphName)
+{
+	if (!BP || GraphName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	auto MatchByName = [&GraphName](UEdGraph* Graph) -> bool
+	{
+		return Graph && Graph->GetName().Equals(GraphName, ESearchCase::CaseSensitive);
+	};
+
+	for (UEdGraph* Graph : BP->UbergraphPages)
+	{
+		if (MatchByName(Graph))
+		{
+			return Graph;
+		}
+	}
+	for (UEdGraph* Graph : BP->FunctionGraphs)
+	{
+		if (MatchByName(Graph))
+		{
+			return Graph;
+		}
+	}
+	for (UEdGraph* Graph : BP->MacroGraphs)
+	{
+		if (MatchByName(Graph))
+		{
+			return Graph;
+		}
+	}
+	for (const FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
+	{
+		for (UEdGraph* Graph : InterfaceDesc.Graphs)
+		{
+			if (MatchByName(Graph))
+			{
+				return Graph;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+bool GraphIsBoundToInterface_ImportBpy(
+	const UBlueprint* BP,
+	const UEdGraph* Graph,
+	const UClass* InterfaceClass)
+{
+	if (!BP || !Graph || !InterfaceClass)
+	{
+		return false;
+	}
+
+	const UClass* ExpectedInterface = InterfaceClass->GetAuthoritativeClass();
+	for (const FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
+	{
+		const UClass* ActualInterface = InterfaceDesc.Interface ? InterfaceDesc.Interface->GetAuthoritativeClass() : nullptr;
+		if (ActualInterface != ExpectedInterface)
+		{
+			continue;
+		}
+
+		if (InterfaceDesc.Graphs.Contains(const_cast<UEdGraph*>(Graph)))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool RootGraphHasPoseHistoryCollectorNode_ImportBpy(const TSharedPtr<FJsonObject>& GraphObj)
+{
+	if (!GraphObj.IsValid())
+	{
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+	if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+	{
+		return false;
+	}
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		FString NodeClass;
+		NodeObj->TryGetStringField(TEXT("node_class"), NodeClass);
+		if (NodeClass.Contains(TEXT("PoseSearchHistoryCollector"), ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+FString ReadNodePropertyAsText_ImportBpy(UEdGraphNode* Node, const TCHAR* PropertyName)
+{
+	if (!Node || !PropertyName)
+	{
+		return FString();
+	}
+
+	FProperty* Property = Node->GetClass()->FindPropertyByName(FName(PropertyName));
+	if (!Property)
+	{
+		return FString();
+	}
+
+	void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Node);
+	if (!ValuePtr)
+	{
+		return FString();
+	}
+
+	FString Exported;
+	Property->ExportTextItem_Direct(Exported, ValuePtr, nullptr, Node, PPF_None);
+	Exported.TrimStartAndEndInline();
+	if (Exported.StartsWith(TEXT("\"")) && Exported.EndsWith(TEXT("\"")) && Exported.Len() >= 2)
+	{
+		Exported = Exported.Mid(1, Exported.Len() - 2);
+	}
+
+	return Exported;
+}
+
+bool GraphContainsPoseHistoryCollectorRuntimeNode_ImportBpy(UEdGraph* Graph)
+{
+	if (!Graph)
+	{
+		return false;
+	}
+
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node || !Node->GetClass())
+		{
+			continue;
+		}
+
+		if (Node->GetClass()->GetName().Contains(TEXT("PoseSearchHistoryCollector"), ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	const TCHAR* StageName,
+	FString& OutError)
+{
+	if (!BP || !Root.IsValid())
+	{
+		OutError = TEXT("Invalid context while validating interface graph bindings");
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* InterfacesArr = nullptr;
+	if (!Root->TryGetArrayField(TEXT("interfaces"), InterfacesArr) || !InterfacesArr || InterfacesArr->Num() == 0)
+	{
+		return true;
+	}
+
+	TArray<UClass*> ExpectedInterfaces;
+	TArray<FString> Mismatches;
+	for (const TSharedPtr<FJsonValue>& InterfaceValue : *InterfacesArr)
+	{
+		if (!InterfaceValue.IsValid())
+		{
+			continue;
+		}
+
+		const FString InterfacePath = InterfaceValue->AsString();
+		if (InterfacePath.IsEmpty())
+		{
+			continue;
+		}
+
+		UClass* InterfaceClass = ResolveNamedObject_ImportBpy<UClass>(InterfacePath);
+		if (!InterfaceClass)
+		{
+			Mismatches.Add(FString::Printf(TEXT("unresolved_interface=%s"), *InterfacePath));
+			continue;
+		}
+
+		InterfaceClass = InterfaceClass->GetAuthoritativeClass();
+		ExpectedInterfaces.AddUnique(InterfaceClass);
+	}
+
+	for (UClass* ExpectedInterface : ExpectedInterfaces)
+	{
+		bool bFound = false;
+		for (const FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
+		{
+			const UClass* ActualClass = InterfaceDesc.Interface ? InterfaceDesc.Interface->GetAuthoritativeClass() : nullptr;
+			if (ActualClass == ExpectedInterface)
+			{
+				bFound = true;
+				break;
+			}
+		}
+
+		if (!bFound)
+		{
+			Mismatches.Add(FString::Printf(TEXT("missing_implemented_interface=%s"), *GetPathNameSafe(ExpectedInterface)));
+		}
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
+	if (Root->TryGetArrayField(TEXT("graphs"), GraphsArr) && GraphsArr)
+	{
+		for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
+		{
+			const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
+			if (!GraphObj.IsValid() || IsNodeOwnedNestedGraphJson_ImportBpy(GraphObj))
+			{
+				continue;
+			}
+
+			FString GraphType;
+			GraphObj->TryGetStringField(TEXT("graph_type"), GraphType);
+			if (!GraphType.Equals(TEXT("function"), ESearchCase::IgnoreCase))
+			{
+				continue;
+			}
+
+			FString GraphName;
+			GraphObj->TryGetStringField(TEXT("name"), GraphName);
+			if (GraphName.IsEmpty())
+			{
+				continue;
+			}
+
+			TArray<UClass*> InterfaceOwners;
+			const FName FunctionName(*GraphName);
+			for (UClass* InterfaceClass : ExpectedInterfaces)
+			{
+				if (InterfaceClass && InterfaceClass->FindFunctionByName(FunctionName))
+				{
+					InterfaceOwners.Add(InterfaceClass);
+				}
+			}
+
+			if (InterfaceOwners.Num() == 0)
+			{
+				continue;
+			}
+
+			UEdGraph* Graph = FindRootGraphByName_ImportBpy(BP, GraphName);
+			if (!Graph)
+			{
+				Mismatches.Add(FString::Printf(TEXT("missing_interface_function_graph=%s"), *GraphName));
+				continue;
+			}
+
+			for (UClass* InterfaceClass : InterfaceOwners)
+			{
+				if (!GraphIsBoundToInterface_ImportBpy(BP, Graph, InterfaceClass))
+				{
+					Mismatches.Add(
+						FString::Printf(
+							TEXT("interface_binding_mismatch graph=%s interface=%s"),
+							*GraphName,
+							*GetPathNameSafe(InterfaceClass)));
+				}
+			}
+		}
+	}
+
+	if (Mismatches.Num() > 0)
+	{
+		OutError = FString::Printf(
+			TEXT("Import interface binding validation failed (%s): %s"),
+			StageName ? StageName : TEXT("unknown"),
+			*FString::Join(Mismatches, TEXT("; ")));
+		return false;
+	}
+
+	return true;
+}
+
+bool ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	const TCHAR* StageName,
+	FString& OutError)
+{
+	if (!BP || !Root.IsValid() || !Cast<UAnimBlueprint>(BP))
+	{
+		return true;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
+	if (!Root->TryGetArrayField(TEXT("graphs"), GraphsArr) || !GraphsArr)
+	{
+		return true;
+	}
+
+	FString PoseHistoryGraphName = TEXT("Get_PoseHistory");
+	int32 ExpectedPoseHistoryGraphNodeCount = -1;
+	TSet<FString> ExpectedAnimNodeReferenceTags;
+	bool bExpectConvertToPoseHistoryNode = false;
+	bool bExpectGetPoseHistoryReferenceNode = false;
+	bool bExpectPoseSearchHistoryCollectorNode = false;
+
+	for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
+	{
+		const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
+		if (!GraphObj.IsValid() || IsNodeOwnedNestedGraphJson_ImportBpy(GraphObj))
+		{
+			continue;
+		}
+
+		FString GraphName;
+		GraphObj->TryGetStringField(TEXT("name"), GraphName);
+		FString GraphType;
+		GraphObj->TryGetStringField(TEXT("graph_type"), GraphType);
+
+		if (GraphName.Equals(UEdGraphSchema_K2::GN_AnimGraph.ToString(), ESearchCase::CaseSensitive))
+		{
+			bExpectPoseSearchHistoryCollectorNode = RootGraphHasPoseHistoryCollectorNode_ImportBpy(GraphObj);
+		}
+
+		if (!GraphType.Equals(TEXT("function"), ESearchCase::IgnoreCase) ||
+			!GraphName.Equals(PoseHistoryGraphName, ESearchCase::CaseSensitive))
+		{
+			continue;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+		{
+			continue;
+		}
+
+		ExpectedPoseHistoryGraphNodeCount = NodesArr->Num();
+
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			FString NodeClass;
+			NodeObj->TryGetStringField(TEXT("node_class"), NodeClass);
+
+			FString FunctionRef;
+			NodeObj->TryGetStringField(TEXT("function_ref"), FunctionRef);
+			if (FunctionRef.Contains(TEXT("ConvertToPoseHistoryNodePure"), ESearchCase::IgnoreCase))
+			{
+				bExpectConvertToPoseHistoryNode = true;
+			}
+			if (FunctionRef.Contains(TEXT("GetPoseHistoryReference"), ESearchCase::IgnoreCase))
+			{
+				bExpectGetPoseHistoryReferenceNode = true;
+			}
+
+			if (NodeClass.Equals(TEXT("K2Node_AnimNodeReference"), ESearchCase::CaseSensitive))
+			{
+				const TSharedPtr<FJsonObject>* NodePropsObj = nullptr;
+				if (!NodeObj->TryGetObjectField(TEXT("node_props"), NodePropsObj) || !NodePropsObj || !NodePropsObj->IsValid())
+				{
+					continue;
+				}
+
+				FString TagValue;
+				if ((*NodePropsObj)->TryGetStringField(TEXT("Tag"), TagValue) && !TagValue.IsEmpty())
+				{
+					ExpectedAnimNodeReferenceTags.Add(TagValue);
+				}
+			}
+		}
+	}
+
+	if (ExpectedPoseHistoryGraphNodeCount < 0 &&
+		ExpectedAnimNodeReferenceTags.Num() == 0 &&
+		!bExpectConvertToPoseHistoryNode &&
+		!bExpectGetPoseHistoryReferenceNode &&
+		!bExpectPoseSearchHistoryCollectorNode)
+	{
+		return true;
+	}
+
+	UEdGraph* PoseHistoryGraph = FindRootGraphByName_ImportBpy(BP, PoseHistoryGraphName);
+	if (!PoseHistoryGraph)
+	{
+		OutError = FString::Printf(
+			TEXT("Import runtime contract validation failed (%s): missing function graph '%s'"),
+			StageName ? StageName : TEXT("unknown"),
+			*PoseHistoryGraphName);
+		return false;
+	}
+
+	if (ExpectedPoseHistoryGraphNodeCount >= 0 &&
+		PoseHistoryGraph->Nodes.Num() != ExpectedPoseHistoryGraphNodeCount)
+	{
+		OutError = FString::Printf(
+			TEXT("Import runtime contract validation failed (%s): graph '%s' node_count expected=%d actual=%d"),
+			StageName ? StageName : TEXT("unknown"),
+			*PoseHistoryGraphName,
+			ExpectedPoseHistoryGraphNodeCount,
+			PoseHistoryGraph->Nodes.Num());
+		return false;
+	}
+
+	TSet<FString> ActualAnimNodeReferenceTags;
+	bool bActualHasConvertToPoseHistoryNode = false;
+	bool bActualHasGetPoseHistoryReferenceNode = false;
+	for (UEdGraphNode* Node : PoseHistoryGraph->Nodes)
+	{
+		if (!Node || !Node->GetClass())
+		{
+			continue;
+		}
+
+		const FString NodeClassName = Node->GetClass()->GetName();
+		if (NodeClassName.Equals(TEXT("K2Node_AnimNodeReference"), ESearchCase::CaseSensitive))
+		{
+			const FString Tag = ReadNodePropertyAsText_ImportBpy(Node, TEXT("Tag"));
+			if (!Tag.IsEmpty())
+			{
+				ActualAnimNodeReferenceTags.Add(Tag);
+			}
+		}
+
+		if (const UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node))
+		{
+			FString FunctionName = CallNode->FunctionReference.GetMemberName().ToString();
+			if (FunctionName.IsEmpty())
+			{
+				if (const UFunction* TargetFunction = CallNode->GetTargetFunction())
+				{
+					FunctionName = TargetFunction->GetName();
+				}
+			}
+
+			if (FunctionName.Equals(TEXT("ConvertToPoseHistoryNodePure"), ESearchCase::CaseSensitive))
+			{
+				bActualHasConvertToPoseHistoryNode = true;
+			}
+			if (FunctionName.Equals(TEXT("GetPoseHistoryReference"), ESearchCase::CaseSensitive))
+			{
+				bActualHasGetPoseHistoryReferenceNode = true;
+			}
+		}
+	}
+
+	for (const FString& ExpectedTag : ExpectedAnimNodeReferenceTags)
+	{
+		if (!ActualAnimNodeReferenceTags.Contains(ExpectedTag))
+		{
+			OutError = FString::Printf(
+				TEXT("Import runtime contract validation failed (%s): graph '%s' missing AnimNodeReference tag '%s'"),
+				StageName ? StageName : TEXT("unknown"),
+				*PoseHistoryGraphName,
+				*ExpectedTag);
+			return false;
+		}
+	}
+
+	if (bExpectConvertToPoseHistoryNode && !bActualHasConvertToPoseHistoryNode)
+	{
+		OutError = FString::Printf(
+			TEXT("Import runtime contract validation failed (%s): graph '%s' missing ConvertToPoseHistoryNodePure call"),
+			StageName ? StageName : TEXT("unknown"),
+			*PoseHistoryGraphName);
+		return false;
+	}
+
+	if (bExpectGetPoseHistoryReferenceNode && !bActualHasGetPoseHistoryReferenceNode)
+	{
+		OutError = FString::Printf(
+			TEXT("Import runtime contract validation failed (%s): graph '%s' missing GetPoseHistoryReference call"),
+			StageName ? StageName : TEXT("unknown"),
+			*PoseHistoryGraphName);
+		return false;
+	}
+
+	if (bExpectPoseSearchHistoryCollectorNode)
+	{
+		UEdGraph* AnimGraph = FindRootGraphByName_ImportBpy(BP, UEdGraphSchema_K2::GN_AnimGraph.ToString());
+		if (!AnimGraph || !GraphContainsPoseHistoryCollectorRuntimeNode_ImportBpy(AnimGraph))
+		{
+			OutError = FString::Printf(
+				TEXT("Import runtime contract validation failed (%s): AnimGraph missing PoseSearchHistoryCollector runtime node"),
+				StageName ? StageName : TEXT("unknown"));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+}
+
 bool UBPDirectImporter::ImportBlueprintFromJson(
 	const FString& JsonData,
 	const FString& TargetAssetPath,
@@ -11774,6 +12810,35 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 		}
 	}
 
+	// Strict pre-compile parity checks: graph/function/delegate/event topology must
+	// match the serialized export before any final compile-time reconstruction.
+	if (!ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
+			BP,
+			Root,
+			false,
+			OutError))
+	{
+		return false;
+	}
+
+	if (!ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
+			BP,
+			Root,
+			TEXT("pre_compile"),
+			OutError))
+	{
+		return false;
+	}
+
+	if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+			BP,
+			Root,
+			TEXT("pre_compile"),
+			OutError))
+	{
+		return false;
+	}
+
 	if (bCompileBlueprint)
 	{
 		CompileBlueprint(BP);
@@ -11846,6 +12911,35 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 		{
 			return false;
 		}
+	}
+
+	// Post-compile parity checks still enforce function/delegate/event class
+	// counts, while relaxing root node-count drift that can be editor-generated.
+	if (!ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
+			BP,
+			Root,
+			true,
+			OutError))
+	{
+		return false;
+	}
+
+	if (!ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
+			BP,
+			Root,
+			TEXT("post_compile"),
+			OutError))
+	{
+		return false;
+	}
+
+	if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+			BP,
+			Root,
+			TEXT("post_compile"),
+			OutError))
+	{
+		return false;
 	}
 
 	return SaveBlueprint(BP, OutError);
@@ -14129,32 +15223,75 @@ NodeCreationDone:
 
 UEdGraphNode* UBPDirectImporter::CreateEventNode(UEdGraph* Graph, const FString& EventName)
 {
+	const FString RequestedAggressive = NormalizeAggressiveFunctionName_ImportBpy(EventName);
+	const bool bIsAnimNotifyEvent = IsAnimNotifyEventName_ImportBpy(EventName);
+
 	// Search for existing event node with this name (e.g. ReceiveBeginPlay)
 	for (UEdGraphNode* N : Graph->Nodes)
 	{
 		if (UK2Node_Event* Evt = Cast<UK2Node_Event>(N))
 		{
-			if (Evt->EventReference.GetMemberName().ToString() == EventName)
+			const FString ExistingName = Evt->EventReference.GetMemberName().ToString();
+			const bool bExactMatch = ExistingName == EventName;
+			const bool bAggressiveMatch =
+				!RequestedAggressive.IsEmpty() &&
+				(NormalizeAggressiveFunctionName_ImportBpy(ExistingName) == RequestedAggressive ||
+				 NormalizeAggressiveFunctionName_ImportBpy(FName::NameToDisplayString(ExistingName, false)) == RequestedAggressive);
+			if (bExactMatch || bAggressiveMatch)
+			{
+				if (bIsAnimNotifyEvent)
+				{
+					ConfigureAnimNotifyEventNodeReference_ImportBpy(Evt, EventName);
+				}
 				return Evt;
+			}
 		}
 	}
 
 	// Create standard event node via schema
 	UK2Node_Event* NewEvt = NewObject<UK2Node_Event>(Graph);
-	if (UFunction* EventFunc = ResolveFunctionOnBlueprintContext_ImportBpy(Graph, EventName))
+	UFunction* EventFunc = ResolveFunctionOnBlueprintContext_ImportBpy(Graph, EventName);
+	if (!EventFunc)
+	{
+		EventFunc = ResolveFunctionOnBlueprintContextByAggressiveName_ImportBpy(Graph, EventName);
+	}
+	if (!EventFunc)
+	{
+		EventFunc = ResolveSelfContextFunction_ImportBpy(Graph, EventName);
+	}
+
+	UClass* PreferredOwnerClass = nullptr;
+	if (UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(Graph))
+	{
+		PreferredOwnerClass = Blueprint->SkeletonGeneratedClass
+			? static_cast<UClass*>(Blueprint->SkeletonGeneratedClass)
+			: (Blueprint->GeneratedClass
+				? static_cast<UClass*>(Blueprint->GeneratedClass)
+				: (Blueprint->ParentClass ? static_cast<UClass*>(Blueprint->ParentClass) : nullptr));
+	}
+
+	if (EventFunc)
 	{
 		NewEvt->EventReference.SetFromField<UFunction>(EventFunc, false);
+		NewEvt->bOverrideFunction = true;
 	}
-	else if (UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(Graph))
+	else if (PreferredOwnerClass)
 	{
-		UClass* EventOwnerClass = Blueprint->ParentClass ? static_cast<UClass*>(Blueprint->ParentClass) : UObject::StaticClass();
-		NewEvt->EventReference.SetExternalMember(FName(*EventName), EventOwnerClass);
+		// Keep events bound to the Blueprint callable class context when no direct function can be resolved yet.
+		NewEvt->EventReference.SetExternalMember(FName(*EventName), PreferredOwnerClass);
+		NewEvt->bOverrideFunction = false;
 	}
 	else
 	{
 		NewEvt->EventReference.SetExternalMember(FName(*EventName), UObject::StaticClass());
+		NewEvt->bOverrideFunction = false;
 	}
-	NewEvt->bOverrideFunction = true;
+
+	if (bIsAnimNotifyEvent)
+	{
+		ConfigureAnimNotifyEventNodeReference_ImportBpy(NewEvt, EventName);
+	}
+
 	NewEvt->CreateNewGuid();
 	NewEvt->PostPlacedNewNode();
 	NewEvt->AllocateDefaultPins();
@@ -14698,6 +15835,12 @@ void UBPDirectImporter::ParsePinType(const FString& TypeStr, FEdGraphPinType& Ou
 
 void UBPDirectImporter::CompileBlueprint(UBlueprint* BP)
 {
+	if (!BP)
+	{
+		return;
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 	FKismetEditorUtilities::CompileBlueprint(BP,
 		EBlueprintCompileOptions::SkipGarbageCollection);
 	BP->MarkPackageDirty();

@@ -97,11 +97,11 @@ class _Variable:
     container:   str        = "single"
     default:     Any        = None
     guid:        str        = ""
-    category:    str        = ""
-    replicated:  bool       = False
-    rep_notify:  str        = ""
-    instance_editable: bool = False
-    tooltip:     str        = ""
+    category:    Optional[str] = None
+    replicated:  Optional[bool] = None
+    rep_notify:  Optional[str] = None
+    instance_editable: Optional[bool] = None
+    tooltip:     Optional[str] = None
 
 
 @dataclass
@@ -580,11 +580,11 @@ class Blueprint:
             container: str = "single",
             default: Any = None,
             guid: str = "",
-            category: str = "",
-            replicated: bool = False,
-            rep_notify: str = "",
-            instance_editable: bool = False,
-            tooltip: str = "") -> "Blueprint":
+            category: Optional[str] = None,
+            replicated: Optional[bool] = None,
+            rep_notify: Optional[str] = None,
+            instance_editable: Optional[bool] = None,
+            tooltip: Optional[str] = None) -> "Blueprint":
         resolved_type = type_str or type or ""
         self._variables.append(_Variable(
             name=name, type_str=resolved_type, container=container, default=default,
@@ -682,18 +682,23 @@ class Blueprint:
                 for c in self._inherited_components
             ],
             "variables": [
-                {
+                (lambda v: {
                     "name":              v.name,
                     "type":              v.type_str,
                     "container":         v.container,
                     "default":           str(v.default) if v.default is not None else "",
                     "guid":              v.guid,
-                    "category":          v.category,
-                    "replicated":        v.replicated,
-                    "rep_notify":        v.rep_notify,
-                    "instance_editable": v.instance_editable,
-                    "tooltip":           v.tooltip,
-                }
+                    **({"category": v.category} if v.category is not None else {}),
+                    **({"category_explicit": True} if v.category is not None else {}),
+                    **({"replicated": v.replicated} if v.replicated is not None else {}),
+                    **({"replicated_explicit": True} if v.replicated is not None else {}),
+                    **({"rep_notify": v.rep_notify} if v.rep_notify is not None else {}),
+                    **({"rep_notify_explicit": True} if v.rep_notify is not None else {}),
+                    **({"instance_editable": v.instance_editable} if v.instance_editable is not None else {}),
+                    **({"instance_editable_explicit": True} if v.instance_editable is not None else {}),
+                    **({"tooltip": v.tooltip} if v.tooltip is not None else {}),
+                    **({"tooltip_explicit": True} if v.tooltip is not None else {}),
+                })(v)
                 for v in self._variables
             ],
             "dispatchers": [

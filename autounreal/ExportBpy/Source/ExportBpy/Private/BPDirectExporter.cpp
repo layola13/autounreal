@@ -3281,6 +3281,14 @@ FString UBPDirectExporter::GenerateVariablesSection(UBlueprint* BP)
 				TEXT(", guid=%s"),
 				*MakePythonStringLiteral_ExportBpy(Var.VarGuid.ToString(EGuidFormats::Digits)));
 		}
+		const FString TooltipValue = Var.MetaDataArray.IsEmpty() ? TEXT("") : Var.MetaDataArray[0].DataValue;
+		VariableLine += FString::Printf(
+			TEXT(", category=%s, replicated=%s, rep_notify=%s, instance_editable=%s, tooltip=%s"),
+			*MakePythonStringLiteral_ExportBpy(Var.Category.ToString()),
+			(Var.PropertyFlags & CPF_Net) != 0 ? TEXT("True") : TEXT("False"),
+			*MakePythonStringLiteral_ExportBpy(Var.RepNotifyFunc.ToString()),
+			(Var.PropertyFlags & CPF_Edit) != 0 ? TEXT("True") : TEXT("False"),
+			*MakePythonStringLiteral_ExportBpy(TooltipValue));
 		VariableLine += TEXT(")\n");
 		Out += VariableLine;
 	}
@@ -4739,11 +4747,16 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeBlueprintToJson(UBlueprint* 
 			Var.VarType.IsMap() ? TEXT("map") : TEXT("single"));
 		VObj->SetStringField(TEXT("default"),  DefaultValue);
 		VObj->SetStringField(TEXT("category"), Var.Category.ToString());
+		VObj->SetBoolField(TEXT("category_explicit"), true);
 		VObj->SetBoolField(TEXT("replicated"), (Var.PropertyFlags & CPF_Net) != 0);
+		VObj->SetBoolField(TEXT("replicated_explicit"), true);
 		VObj->SetStringField(TEXT("rep_notify"), Var.RepNotifyFunc.ToString());
+		VObj->SetBoolField(TEXT("rep_notify_explicit"), true);
 		VObj->SetBoolField(TEXT("instance_editable"), (Var.PropertyFlags & CPF_Edit) != 0);
+		VObj->SetBoolField(TEXT("instance_editable_explicit"), true);
 		VObj->SetStringField(TEXT("tooltip"),  Var.MetaDataArray.IsEmpty() ? TEXT("") :
 			Var.MetaDataArray[0].DataValue);
+		VObj->SetBoolField(TEXT("tooltip_explicit"), true);
 		Vars.Add(MakeShared<FJsonValueObject>(VObj));
 	}
 	Root->SetArrayField(TEXT("variables"), Vars);

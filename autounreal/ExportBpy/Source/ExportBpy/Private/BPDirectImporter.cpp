@@ -4633,12 +4633,29 @@ bool IsQualifiedFunctionReference_ImportBpy(const FString& FunctionRef)
 		FunctionRef.Contains(TEXT("."));
 }
 
+UEdGraph* FindRootGraphByName_ImportBpy(UBlueprint* BP, const FString& Name);
 void EnsureFunctionPins_ImportBpy(UK2Node_FunctionEntry* EntryNode, const TArray<TPair<FString, FEdGraphPinType>>& Inputs);
 void EnsureFunctionPins_ImportBpy(UK2Node_FunctionResult* ResultNode, const TArray<TPair<FString, FEdGraphPinType>>& Outputs);
 void ApplyFunctionGraphMetadata_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson, UK2Node_FunctionEntry* EntryNode);
+void ReplayFunctionGraphMetadataToSignature_ImportBpy(
+	UBlueprint* BP,
+	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs);
 void ParsePinTypeString_ImportBpy(const FString& TypeStr, FEdGraphPinType& OutType);
 void ParseGraphPins_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson, const TCHAR* FieldName, TArray<TPair<FString, FEdGraphPinType>>& OutPins);
 bool GraphJsonContainsAnimNodes_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson);
+
+struct FAnimNodeBindingDescriptor_ImportBpy;
+bool CollectAnimNodeBindingDescriptorsFromLiveNode_ImportBpy(
+	UEdGraphNode* Node,
+	TMap<FString, FAnimNodeBindingDescriptor_ImportBpy>& OutDescriptors,
+	FString& OutError);
+void LogMotionMatchingBindingMapSnapshot_ImportBpy(
+	UEdGraphNode* Node,
+	const TCHAR* Phase,
+	const FString* SourceBindingsText = nullptr);
+void LogMotionMatchingBindingSnapshotsForBlueprint_ImportBpy(
+	UBlueprint* BP,
+	const TCHAR* Phase);
 
 int32 GetGraphImportPriority_ImportBpy(const TSharedPtr<FJsonObject>& GraphJson)
 {
@@ -5231,6 +5248,34 @@ void ApplyFunctionGraphMetadata_ImportBpy(
 	if (GraphJson->TryGetBoolField(TEXT("thread_safe"), bThreadSafe))
 	{
 		EntryNode->MetaData.bThreadSafe = bThreadSafe;
+		if (UFunction* SignatureFunction = EntryNode->FindSignatureFunction())
+		{
+			if (bThreadSafe)
+			{
+				SignatureFunction->SetMetaData(FBlueprintMetadata::MD_ThreadSafe, TEXT("true"));
+			}
+			else if (SignatureFunction->HasMetaData(FBlueprintMetadata::MD_ThreadSafe))
+			{
+				SignatureFunction->RemoveMetaData(FBlueprintMetadata::MD_ThreadSafe);
+			}
+		}
+	}
+
+	FString CategoryText;
+	if (GraphJson->TryGetStringField(TEXT("category"), CategoryText))
+	{
+		EntryNode->MetaData.Category = FText::FromString(CategoryText);
+		if (UFunction* SignatureFunction = EntryNode->FindSignatureFunction())
+		{
+			if (!CategoryText.IsEmpty())
+			{
+				SignatureFunction->SetMetaData(FBlueprintMetadata::MD_FunctionCategory, *CategoryText);
+			}
+			else if (SignatureFunction->HasMetaData(FBlueprintMetadata::MD_FunctionCategory))
+			{
+				SignatureFunction->RemoveMetaData(FBlueprintMetadata::MD_FunctionCategory);
+			}
+		}
 	}
 
 	bool bIsPure = false;
@@ -5261,6 +5306,85 @@ void ApplyFunctionGraphMetadata_ImportBpy(
 
 		EntryNode->ReconstructNode();
 	}
+}
+
+void ReplayFunctionGraphMetadataToSignature_ImportBpy(
+	UBlueprint* BP,
+	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs)
+{
+	if (!BP)
+	{
+		return;
+	}
+
+	int32 ReplayedGraphCount = 0;
+	for (const TSharedPtr<FJsonObject>& GraphJson : SortedGraphs)
+	{
+		if (!GraphJson.IsValid() || IsNodeOwnedNestedGraphJson_ImportBpy(GraphJson))
+		{
+			continue;
+		}
+
+		FString GraphType;
+		FString GraphName;
+		GraphJson->TryGetStringField(TEXT("graph_type"), GraphType);
+		GraphJson->TryGetStringField(TEXT("name"), GraphName);
+		if (!GraphType.Equals(TEXT("function"), ESearchCase::CaseSensitive) || GraphName.IsEmpty())
+		{
+			continue;
+		}
+
+		UEdGraph* Graph = FindRootGraphByName_ImportBpy(BP, GraphName);
+		if (!Graph)
+		{
+			continue;
+		}
+
+		TArray<UK2Node_FunctionEntry*> EntryNodes;
+		Graph->GetNodesOfClass(EntryNodes);
+		if (EntryNodes.Num() == 0 || !EntryNodes[0])
+		{
+			continue;
+		}
+
+		ApplyFunctionGraphMetadata_ImportBpy(GraphJson, EntryNodes[0]);
+		++ReplayedGraphCount;
+
+		if (GraphName.Equals(TEXT("Get_MMBlendTime"), ESearchCase::CaseSensitive) ||
+			GraphName.Equals(TEXT("Get_MMNotifyRecencyTimeOut"), ESearchCase::CaseSensitive))
+		{
+			if (UFunction* Signature = EntryNodes[0]->FindSignatureFunction())
+			{
+				const bool bIsPure = (Signature->FunctionFlags & FUNC_BlueprintPure) != 0;
+				const bool bThreadSafe =
+					Signature->HasMetaData(FBlueprintMetadata::MD_ThreadSafe) ||
+					Signature->GetMetaData(FBlueprintMetadata::MD_ThreadSafe).Equals(TEXT("true"), ESearchCase::IgnoreCase);
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("[ExportBpy][ImportDiag][FunctionMetaReplay] function=%s pure=%d thread_safe=%d category=%s"),
+					*GraphName,
+					bIsPure ? 1 : 0,
+					bThreadSafe ? 1 : 0,
+					*Signature->GetMetaData(FBlueprintMetadata::MD_FunctionCategory));
+			}
+			else
+			{
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("[ExportBpy][ImportDiag][FunctionMetaReplay] function=%s signature_not_ready"),
+					*GraphName);
+			}
+		}
+	}
+
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[ExportBpy][ImportDiag][FunctionMetaReplay] blueprint=%s replayed_function_graphs=%d"),
+		*BP->GetPathName(),
+		ReplayedGraphCount);
 }
 
 void ParseGraphPins_ImportBpy(
@@ -8429,34 +8553,96 @@ bool ApplyAnimNodeBindingPropertyBindings_ImportBpy(
 
 	const FString RemappedBindings =
 		RemapBlueprintReferencesInSerializedText_ImportBpy(SerializedBindings);
+	const bool bHasNonEmptyBindingEntries =
+		!RemappedBindings.IsEmpty() && !RemappedBindings.Equals(TEXT("()"), ESearchCase::CaseSensitive);
 
-	// UE5.x path: PropertyBindings map is on the anim graph node itself.
-	if (FMapProperty* DirectBindingsProperty =
-			FindFProperty<FMapProperty>(Node->GetClass(), TEXT("PropertyBindings")))
+	// Count expected PropertyName tokens in the source text so we can detect
+	// silent drops by FMapProperty::ImportText_Direct (e.g., FText/NSLOCTEXT
+	// sub-field parse failures inside FAnimGraphNodePropertyBinding).
+	int32 ExpectedKeyCount = 0;
+	if (bHasNonEmptyBindingEntries)
 	{
-		void* ValuePtr = DirectBindingsProperty->ContainerPtrToValuePtr<void>(Node);
-		if (!ValuePtr)
+		const FString PropertyNameToken = TEXT("PropertyName=\"");
+		int32 SearchFrom = 0;
+		while (SearchFrom < RemappedBindings.Len())
 		{
-			OutError = FString::Printf(
-				TEXT("Cannot access PropertyBindings map on node %s"),
-				*DescribeNode_ImportBpy(Node));
-			return false;
+			const int32 Hit = RemappedBindings.Find(
+				PropertyNameToken, ESearchCase::CaseSensitive, ESearchDir::FromStart, SearchFrom);
+			if (Hit == INDEX_NONE) break;
+			++ExpectedKeyCount;
+			SearchFrom = Hit + PropertyNameToken.Len();
 		}
-
-		if (!DirectBindingsProperty->ImportText_Direct(*RemappedBindings, ValuePtr, Node, PPF_None))
-		{
-			OutError = FString::Printf(
-				TEXT("Failed to import PropertyBindings on node %s"),
-				*DescribeNode_ImportBpy(Node));
-			return false;
-		}
-
-		return true;
 	}
 
-	// Legacy fallback: bindings are stored on nested Binding UObject.
 	FObjectPropertyBase* BindingProperty =
 		FindFProperty<FObjectPropertyBase>(Node->GetClass(), TEXT("Binding"));
+
+	// Prefer the Binding subobject path when available (UE5.7+), because
+	// node-level PropertyBindings can resolve to deprecated storage.
+	if (!BindingProperty)
+	{
+		// Fallback for branches where bindings are still stored directly on node.
+		if (FMapProperty* DirectBindingsProperty =
+				FindFProperty<FMapProperty>(Node->GetClass(), TEXT("PropertyBindings")))
+		{
+			void* ValuePtr = DirectBindingsProperty->ContainerPtrToValuePtr<void>(Node);
+			if (!ValuePtr)
+			{
+				OutError = FString::Printf(
+					TEXT("Cannot access PropertyBindings map on node %s"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+
+			// Signal that we are about to mutate the map; without PreEditChange the
+			// node's editor-side caches (incl. ExposedValueHandler staging state)
+			// won't invalidate and the next compile may silently reuse stale data.
+			Node->Modify();
+			Node->PreEditChange(DirectBindingsProperty);
+
+			if (!DirectBindingsProperty->ImportText_Direct(*RemappedBindings, ValuePtr, Node, PPF_None))
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to import PropertyBindings on node %s"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("A_after_import_text"), &RemappedBindings);
+
+			// Verify ImportText didn't silently drop entries (FText localisation
+			// sub-fields and Transient flags can cause partial apply).
+			FScriptMapHelper MapHelper(DirectBindingsProperty, ValuePtr);
+			const int32 ImportedKeyCount = MapHelper.Num();
+			if (bHasNonEmptyBindingEntries && ImportedKeyCount < ExpectedKeyCount)
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[BPDirectImporter] PropertyBindings partial import on %s: expected=%d imported=%d"),
+					*DescribeNode_ImportBpy(Node), ExpectedKeyCount, ImportedKeyCount);
+			}
+
+			// Build a property chain so the node rebuilds internal caches
+			// (binding validation / property access staging) before compile runs.
+			FPropertyChangedEvent ChangeEvent(DirectBindingsProperty, EPropertyChangeType::ValueSet);
+			Node->PostEditChangeProperty(ChangeEvent);
+			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_after_post_edit_change"), nullptr);
+
+			// Do not reconstruct here: some anim graph nodes clear editor-side
+			// binding data during reconstruct, which turns binding-driven pins
+			// back into literal defaults on export.
+
+			// Mark the owning blueprint structurally modified so the upcoming full
+			// compile does NOT take the "skeleton-only" shortcut which skips
+			// PropertyAccess extension regeneration.
+			if (UBlueprint* OwningBP = FBlueprintEditorUtils::FindBlueprintForNode(Node))
+			{
+				FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(OwningBP);
+			}
+
+			return true;
+		}
+	}
+
+	// Preferred path: bindings stored on nested Binding UObject.
 	if (!BindingProperty)
 	{
 		OutError = FString::Printf(
@@ -8513,12 +8699,45 @@ bool ApplyAnimNodeBindingPropertyBindings_ImportBpy(
 		return false;
 	}
 
+	Node->Modify();
+	BindingObject->Modify();
+	Node->PreEditChange(BindingProperty);
+
 	if (!PropertyBindingsProperty->ImportText_Direct(*RemappedBindings, ValuePtr, BindingObject, PPF_None))
 	{
 		OutError = FString::Printf(
 			TEXT("Failed to import BindingPropertyBindings on node %s"),
 			*DescribeNode_ImportBpy(Node));
 		return false;
+	}
+	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("A_after_import_text_legacy_binding"), &RemappedBindings);
+
+	if (const FMapProperty* MapProperty = CastField<FMapProperty>(PropertyBindingsProperty))
+	{
+		FScriptMapHelper MapHelper(MapProperty, ValuePtr);
+		const int32 ImportedKeyCount = MapHelper.Num();
+		if (bHasNonEmptyBindingEntries && ImportedKeyCount < ExpectedKeyCount)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[BPDirectImporter] Binding.PropertyBindings partial import on %s: expected=%d imported=%d"),
+				*DescribeNode_ImportBpy(Node),
+				ExpectedKeyCount,
+				ImportedKeyCount);
+		}
+	}
+
+	FPropertyChangedEvent ChangeEvent(BindingProperty, EPropertyChangeType::ValueSet);
+	Node->PostEditChangeProperty(ChangeEvent);
+	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_after_post_edit_change_legacy_binding"), nullptr);
+
+	// Do not reconstruct here: reconstruct can mutate editor-only pin state on
+	// some anim nodes and accidentally wipe binding-driven display configuration.
+
+	if (UBlueprint* OwningBP = FBlueprintEditorUtils::FindBlueprintForNode(Node))
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(OwningBP);
 	}
 
 	return true;
@@ -10770,6 +10989,7 @@ bool ApplyNodeJsonToNode_ImportBpy(
 	{
 		return false;
 	}
+	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("C_after_node_json_apply"), nullptr);
 
 	AssignAnimationGraphResultNode_ImportBpy(Node->GetGraph(), Node);
 
@@ -13935,6 +14155,530 @@ FString GetSerializedNodePropStringFromNodeJson_ImportBpy(
 	return Value;
 }
 
+void ExtractBindingPropertyKeysFromSerializedText_ImportBpy(
+	const FString& SerializedBindings,
+	TSet<FString>& OutKeys)
+{
+	OutKeys.Reset();
+	if (SerializedBindings.IsEmpty() || SerializedBindings == TEXT("()"))
+	{
+		return;
+	}
+
+	// Preferred map export form:
+	// (("BlendTime", (...)),("NotifyRecencyTimeOut", (...)))
+	int32 EntryMarkerPos = SerializedBindings.Find(TEXT("((\""), ESearchCase::CaseSensitive);
+	if (EntryMarkerPos != INDEX_NONE)
+	{
+		int32 KeyStart = EntryMarkerPos + 3;
+		while (KeyStart >= 0 && KeyStart < SerializedBindings.Len())
+		{
+			const int32 KeyEnd = SerializedBindings.Find(
+				TEXT("\""),
+				ESearchCase::CaseSensitive,
+				ESearchDir::FromStart,
+				KeyStart);
+			if (KeyEnd == INDEX_NONE || KeyEnd <= KeyStart)
+			{
+				break;
+			}
+
+			const FString Key = SerializedBindings.Mid(KeyStart, KeyEnd - KeyStart).TrimStartAndEnd();
+			if (!Key.IsEmpty())
+			{
+				OutKeys.Add(Key);
+			}
+
+			const int32 NextMarkerPos = SerializedBindings.Find(
+				TEXT("),(\""),
+				ESearchCase::CaseSensitive,
+				ESearchDir::FromStart,
+				KeyEnd);
+			if (NextMarkerPos == INDEX_NONE)
+			{
+				break;
+			}
+			KeyStart = NextMarkerPos + 4;
+		}
+
+		if (OutKeys.Num() > 0)
+		{
+			return;
+		}
+	}
+
+	// Legacy fallback where keys must be inferred from struct payload fields.
+	static const FString PropertyNameToken = TEXT("PropertyName=\"");
+	int32 SearchFrom = 0;
+	while (SearchFrom < SerializedBindings.Len())
+	{
+		const int32 TokenIndex = SerializedBindings.Find(
+			PropertyNameToken,
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart,
+			SearchFrom);
+		if (TokenIndex == INDEX_NONE)
+		{
+			break;
+		}
+
+		const int32 NameStart = TokenIndex + PropertyNameToken.Len();
+		const int32 NameEnd = SerializedBindings.Find(
+			TEXT("\""),
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart,
+			NameStart);
+		if (NameEnd == INDEX_NONE || NameEnd <= NameStart)
+		{
+			break;
+		}
+
+		const FString PropertyName = SerializedBindings.Mid(NameStart, NameEnd - NameStart).TrimStartAndEnd();
+		if (!PropertyName.IsEmpty())
+		{
+			OutKeys.Add(PropertyName);
+		}
+		SearchFrom = NameEnd + 1;
+	}
+}
+
+struct FAnimNodeBindingDescriptor_ImportBpy
+{
+	FString PathAsText;
+	FString TypeName;
+	bool bIsBound = false;
+	bool bRequiresThreadSafe = false;
+};
+
+bool ExtractBindingEntryBodyByKeyFromSerializedText_ImportBpy(
+	const FString& SerializedBindings,
+	const FString& Key,
+	FString& OutBody)
+{
+	OutBody.Reset();
+	if (SerializedBindings.IsEmpty() || Key.IsEmpty())
+	{
+		return false;
+	}
+
+	const FString KeyToken = FString::Printf(TEXT("(\"%s\", ("), *Key);
+	const int32 EntryPos = SerializedBindings.Find(KeyToken, ESearchCase::CaseSensitive);
+	if (EntryPos == INDEX_NONE)
+	{
+		return false;
+	}
+
+	const int32 BodyStart = EntryPos + KeyToken.Len();
+	const int32 Len = SerializedBindings.Len();
+	int32 Depth = 1;
+	bool bInQuotes = false;
+	bool bEscape = false;
+
+	for (int32 Index = BodyStart; Index < Len; ++Index)
+	{
+		const TCHAR Ch = SerializedBindings[Index];
+		if (bEscape)
+		{
+			bEscape = false;
+			continue;
+		}
+
+		if (bInQuotes && Ch == TEXT('\\'))
+		{
+			bEscape = true;
+			continue;
+		}
+
+		if (Ch == TEXT('"'))
+		{
+			bInQuotes = !bInQuotes;
+			continue;
+		}
+
+		if (bInQuotes)
+		{
+			continue;
+		}
+
+		if (Ch == TEXT('('))
+		{
+			++Depth;
+		}
+		else if (Ch == TEXT(')'))
+		{
+			--Depth;
+			if (Depth == 0)
+			{
+				OutBody = SerializedBindings.Mid(BodyStart, Index - BodyStart);
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+FString ExtractQuotedFieldValueFromBindingBody_ImportBpy(
+	const FString& EntryBody,
+	const TCHAR* FieldToken)
+{
+	if (!FieldToken || EntryBody.IsEmpty())
+	{
+		return FString();
+	}
+
+	const int32 TokenPos = EntryBody.Find(FieldToken, ESearchCase::CaseSensitive);
+	if (TokenPos == INDEX_NONE)
+	{
+		return FString();
+	}
+
+	const int32 ValueStart = TokenPos + FCString::Strlen(FieldToken);
+	const int32 ValueEnd = EntryBody.Find(
+		TEXT("\""),
+		ESearchCase::CaseSensitive,
+		ESearchDir::FromStart,
+		ValueStart);
+	if (ValueEnd == INDEX_NONE || ValueEnd <= ValueStart)
+	{
+		return FString();
+	}
+
+	return EntryBody.Mid(ValueStart, ValueEnd - ValueStart).TrimStartAndEnd();
+}
+
+void CollectExpectedAnimNodeBindingDescriptorsFromSerializedText_ImportBpy(
+	const FString& SerializedBindings,
+	TMap<FString, FAnimNodeBindingDescriptor_ImportBpy>& OutDescriptors)
+{
+	OutDescriptors.Reset();
+	TSet<FString> Keys;
+	ExtractBindingPropertyKeysFromSerializedText_ImportBpy(SerializedBindings, Keys);
+	for (const FString& Key : Keys)
+	{
+		FString EntryBody;
+		if (!ExtractBindingEntryBodyByKeyFromSerializedText_ImportBpy(SerializedBindings, Key, EntryBody))
+		{
+			continue;
+		}
+
+		FAnimNodeBindingDescriptor_ImportBpy Descriptor;
+		Descriptor.PathAsText =
+			ExtractQuotedFieldValueFromBindingBody_ImportBpy(EntryBody, TEXT("PathAsText=\""));
+		if (EntryBody.Contains(TEXT("Type=Function"), ESearchCase::CaseSensitive))
+		{
+			Descriptor.TypeName = TEXT("Function");
+		}
+		else if (EntryBody.Contains(TEXT("Type=Property"), ESearchCase::CaseSensitive))
+		{
+			Descriptor.TypeName = TEXT("Property");
+		}
+		Descriptor.bIsBound =
+			EntryBody.Contains(TEXT("bIsBound=True"), ESearchCase::CaseSensitive) ||
+			EntryBody.Contains(TEXT("bIsBound=true"), ESearchCase::CaseSensitive);
+		Descriptor.bRequiresThreadSafe =
+			EntryBody.Contains(TEXT("WorkerThread"), ESearchCase::IgnoreCase);
+
+		OutDescriptors.Add(Key, Descriptor);
+	}
+}
+
+bool CollectAnimNodeBindingPropertyKeysFromLiveNode_ImportBpy(
+	UEdGraphNode* Node,
+	TSet<FString>& OutKeys,
+	FString& OutError)
+{
+	OutKeys.Reset();
+	if (!Node)
+	{
+		OutError = TEXT("binding key collection failed: node is null");
+		return false;
+	}
+
+	auto CollectKeysFromMap = [&OutKeys](FMapProperty* MapProperty, void* ValuePtr) -> bool
+	{
+		if (!MapProperty || !ValuePtr)
+		{
+			return false;
+		}
+
+		const FNameProperty* NameKeyProperty = CastField<FNameProperty>(MapProperty->KeyProp);
+		if (!NameKeyProperty)
+		{
+			return false;
+		}
+
+		FScriptMapHelper MapHelper(MapProperty, ValuePtr);
+		for (int32 Index = 0; Index < MapHelper.GetMaxIndex(); ++Index)
+		{
+			if (!MapHelper.IsValidIndex(Index))
+			{
+				continue;
+			}
+
+			const FName KeyName = NameKeyProperty->GetPropertyValue(MapHelper.GetKeyPtr(Index));
+			if (!KeyName.IsNone())
+			{
+				OutKeys.Add(KeyName.ToString());
+			}
+		}
+		return true;
+	};
+
+	// Prefer Binding subobject map (UE5.7+).
+	FObjectPropertyBase* BindingProperty =
+		FindFProperty<FObjectPropertyBase>(Node->GetClass(), TEXT("Binding"));
+	if (BindingProperty)
+	{
+		UObject* BindingObject = BindingProperty->GetObjectPropertyValue_InContainer(Node);
+		if (!BindingObject)
+		{
+			return true;
+		}
+
+		FMapProperty* PropertyBindingsProperty =
+			FindFProperty<FMapProperty>(BindingObject->GetClass(), TEXT("PropertyBindings"));
+		if (!PropertyBindingsProperty)
+		{
+			OutError = FString::Printf(
+				TEXT("binding key collection failed: Binding object %s has no PropertyBindings map"),
+				*GetPathNameSafe(BindingObject));
+			return false;
+		}
+
+		void* ValuePtr = PropertyBindingsProperty->ContainerPtrToValuePtr<void>(BindingObject);
+		if (!ValuePtr)
+		{
+			OutError = FString::Printf(
+				TEXT("binding key collection failed: cannot access Binding.PropertyBindings on node %s"),
+				*DescribeNode_ImportBpy(Node));
+			return false;
+		}
+
+		if (!CollectKeysFromMap(PropertyBindingsProperty, ValuePtr))
+		{
+			OutError = FString::Printf(
+				TEXT("binding key collection failed: invalid Binding.PropertyBindings map schema on node %s"),
+				*DescribeNode_ImportBpy(Node));
+			return false;
+		}
+
+		return true;
+	}
+
+	// Fallback for branches where map still lives on the node.
+	if (FMapProperty* DirectBindingsProperty =
+			FindFProperty<FMapProperty>(Node->GetClass(), TEXT("PropertyBindings")))
+	{
+		void* ValuePtr = DirectBindingsProperty->ContainerPtrToValuePtr<void>(Node);
+		if (!ValuePtr)
+		{
+			OutError = FString::Printf(
+				TEXT("binding key collection failed: cannot access node.PropertyBindings on %s"),
+				*DescribeNode_ImportBpy(Node));
+			return false;
+		}
+
+		if (!CollectKeysFromMap(DirectBindingsProperty, ValuePtr))
+		{
+			OutError = FString::Printf(
+				TEXT("binding key collection failed: invalid node.PropertyBindings map schema on %s"),
+				*DescribeNode_ImportBpy(Node));
+			return false;
+		}
+		return true;
+	}
+
+	// Node has no binding container at all; treat as empty.
+	return true;
+}
+
+bool CollectAnimNodeBindingDescriptorsFromLiveNode_ImportBpy(
+	UEdGraphNode* Node,
+	TMap<FString, FAnimNodeBindingDescriptor_ImportBpy>& OutDescriptors,
+	FString& OutError)
+{
+	OutDescriptors.Reset();
+	if (!Node)
+	{
+		OutError = TEXT("binding descriptor collection failed: node is null");
+		return false;
+	}
+
+	FString SerializedBindings;
+	auto ExportMapText = [&SerializedBindings](
+							 FMapProperty* MapProperty,
+							 void* ValuePtr,
+							 UObject* OwnerObject) -> bool
+	{
+		if (!MapProperty || !ValuePtr)
+		{
+			return true;
+		}
+
+		SerializedBindings.Reset();
+		MapProperty->ExportTextItem_Direct(SerializedBindings, ValuePtr, nullptr, OwnerObject, PPF_None);
+		SerializedBindings.TrimStartAndEndInline();
+		if (SerializedBindings.IsEmpty())
+		{
+			SerializedBindings = TEXT("()");
+		}
+		return true;
+	};
+
+	// Prefer Binding subobject map (UE5.7+).
+	FObjectPropertyBase* BindingProperty =
+		FindFProperty<FObjectPropertyBase>(Node->GetClass(), TEXT("Binding"));
+	if (BindingProperty)
+	{
+		UObject* BindingObject = BindingProperty->GetObjectPropertyValue_InContainer(Node);
+		if (IsValid(BindingObject))
+		{
+			FMapProperty* PropertyBindingsProperty =
+				FindFProperty<FMapProperty>(BindingObject->GetClass(), TEXT("PropertyBindings"));
+			if (!PropertyBindingsProperty)
+			{
+				OutError = FString::Printf(
+					TEXT("binding descriptor collection failed: Binding object %s has no PropertyBindings map"),
+					*GetPathNameSafe(BindingObject));
+				return false;
+			}
+
+			void* ValuePtr = PropertyBindingsProperty->ContainerPtrToValuePtr<void>(BindingObject);
+			if (!ExportMapText(PropertyBindingsProperty, ValuePtr, BindingObject))
+			{
+				OutError = FString::Printf(
+					TEXT("binding descriptor collection failed: cannot export Binding.PropertyBindings on %s"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+		}
+	}
+	else if (FMapProperty* DirectBindingsProperty =
+				 FindFProperty<FMapProperty>(Node->GetClass(), TEXT("PropertyBindings")))
+	{
+		// Fallback for branches where map still lives directly on node.
+		void* ValuePtr = DirectBindingsProperty->ContainerPtrToValuePtr<void>(Node);
+		if (!ExportMapText(DirectBindingsProperty, ValuePtr, Node))
+		{
+			OutError = FString::Printf(
+				TEXT("binding descriptor collection failed: cannot export node.PropertyBindings on %s"),
+				*DescribeNode_ImportBpy(Node));
+			return false;
+		}
+	}
+
+	if (!SerializedBindings.IsEmpty() && SerializedBindings != TEXT("()"))
+	{
+		CollectExpectedAnimNodeBindingDescriptorsFromSerializedText_ImportBpy(
+			SerializedBindings,
+			OutDescriptors);
+	}
+
+	return true;
+}
+
+void LogMotionMatchingBindingMapSnapshot_ImportBpy(
+	UEdGraphNode* Node,
+	const TCHAR* Phase,
+	const FString* SourceBindingsText)
+{
+	if (!Node || !Node->GetClass())
+	{
+		return;
+	}
+
+	if (!Node->GetClass()->GetName().Contains(TEXT("AnimGraphNode_MotionMatching"), ESearchCase::CaseSensitive))
+	{
+		return;
+	}
+
+	TMap<FString, FAnimNodeBindingDescriptor_ImportBpy> Descriptors;
+	FString CollectError;
+	if (!CollectAnimNodeBindingDescriptorsFromLiveNode_ImportBpy(Node, Descriptors, CollectError))
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag][MotionBinding][%s] graph=%s node=%s collect_failed=%s"),
+			Phase ? Phase : TEXT("unknown"),
+			Node->GetGraph() ? *Node->GetGraph()->GetName() : TEXT("<null>"),
+			*DescribeNode_ImportBpy(Node),
+			*CollectError);
+		return;
+	}
+
+	TArray<FString> Keys;
+	Descriptors.GetKeys(Keys);
+	Keys.Sort();
+
+	TArray<FString> DetailParts;
+	for (const FString& Key : Keys)
+	{
+		const FAnimNodeBindingDescriptor_ImportBpy* Descriptor = Descriptors.Find(Key);
+		if (!Descriptor)
+		{
+			continue;
+		}
+
+		DetailParts.Add(FString::Printf(
+			TEXT("%s{type=%s,path=%s,bound=%d}"),
+			*Key,
+			Descriptor->TypeName.IsEmpty() ? TEXT("<none>") : *Descriptor->TypeName,
+			Descriptor->PathAsText.IsEmpty() ? TEXT("<none>") : *Descriptor->PathAsText,
+			Descriptor->bIsBound ? 1 : 0));
+	}
+
+	FString SourceSnippet;
+	if (SourceBindingsText)
+	{
+		SourceSnippet = *SourceBindingsText;
+		SourceSnippet.ReplaceInline(TEXT("\r"), TEXT(" "));
+		SourceSnippet.ReplaceInline(TEXT("\n"), TEXT(" "));
+		SourceSnippet.TrimStartAndEndInline();
+		if (SourceSnippet.Len() > 220)
+		{
+			SourceSnippet = SourceSnippet.Left(220) + TEXT("...");
+		}
+	}
+
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[ExportBpy][ImportDiag][MotionBinding][%s] graph=%s node=%s entries=%d details=%s source=%s"),
+		Phase ? Phase : TEXT("unknown"),
+		Node->GetGraph() ? *Node->GetGraph()->GetName() : TEXT("<null>"),
+		*DescribeNode_ImportBpy(Node),
+		Descriptors.Num(),
+		DetailParts.Num() > 0 ? *FString::Join(DetailParts, TEXT("; ")) : TEXT("<empty>"),
+		SourceSnippet.IsEmpty() ? TEXT("<none>") : *SourceSnippet);
+}
+
+void LogMotionMatchingBindingSnapshotsForBlueprint_ImportBpy(
+	UBlueprint* BP,
+	const TCHAR* Phase)
+{
+	if (!BP)
+	{
+		return;
+	}
+
+	TArray<UEdGraph*> RootGraphs;
+	BP->GetAllGraphs(RootGraphs);
+	for (UEdGraph* Graph : RootGraphs)
+	{
+		if (!Graph)
+		{
+			continue;
+		}
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, Phase, nullptr);
+		}
+	}
+}
+
 void CollectSerializedAnimNodeJsonByUidFromRootJson_ImportBpy(
 	const TSharedPtr<FJsonObject>& Root,
 	TMap<FString, TSharedPtr<FJsonObject>>& OutNodeByUid)
@@ -14171,6 +14915,217 @@ void CollectMotionMatchingPoseHistoryMismatches_ImportBpy(
 			TEXT("motion_matching_missing_pose_history_collector graph=%s"),
 			*AnimGraph->GetName()));
 	}
+}
+
+void CollectAnimNodePropertyBindingMismatches_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	TArray<FString>& OutMismatches)
+{
+	OutMismatches.Reset();
+	if (!BP || !Root.IsValid())
+	{
+		return;
+	}
+
+	TMap<FString, TSharedPtr<FJsonObject>> SerializedAnimNodeByUid;
+	CollectSerializedAnimNodeJsonByUidFromRootJson_ImportBpy(Root, SerializedAnimNodeByUid);
+	if (SerializedAnimNodeByUid.Num() == 0)
+	{
+		return;
+	}
+
+	for (const TPair<FString, TSharedPtr<FJsonObject>>& Pair : SerializedAnimNodeByUid)
+	{
+		const FString& SerializedUid = Pair.Key;
+		const TSharedPtr<FJsonObject>& NodeJson = Pair.Value;
+		if (!NodeJson.IsValid())
+		{
+			continue;
+		}
+
+		const FString SerializedBindings =
+			GetSerializedNodePropStringFromNodeJson_ImportBpy(NodeJson, TEXT("BindingPropertyBindings"));
+		if (SerializedBindings.IsEmpty())
+		{
+			// No binding contract serialized for this node.
+			continue;
+		}
+
+		TSet<FString> ExpectedKeys;
+		ExtractBindingPropertyKeysFromSerializedText_ImportBpy(SerializedBindings, ExpectedKeys);
+		TMap<FString, FAnimNodeBindingDescriptor_ImportBpy> ExpectedDescriptors;
+		CollectExpectedAnimNodeBindingDescriptorsFromSerializedText_ImportBpy(
+			SerializedBindings,
+			ExpectedDescriptors);
+		if (SerializedBindings != TEXT("()") && ExpectedKeys.Num() == 0)
+		{
+			OutMismatches.Add(FString::Printf(
+				TEXT("binding_keys_parse_failed uid=%s serialized=%s"),
+				*SerializedUid,
+				*SerializedBindings.Left(256)));
+			continue;
+		}
+
+		UEdGraphNode* LiveNode = FindImportedNodeBySerializedUid_ImportBpy(BP, SerializedUid);
+		if (!LiveNode)
+		{
+			FGuid ParsedGuid;
+			if (TryParseGuid_ImportBpy(SerializedUid, ParsedGuid))
+			{
+				LiveNode = FindImportedNodeByGuidScan_ImportBpy(BP, ParsedGuid);
+			}
+		}
+		if (!LiveNode)
+		{
+			OutMismatches.Add(FString::Printf(
+				TEXT("missing_live_anim_node_for_binding_check uid=%s"),
+				*SerializedUid));
+			continue;
+		}
+
+		TSet<FString> ActualKeys;
+		FString CollectError;
+		if (!CollectAnimNodeBindingPropertyKeysFromLiveNode_ImportBpy(LiveNode, ActualKeys, CollectError))
+		{
+			OutMismatches.Add(FString::Printf(
+				TEXT("binding_live_keys_read_failed uid=%s graph=%s node=%s error=%s"),
+				*SerializedUid,
+				LiveNode->GetGraph() ? *LiveNode->GetGraph()->GetName() : TEXT("<null>"),
+				*DescribeNode_ImportBpy(LiveNode),
+				*CollectError));
+			continue;
+		}
+
+		for (const FString& ExpectedKey : ExpectedKeys)
+		{
+			if (!ActualKeys.Contains(ExpectedKey))
+			{
+				OutMismatches.Add(FString::Printf(
+					TEXT("binding_key_missing uid=%s graph=%s node=%s key=%s"),
+					*SerializedUid,
+					LiveNode->GetGraph() ? *LiveNode->GetGraph()->GetName() : TEXT("<null>"),
+					*DescribeNode_ImportBpy(LiveNode),
+					*ExpectedKey));
+			}
+		}
+
+		TMap<FString, FAnimNodeBindingDescriptor_ImportBpy> ActualDescriptors;
+		if (!CollectAnimNodeBindingDescriptorsFromLiveNode_ImportBpy(LiveNode, ActualDescriptors, CollectError))
+		{
+			OutMismatches.Add(FString::Printf(
+				TEXT("binding_live_descriptors_read_failed uid=%s graph=%s node=%s error=%s"),
+				*SerializedUid,
+				LiveNode->GetGraph() ? *LiveNode->GetGraph()->GetName() : TEXT("<null>"),
+				*DescribeNode_ImportBpy(LiveNode),
+				*CollectError));
+			continue;
+		}
+
+		for (const TPair<FString, FAnimNodeBindingDescriptor_ImportBpy>& PairExpected : ExpectedDescriptors)
+		{
+			const FString& Key = PairExpected.Key;
+			const FAnimNodeBindingDescriptor_ImportBpy& ExpectedDescriptor = PairExpected.Value;
+			const FAnimNodeBindingDescriptor_ImportBpy* ActualDescriptor = ActualDescriptors.Find(Key);
+			if (!ActualDescriptor)
+			{
+				continue;
+			}
+
+			if (!ExpectedDescriptor.PathAsText.IsEmpty() &&
+				!ActualDescriptor->PathAsText.Equals(ExpectedDescriptor.PathAsText, ESearchCase::CaseSensitive))
+			{
+				OutMismatches.Add(FString::Printf(
+					TEXT("binding_path_mismatch uid=%s graph=%s node=%s key=%s expected=%s actual=%s"),
+					*SerializedUid,
+					LiveNode->GetGraph() ? *LiveNode->GetGraph()->GetName() : TEXT("<null>"),
+					*DescribeNode_ImportBpy(LiveNode),
+					*Key,
+					*ExpectedDescriptor.PathAsText,
+					*ActualDescriptor->PathAsText));
+			}
+
+			if (!ExpectedDescriptor.TypeName.IsEmpty() &&
+				!ActualDescriptor->TypeName.Equals(ExpectedDescriptor.TypeName, ESearchCase::CaseSensitive))
+			{
+				OutMismatches.Add(FString::Printf(
+					TEXT("binding_type_mismatch uid=%s graph=%s node=%s key=%s expected=%s actual=%s"),
+					*SerializedUid,
+					LiveNode->GetGraph() ? *LiveNode->GetGraph()->GetName() : TEXT("<null>"),
+					*DescribeNode_ImportBpy(LiveNode),
+					*Key,
+					*ExpectedDescriptor.TypeName,
+					*ActualDescriptor->TypeName));
+			}
+
+			if (ExpectedDescriptor.bIsBound && !ActualDescriptor->bIsBound)
+			{
+				OutMismatches.Add(FString::Printf(
+					TEXT("binding_bound_flag_mismatch uid=%s graph=%s node=%s key=%s expected=true actual=false"),
+					*SerializedUid,
+					LiveNode->GetGraph() ? *LiveNode->GetGraph()->GetName() : TEXT("<null>"),
+					*DescribeNode_ImportBpy(LiveNode),
+					*Key));
+			}
+
+			const bool bExpectedFunctionBinding =
+				ExpectedDescriptor.TypeName.Equals(TEXT("Function"), ESearchCase::CaseSensitive);
+			const bool bActualFunctionBinding =
+				ActualDescriptor->TypeName.Equals(TEXT("Function"), ESearchCase::CaseSensitive);
+			if (bExpectedFunctionBinding || bActualFunctionBinding)
+			{
+				const FString FunctionRef =
+					!ActualDescriptor->PathAsText.IsEmpty()
+						? ActualDescriptor->PathAsText
+						: ExpectedDescriptor.PathAsText;
+				UFunction* ResolvedFunction =
+					ResolveSelfContextFunction_ImportBpy(LiveNode->GetGraph(), FunctionRef);
+				if (!ResolvedFunction)
+				{
+					OutMismatches.Add(FString::Printf(
+						TEXT("binding_function_unresolved uid=%s graph=%s node=%s key=%s function=%s"),
+						*SerializedUid,
+						LiveNode->GetGraph() ? *LiveNode->GetGraph()->GetName() : TEXT("<null>"),
+						*DescribeNode_ImportBpy(LiveNode),
+						*Key,
+						*FunctionRef));
+					continue;
+				}
+
+				const bool bIsPure = (ResolvedFunction->FunctionFlags & FUNC_BlueprintPure) != 0;
+				const bool bThreadSafe =
+					ResolvedFunction->HasMetaData(FBlueprintMetadata::MD_ThreadSafe) ||
+					ResolvedFunction->GetMetaData(FBlueprintMetadata::MD_ThreadSafe).Equals(TEXT("true"), ESearchCase::IgnoreCase);
+				const bool bRequiresThreadSafe =
+					ExpectedDescriptor.bRequiresThreadSafe ||
+					ActualDescriptor->bRequiresThreadSafe;
+				if (!bIsPure || (bRequiresThreadSafe && !bThreadSafe))
+				{
+					OutMismatches.Add(FString::Printf(
+						TEXT("binding_function_metadata_invalid uid=%s graph=%s node=%s key=%s function=%s pure=%d thread_safe=%d requires_thread_safe=%d"),
+						*SerializedUid,
+						LiveNode->GetGraph() ? *LiveNode->GetGraph()->GetName() : TEXT("<null>"),
+						*DescribeNode_ImportBpy(LiveNode),
+						*Key,
+						*ResolvedFunction->GetName(),
+						bIsPure ? 1 : 0,
+						bThreadSafe ? 1 : 0,
+						bRequiresThreadSafe ? 1 : 0));
+				}
+			}
+		}
+	}
+}
+
+void EnforceAnimNodeBindingDrivenPinVisibility_ImportBpy(
+	UBlueprint* BP,
+	int32& OutChangedNodeCount)
+{
+	// Source exports already carry authoritative ShowPinForProperties flags.
+	// Do not mutate pin visibility during import finalization, otherwise valid
+	// bound properties (e.g. MotionMatching.BlendTime) disappear from the node UI.
+	OutChangedNodeCount = 0;
+	(void)BP;
 }
 
 void CollectEventAndDelegateBindingMismatches_ImportBpy(
@@ -14474,6 +15429,10 @@ bool ValidateRoundtripAgainstRootJson_ImportBpy(
 
 	if (const UAnimBlueprint* AnimBlueprint = Cast<UAnimBlueprint>(BP))
 	{
+		TArray<FString> AnimNodeBindingMismatches;
+		CollectAnimNodePropertyBindingMismatches_ImportBpy(BP, Root, AnimNodeBindingMismatches);
+		Mismatches.Append(AnimNodeBindingMismatches);
+
 		TArray<FString> FunctionRefBindingMismatches;
 		CollectAnimNodeFunctionRefBindingMismatches_ImportBpy(BP, Root, FunctionRefBindingMismatches);
 		Mismatches.Append(FunctionRefBindingMismatches);
@@ -15016,6 +15975,18 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 				ImportCompileWarnings.AddUnique(Warning);
 			}
 		}
+
+		if (Cast<UAnimBlueprint>(BP))
+		{
+			FString PhaseLabel = TEXT("D_post_compile");
+			if (CompileStage && FCString::Strlen(CompileStage) > 0)
+			{
+				PhaseLabel += TEXT("_");
+				PhaseLabel += CompileStage;
+			}
+			LogMotionMatchingBindingSnapshotsForBlueprint_ImportBpy(BP, *PhaseLabel);
+		}
+
 		return true;
 	};
 
@@ -15163,6 +16134,15 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 		}
 	}
 
+	// Rebuild skeleton after all graph creation so function signatures exist and
+	// metadata (thread_safe/category/pure) can be applied deterministically.
+	if (SortedGraphs.Num() > 0)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+		FKismetEditorUtilities::GenerateBlueprintSkeleton(BP, true);
+		ReplayFunctionGraphMetadataToSignature_ImportBpy(BP, SortedGraphs);
+	}
+
 	// Reconcile interface graph ownership from the implemented interface function
 	// signatures. Some UE import paths leave correctly created graphs unattached
 	// to FBPInterfaceDescription::Graphs, which breaks interface runtime calls.
@@ -15293,6 +16273,27 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 				OutError))
 		{
 			return false;
+		}
+
+		int32 FinalBindingVisibilityChangedNodes = 0;
+		EnforceAnimNodeBindingDrivenPinVisibility_ImportBpy(BP, FinalBindingVisibilityChangedNodes);
+		if (FinalBindingVisibilityChangedNodes > 0)
+		{
+			if (!CompileAndTrackWarnings(TEXT("binding_visibility_final_pass")))
+			{
+				return false;
+			}
+
+			if (!ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(BP, SortedGraphs, OutError))
+			{
+				return false;
+			}
+
+			if (ComponentsArr &&
+				!ReplayComponentTemplatePropertiesAfterCompile_ImportBpy(BP, *ComponentsArr, nullptr, OutError))
+			{
+				return false;
+			}
 		}
 	}
 

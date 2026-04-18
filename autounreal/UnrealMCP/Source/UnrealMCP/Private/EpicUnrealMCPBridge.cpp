@@ -22,6 +22,7 @@
 #include "Engine/Selection.h"
 #include "Kismet/GameplayStatics.h"
 #include "Async/Async.h"
+#include "HAL/PlatformProcess.h"
 // Add Blueprint related includes
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
@@ -153,6 +154,7 @@ EMCPCommandGroup GetCommandGroup(const FString& CanonicalCommand)
         TEXT("get_blueprint_bpy"),
         TEXT("export_asset_bpy"),
         TEXT("export_blueprint_bpy"),
+        TEXT("verify_export_roundtrip"),
         TEXT("import_asset_py"),
         TEXT("import_blueprint_py"),
         TEXT("import_blueprint_from_bpy"),
@@ -299,6 +301,46 @@ bool ShouldExecuteOffGameThread(const FString& CanonicalCommand)
 {
     return CanonicalCommand == TEXT("searchassetsbynamefromfab") ||
            CanonicalCommand == TEXT("getassetsbynamefromfab");
+}
+
+bool IsRetryableEditorBusyResponse(const FString& SerializedResponse)
+{
+    if (SerializedResponse.IsEmpty())
+    {
+        return false;
+    }
+
+    TSharedPtr<FJsonObject> RootObject;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(SerializedResponse);
+    if (!FJsonSerializer::Deserialize(Reader, RootObject) || !RootObject.IsValid())
+    {
+        return false;
+    }
+
+    FString Status;
+    if (!RootObject->TryGetStringField(TEXT("status"), Status) ||
+        !Status.Equals(TEXT("error"), ESearchCase::IgnoreCase))
+    {
+        return false;
+    }
+
+    FString ErrorCode;
+    if (RootObject->TryGetStringField(TEXT("error_code"), ErrorCode) &&
+        ErrorCode.Equals(TEXT("editor_busy_postload"), ESearchCase::IgnoreCase))
+    {
+        return true;
+    }
+
+    const TSharedPtr<FJsonObject>* ResultObject = nullptr;
+    if (RootObject->TryGetObjectField(TEXT("result"), ResultObject) &&
+        ResultObject && ResultObject->IsValid() &&
+        (*ResultObject)->TryGetStringField(TEXT("error_code"), ErrorCode) &&
+        ErrorCode.Equals(TEXT("editor_busy_postload"), ESearchCase::IgnoreCase))
+    {
+        return true;
+    }
+
+    return false;
 }
 }
 
@@ -556,22 +598,50 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const T
         bExecuteOffGameThread = !bUnsafeInProcess;
     }
 
-    if (bExecuteOffGameThread)
+    auto ExecuteCommandOnce = [&ExecuteRoutedCommand, bExecuteOffGameThread]() -> FString
     {
-        return ExecuteRoutedCommand();
+        if (bExecuteOffGameThread)
+        {
+            return ExecuteRoutedCommand();
+        }
+
+        // Create a promise to wait for the result
+        TPromise<FString> Promise;
+        TFuture<FString> Future = Promise.GetFuture();
+
+        // Queue execution on Game Thread
+        AsyncTask(ENamedThreads::GameThread, [ExecuteRoutedCommand, Promise = MoveTemp(Promise)]() mutable
+        {
+            Promise.SetValue(ExecuteRoutedCommand());
+        });
+
+        return Future.Get();
+    };
+
+    const bool bRetryOnEditorBusy =
+        CanonicalCommand == TEXT("import_blueprint_from_bpy") ||
+        CanonicalCommand == TEXT("edit_blueprint_by_bpy") ||
+        CanonicalCommand == TEXT("import_blueprint_py") ||
+        CanonicalCommand == TEXT("import_asset_py");
+
+    if (!bRetryOnEditorBusy)
+    {
+        return ExecuteCommandOnce();
     }
 
-    // Create a promise to wait for the result
-    TPromise<FString> Promise;
-    TFuture<FString> Future = Promise.GetFuture();
-
-    // Queue execution on Game Thread
-    AsyncTask(ENamedThreads::GameThread, [ExecuteRoutedCommand, Promise = MoveTemp(Promise)]() mutable
+    constexpr int32 MaxEditorBusyRetries = 200; // 20 seconds max at 100ms intervals.
+    for (int32 AttemptIndex = 0; AttemptIndex < MaxEditorBusyRetries; ++AttemptIndex)
     {
-        Promise.SetValue(ExecuteRoutedCommand());
-    });
+        const FString Response = ExecuteCommandOnce();
+        if (!IsRetryableEditorBusyResponse(Response))
+        {
+            return Response;
+        }
 
-    return Future.Get();
+        FPlatformProcess::Sleep(0.1f);
+    }
+
+    return ExecuteCommandOnce();
 }
 
 FString UEpicUnrealMCPBridge::ExecuteCommandJson(const FString& CommandType, const FString& ParamsJson)

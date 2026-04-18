@@ -39,6 +39,7 @@ private:
     TSharedPtr<FJsonObject> HandleGetBlueprintBpy(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleExportBlueprintBpy(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleImportBlueprintPython(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleVerifyExportRoundtrip(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleExportBlueprintFunctions(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleImportBlueprintFunctions(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCompileLiveCoding(const TSharedPtr<FJsonObject>& Params);

@@ -2136,6 +2136,37 @@ def import_blueprint_from_bpy_verified(
 
 
 @mcp.tool()
+def verify_export_roundtrip(
+    target: str = "",
+    source_json: str = "",
+    source_json_path: str = "",
+    asset_path: str = "",
+    blueprint_path: str = "",
+    soft_path_from_project_root: str = "",
+    blueprint_name: str = "",
+    blueprint: str = ""
+) -> Dict[str, Any]:
+    """
+    Verify importer roundtrip by canonicalizing source JSON vs live re-export.
+
+    Returns error when semantic roundtrip drifts after import.
+    """
+    params: Dict[str, Any] = {}
+    _apply_blueprint_target_params(
+        params,
+        target=target,
+        asset_path=asset_path,
+        blueprint_path=blueprint_path,
+        soft_path_from_project_root=soft_path_from_project_root,
+        blueprint_name=blueprint_name,
+        blueprint=blueprint
+    )
+    _maybe_add_param(params, "source_json", source_json)
+    _maybe_add_param(params, "source_json_path", source_json_path)
+    return _forward_unreal_command("verify_export_roundtrip", params)
+
+
+@mcp.tool()
 def edit_blueprint_by_bpy(
     target: str,
     bpydata: str = "",

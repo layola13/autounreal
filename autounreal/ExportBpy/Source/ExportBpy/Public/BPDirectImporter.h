@@ -70,6 +70,28 @@ public:
 		const FString& JsonData,
 		const FString& TargetAssetPath);
 
+	UFUNCTION(BlueprintCallable, Category = "ExportBpy")
+	static bool ValidateRoundtrip(
+		const FString& JsonData,
+		const FString& TargetAssetPath,
+		FString& OutError);
+
+	UFUNCTION(BlueprintCallable, Category = "ExportBpy")
+	static FString ValidateRoundtripDetailed(
+		const FString& JsonData,
+		const FString& TargetAssetPath);
+
+	UFUNCTION(BlueprintCallable, Category = "ExportBpy")
+	static bool VerifyExportRoundtrip(
+		const FString& JsonData,
+		const FString& TargetAssetPath,
+		FString& OutError);
+
+	UFUNCTION(BlueprintCallable, Category = "ExportBpy")
+	static FString VerifyExportRoundtripDetailed(
+		const FString& JsonData,
+		const FString& TargetAssetPath);
+
 	/**
 	 * 将独立资产（InputAction / InputMappingContext / Chooser / PoseSearchDatabase 等）
 	 * 从旧的扁平属性 JSON，或新的 standalone asset meta JSON，导入到目标资产。
@@ -169,6 +191,9 @@ private:
 
 	// ── Compile ───────────────────────────────────────────────────────────────
 
-	static  void CompileBlueprint(UBlueprint* BP);
+	static bool CompileBlueprint(
+		UBlueprint* BP,
+		TArray<FString>* OutWarnings = nullptr,
+		FString* OutError = nullptr);
 	static bool SaveBlueprint(UBlueprint* BP, FString& OutError);
 };

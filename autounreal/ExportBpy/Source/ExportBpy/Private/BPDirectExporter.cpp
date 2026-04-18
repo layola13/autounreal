@@ -182,6 +182,181 @@ void AddNodeObjectPropertyTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info
 	}
 }
 
+bool ExportAnimNodeBindingPropertyBindingsText_ExportBpy(UK2Node* Node, FString& OutExportedValue)
+{
+	OutExportedValue.Reset();
+
+	if (!Node)
+	{
+		return false;
+	}
+
+	// UE5.x path: property bindings live directly on UAnimGraphNode_Base.
+	if (FMapProperty* DirectBindingsProperty =
+			FindFProperty<FMapProperty>(Node->GetClass(), TEXT("PropertyBindings")))
+	{
+		void* ValuePtr = DirectBindingsProperty->ContainerPtrToValuePtr<void>(Node);
+		void* DefaultPtr = nullptr;
+		if (UObject* DefaultNode = Node->GetClass()->GetDefaultObject(false))
+		{
+			DefaultPtr = DirectBindingsProperty->ContainerPtrToValuePtr<void>(DefaultNode);
+		}
+
+		DirectBindingsProperty->ExportTextItem_Direct(
+			OutExportedValue,
+			ValuePtr,
+			DefaultPtr,
+			Node,
+			PPF_None);
+		if (!OutExportedValue.IsEmpty() && OutExportedValue != TEXT("()"))
+		{
+			return true;
+		}
+
+		OutExportedValue.Reset();
+	}
+
+	// Legacy fallback: bindings stored on nested Binding UObject.
+	const FObjectPropertyBase* BindingProperty =
+		FindFProperty<FObjectPropertyBase>(Node->GetClass(), TEXT("Binding"));
+	if (!BindingProperty)
+	{
+		return false;
+	}
+
+	UObject* BindingObject = BindingProperty->GetObjectPropertyValue_InContainer(Node);
+	if (!BindingObject)
+	{
+		return false;
+	}
+
+	FProperty* PropertyBindingsProperty =
+		BindingObject->GetClass()->FindPropertyByName(TEXT("PropertyBindings"));
+	if (!PropertyBindingsProperty)
+	{
+		return false;
+	}
+
+	void* ValuePtr = PropertyBindingsProperty->ContainerPtrToValuePtr<void>(BindingObject);
+	if (!ValuePtr)
+	{
+		return false;
+	}
+
+	void* DefaultPtr = nullptr;
+	if (UObject* DefaultNode = Node->GetClass()->GetDefaultObject())
+	{
+		if (UObject* DefaultBindingObject = BindingProperty->GetObjectPropertyValue_InContainer(DefaultNode))
+		{
+			DefaultPtr = PropertyBindingsProperty->ContainerPtrToValuePtr<void>(DefaultBindingObject);
+		}
+	}
+
+	PropertyBindingsProperty->ExportTextItem_Direct(
+		OutExportedValue,
+		ValuePtr,
+		DefaultPtr,
+		BindingObject,
+		PPF_None);
+
+	return !OutExportedValue.IsEmpty();
+}
+
+TSet<FString> CollectAnimNodeBindingDrivenPinNames_ExportBpy(UK2Node* Node)
+{
+	TSet<FString> Result;
+
+	if (!Node)
+	{
+		return Result;
+	}
+
+	// Prefer direct map keys when available (UE5.x).
+	if (FMapProperty* DirectBindingsProperty =
+			FindFProperty<FMapProperty>(Node->GetClass(), TEXT("PropertyBindings")))
+	{
+		void* ValuePtr = DirectBindingsProperty->ContainerPtrToValuePtr<void>(Node);
+		if (ValuePtr)
+		{
+			FScriptMapHelper MapHelper(DirectBindingsProperty, ValuePtr);
+			const FNameProperty* NameKeyProperty = CastField<FNameProperty>(DirectBindingsProperty->KeyProp);
+			if (NameKeyProperty)
+			{
+				for (int32 Index = 0; Index < MapHelper.GetMaxIndex(); ++Index)
+				{
+					if (!MapHelper.IsValidIndex(Index))
+					{
+						continue;
+					}
+
+					const FName PropertyName = NameKeyProperty->GetPropertyValue(MapHelper.GetKeyPtr(Index));
+					if (!PropertyName.IsNone())
+					{
+						Result.Add(PropertyName.ToString());
+					}
+				}
+			}
+		}
+	}
+
+	if (Result.Num() > 0)
+	{
+		return Result;
+	}
+
+	// Fallback: parse exported text from legacy binding representation.
+	FString BindingText;
+	if (!ExportAnimNodeBindingPropertyBindingsText_ExportBpy(Node, BindingText) || BindingText.IsEmpty())
+	{
+		return Result;
+	}
+
+	static const FString PropertyNameToken = TEXT("PropertyName=\"");
+	int32 SearchFrom = 0;
+	while (SearchFrom < BindingText.Len())
+	{
+		const int32 TokenIndex = BindingText.Find(
+			PropertyNameToken,
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart,
+			SearchFrom);
+		if (TokenIndex == INDEX_NONE)
+		{
+			break;
+		}
+
+		const int32 NameStart = TokenIndex + PropertyNameToken.Len();
+		const int32 NameEnd = BindingText.Find(
+			TEXT("\""),
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart,
+			NameStart);
+		if (NameEnd == INDEX_NONE || NameEnd <= NameStart)
+		{
+			break;
+		}
+
+		Result.Add(BindingText.Mid(NameStart, NameEnd - NameStart));
+		SearchFrom = NameEnd + 1;
+	}
+
+	return Result;
+}
+
+void AddAnimNodeBindingPropertyBindingsIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info)
+{
+	if (!Node || !Info.NodeType.StartsWith(TEXT("AnimGraphNode_")))
+	{
+		return;
+	}
+
+	FString ExportedValue;
+	if (ExportAnimNodeBindingPropertyBindingsText_ExportBpy(Node, ExportedValue))
+	{
+		Info.NodeProps.Add(TEXT("BindingPropertyBindings"), ExportedValue);
+	}
+}
+
 void AddGenericNodePropertyText_ExportBpy(
 	UEdGraphNode* Node,
 	const TSharedPtr<FJsonObject>& NodeProps,
@@ -1839,6 +2014,7 @@ TArray<FString> InlineExtraPropLines_ExportBpy(const FNodeInfo& Info)
 		return Key == TEXT("Node") ||
 			Key == TEXT("ShowPinForProperties") ||
 			Key == TEXT("CustomPinProperties") ||
+			Key == TEXT("BindingPropertyBindings") ||
 			Key == TEXT("InitialUpdateFunction") ||
 			Key == TEXT("BecomeRelevantFunction") ||
 			Key == TEXT("UpdateFunction") ||
@@ -2645,6 +2821,12 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		AddNodePropertyDeltaOrTextIfPresent_ExportBpy(Node, Info, TEXT("Mode"));
 	}
 
+	TSet<FString> AnimBindingDrivenPins;
+	if (Info.NodeType.StartsWith(TEXT("AnimGraphNode_")))
+	{
+		AnimBindingDrivenPins = CollectAnimNodeBindingDrivenPinNames_ExportBpy(Node);
+	}
+
 	for (UEdGraphPin* Pin : Node->Pins)
 	{
 		const FString RawPinName = Pin->PinName.ToString();
@@ -2682,10 +2864,18 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 			}
 		}
 
-		const FString PinDefaultValue = GetPinDefaultValueForExport_ExportBpy(Pin);
-		if (!PinDefaultValue.IsEmpty())
+		const bool bIsAnimBindingDrivenInput =
+			Pin &&
+			Pin->Direction == EGPD_Input &&
+			(AnimBindingDrivenPins.Contains(RawPinName) ||
+				(!LogicalPinName.IsEmpty() && AnimBindingDrivenPins.Contains(LogicalPinName)));
+		if (!bIsAnimBindingDrivenInput)
 		{
-			Info.DefaultValues.Add(PinNameForMetadata, PinDefaultValue);
+			const FString PinDefaultValue = GetPinDefaultValueForExport_ExportBpy(Pin);
+			if (!PinDefaultValue.IsEmpty())
+			{
+				Info.DefaultValues.Add(PinNameForMetadata, PinDefaultValue);
+			}
 		}
 	}
 
@@ -2694,6 +2884,7 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("ShowPinForProperties"));
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("CustomPinProperties"));
+		AddAnimNodeBindingPropertyBindingsIfPresent_ExportBpy(Node, Info);
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("InitialUpdateFunction"));
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("BecomeRelevantFunction"));
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("UpdateFunction"));

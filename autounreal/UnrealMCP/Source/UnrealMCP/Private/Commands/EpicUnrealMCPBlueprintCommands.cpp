@@ -72,9 +72,11 @@
 #include "Misc/Guid.h"
 #include "Misc/PackageName.h"
 #include "UObject/Interface.h"
+#include "UObject/UObjectThreadContext.h"
 #include "EdGraphUtilities.h"
 #include "ExportBlueprintToTxtLibrary.h"
 #include "BPDirectExporter.h"
+#include "BPDirectImporter.h"
 
 #if PLATFORM_WINDOWS
 #include "ILiveCodingModule.h"
@@ -6390,6 +6392,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleCommand(const FSt
     {
         return HandleExportBlueprintBpy(Params);
     }
+    else if (CommandType == TEXT("verify_export_roundtrip"))
+    {
+        return HandleVerifyExportRoundtrip(Params);
+    }
     else if (
         CommandType == TEXT("import_asset_py") ||
         CommandType == TEXT("import_blueprint_py") ||
@@ -8980,6 +8986,15 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleImportBlueprintPy
 
         if (bIsBpyDslPath)
         {
+            if (FUObjectThreadContext::Get().IsRoutingPostLoad)
+            {
+                TSharedPtr<FJsonObject> BusyResponse = FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                    TEXT("Blueprint import is temporarily blocked while UE is routing PostLoad. Retry after editor loading finishes."));
+                BusyResponse->SetStringField(TEXT("error_code"), TEXT("editor_busy_postload"));
+                BusyResponse->SetBoolField(TEXT("retryable"), true);
+                return BusyResponse;
+            }
+
             const bool bIsStandaloneAssetPackage = !bIsUpperPackagePath && IsStandaloneAssetBpyPackagePath_BP(InputPath);
             const FString TargetAssetRef = ResolveBlueprintTargetParam(Params);
             if (!bIsStandaloneAssetPackage && TargetAssetRef.IsEmpty())
@@ -9290,6 +9305,59 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleImportBlueprintPy
     ResultObj->SetBoolField(TEXT("compiled"), bCompileBlueprint);
     ResultObj->SetNumberField(TEXT("imported_graph_count"), ImportedGraphCount);
     ResultObj->SetObjectField(TEXT("edit_result"), EditResult);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleVerifyExportRoundtrip(const TSharedPtr<FJsonObject>& Params)
+{
+    const FString TargetBlueprint = ResolveBlueprintTargetParam(Params);
+    if (TargetBlueprint.IsEmpty())
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing target blueprint path"));
+    }
+
+    FString SourceJson = GetFirstNonEmptyStringField_BP(
+        Params,
+        {TEXT("source_json"), TEXT("json_data"), TEXT("spec_json")});
+
+    if (SourceJson.IsEmpty())
+    {
+        FString SourceJsonPath;
+        if (Params->TryGetStringField(TEXT("source_json_path"), SourceJsonPath) && !SourceJsonPath.IsEmpty())
+        {
+            if (FPaths::IsRelative(SourceJsonPath))
+            {
+                SourceJsonPath = FPaths::Combine(FPaths::ProjectDir(), SourceJsonPath);
+            }
+            if (!FFileHelper::LoadFileToString(SourceJson, *SourceJsonPath))
+            {
+                return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Failed to read source_json_path: %s"), *SourceJsonPath));
+            }
+        }
+    }
+
+    if (SourceJson.IsEmpty())
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("Missing source_json/json_data/spec_json or source_json_path"));
+    }
+
+    FString VerifyError;
+    const bool bSuccess = UBPDirectImporter::VerifyExportRoundtrip(
+        SourceJson,
+        TargetBlueprint,
+        VerifyError);
+    if (!bSuccess)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            VerifyError.IsEmpty() ? TEXT("VerifyExportRoundtrip failed") : VerifyError);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("target_blueprint"), TargetBlueprint);
+    ResultObj->SetStringField(TEXT("verify_mode"), TEXT("canonical_json_roundtrip"));
     return ResultObj;
 }
 

@@ -430,10 +430,30 @@ def _import_blueprint_object_with_details(
             "validation_summary": {"ok": True, "warnings": ["dry-run"]},
         }
 
-    ok, err = _call_cpp_importer(json_str, asset_path, compile_blueprint=False)
+    ok, err = _call_cpp_importer(
+        json_str,
+        asset_path,
+        compile_blueprint=bool(compile_blueprint),
+    )
     if not ok and err:
         err = _describe_missing_connection_nodes(payload, err)
     bridge_asset_path = _normalize_bridge_blueprint_path(asset_path)
+    parent_class_path = str(payload.get("parent", "") or "")
+    is_anim_blueprint_payload = "AnimInstance" in parent_class_path
+    force_py_post_repair = str(
+        os.environ.get("EXPORTBPY_FORCE_PY_POST_REPAIR", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    disable_py_post_repair = str(
+        os.environ.get("EXPORTBPY_DISABLE_PY_POST_REPAIR", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    run_legacy_post_import_repairs = (
+        not disable_py_post_repair
+        and (
+            force_py_post_repair
+            or (not compile_blueprint)
+            or (not is_anim_blueprint_payload)
+        )
+    )
     expected_delegate_bindings = preflight_stats.get("expected_create_delegate_bindings", [])
     has_expected_delegate_bindings = bool(
         isinstance(expected_delegate_bindings, list) and expected_delegate_bindings
@@ -442,7 +462,7 @@ def _import_blueprint_object_with_details(
     repair_err = ""
     post_repair_ok = True
     post_repair_err = ""
-    compiled_ok = not compile_blueprint
+    compiled_ok = bool(ok if compile_blueprint else True)
     compile_err = ""
     delegate_restore_ok = True
     delegate_restore_err = ""
@@ -451,7 +471,7 @@ def _import_blueprint_object_with_details(
     delegate_final_restore_ok = True
     delegate_final_restore_err = ""
 
-    if ok:
+    if ok and run_legacy_post_import_repairs:
         repair_ok, repair_err = _repair_imported_blueprint_pin_defaults(
             bridge_asset_path,
             payload,
@@ -486,6 +506,8 @@ def _import_blueprint_object_with_details(
             and delegate_final_restore_ok
         ):
             _save_asset_if_possible(bridge_asset_path)
+    elif ok:
+        _save_asset_if_possible(bridge_asset_path)
 
     validation_summary = (
         _validate_imported_blueprint(asset_path, payload, preflight_stats=preflight_stats)
@@ -1309,83 +1331,6 @@ def _normalize_function_name_text(value: Any) -> str:
     return text
 
 
-def _is_optional_accessor_function_graph(graph: Dict[str, Any]) -> bool:
-    if not isinstance(graph, dict):
-        return False
-
-    graph_type = str(graph.get("graph_type", "") or "").strip().lower()
-    if graph_type != "function":
-        return False
-
-    graph_name = str(graph.get("name", "") or "").strip()
-    if not graph_name or not (graph_name.startswith("Get_") or graph_name.startswith("Set_")):
-        return False
-
-    raw_nodes = graph.get("nodes", [])
-    if not isinstance(raw_nodes, list) or not raw_nodes or len(raw_nodes) > 6:
-        return False
-
-    allowed_node_classes = {
-        "K2Node_FunctionEntry",
-        "K2Node_FunctionResult",
-        "K2Node_VariableGet",
-        "K2Node_VariableSet",
-        "K2Node_CallFunction",
-        "K2Node_AnimNodeReference",
-        "K2Node_Knot",
-    }
-    has_entry = False
-    has_result = False
-    variable_node_count = 0
-    call_function_count = 0
-    for node in raw_nodes:
-        if not isinstance(node, dict):
-            return False
-        node_class = str(node.get("node_class", "") or "").strip()
-        if not node_class or node_class not in allowed_node_classes:
-            return False
-        if node_class == "K2Node_FunctionEntry":
-            has_entry = True
-        elif node_class == "K2Node_FunctionResult":
-            has_result = True
-        elif node_class in ("K2Node_VariableGet", "K2Node_VariableSet"):
-            variable_node_count += 1
-        elif node_class == "K2Node_CallFunction":
-            call_function_count += 1
-
-    if not has_entry:
-        return False
-    if graph_name.startswith("Get_"):
-        if not has_result:
-            return False
-        if variable_node_count < 1 and call_function_count < 1:
-            return False
-    elif variable_node_count < 1:
-        return False
-    return True
-
-
-def _collect_optional_accessor_function_graphs(payload: Dict[str, Any]) -> Set[str]:
-    optional_graphs: Set[str] = set()
-    if not isinstance(payload, dict):
-        return optional_graphs
-
-    graphs = payload.get("graphs", [])
-    if not isinstance(graphs, list):
-        return optional_graphs
-
-    for graph in graphs:
-        if not isinstance(graph, dict):
-            continue
-        if not _is_optional_accessor_function_graph(graph):
-            continue
-        graph_name = str(graph.get("name", "") or "").strip()
-        if graph_name:
-            optional_graphs.add(graph_name)
-
-    return optional_graphs
-
-
 def _normalize_missing_graph_name(value: Any) -> str:
     if isinstance(value, dict):
         for key in ("graph", "name", "graph_name"):
@@ -1724,8 +1669,7 @@ def _validate_imported_blueprint(
     if not isinstance(summary["preflight_stats"], dict) or not summary["preflight_stats"]:
         summary["preflight_stats"] = _collect_expected_import_stats(payload)
 
-    optional_accessor_function_graphs = _collect_optional_accessor_function_graphs(payload)
-    summary["optional_accessor_function_graphs"] = sorted(optional_accessor_function_graphs)
+    summary["optional_accessor_function_graphs"] = []
 
     blueprint = _load_blueprint_asset_for_repair(asset_path)
     generated_class = _get_generated_class(blueprint)
@@ -1784,8 +1728,6 @@ def _validate_imported_blueprint(
                                 item_text = _normalize_missing_graph_name(item)
                                 if not item_text:
                                     continue
-                                if item_text in optional_accessor_function_graphs:
-                                    continue
                                 filtered.append(item_text)
                             summary[key] = existing + filtered
                         else:
@@ -1804,8 +1746,6 @@ def _validate_imported_blueprint(
             continue
 
         if graph_name_text not in live_graph_node_counts:
-            if graph_name_text in optional_accessor_function_graphs:
-                continue
             summary["missing_graphs"].append(graph_name_text)
             continue
 
@@ -1832,9 +1772,7 @@ def _validate_imported_blueprint(
         for name in expected_function_names
         if str(name or "").strip()
     }
-    required_function_name_set = expected_function_name_set.difference(
-        optional_accessor_function_graphs
-    )
+    required_function_name_set = expected_function_name_set
     live_function_name_set = {
         str(name or "").strip()
         for name in live_function_names

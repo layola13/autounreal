@@ -33,6 +33,7 @@ ue_bp_dsl/core.py — Blueprint DSL 核心层
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -155,6 +156,11 @@ class _Timeline:
     autoplay:         bool  = False
     use_last_keyframe: bool = True
     tracks:           List[_TimelineTrack] = field(default_factory=list)
+
+
+@dataclass
+class _NestedGraphProp:
+    graph: Dict[str, Any]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -728,6 +734,27 @@ def _serialize_graph(g: _Graph) -> Dict[str, Any]:
     node_by_uid = {n.uid: n for n in g.nodes}
     exec_like_var_get_pins = {"exec", "execute", "then", "else"}
 
+    def _normalize_nested_graph_value(value: Any) -> Any:
+        if isinstance(value, _NestedGraphProp):
+            return _normalize_nested_graph_value(value.graph)
+        if isinstance(value, dict):
+            return {
+                key: _normalize_nested_graph_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_normalize_nested_graph_value(item) for item in value]
+        return value
+
+    def _serialize_extra_prop_value(value: Any) -> Any:
+        if isinstance(value, _NestedGraphProp):
+            return json.dumps(
+                _normalize_nested_graph_value(value.graph),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        return value
+
     def _normalize_var_get_metadata(node: _Node) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, str]]:
         node_props = dict(node.extra_props)
         pin_aliases = dict(node.pin_aliases)
@@ -788,7 +815,10 @@ def _serialize_graph(g: _Graph) -> Dict[str, Any]:
                 "pos_y":        n.pos_y,
                 "readable_name": n.readable_name,
                 "node_guid":    n.node_guid,
-                "node_props":   _normalize_var_get_metadata(n)[0],
+                "node_props":   {
+                    key: _serialize_extra_prop_value(value)
+                    for key, value in _normalize_var_get_metadata(n)[0].items()
+                },
                 "pin_aliases":  _normalize_var_get_metadata(n)[1],
                 "pin_ids":      _normalize_var_get_metadata(n)[2],
                 "input_pin_types": dict(n.input_pin_types),
@@ -842,6 +872,10 @@ def _serialize_timeline(t: _Timeline) -> Dict[str, Any]:
             for tr in t.tracks
         ],
     }
+
+
+def nested_graph_prop(graph: Dict[str, Any]) -> _NestedGraphProp:
+    return _NestedGraphProp(graph=dict(graph))
 
 # ═══════════════════════════════════════════════════════════════
 #  DSL helper functions (used in .bp.py scripts)

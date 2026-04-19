@@ -89,6 +89,9 @@
 
 namespace
 {
+FString MakePythonStringLiteral_ExportBpy(const FString& Text);
+FString BuildPinRefAttribute_ExportBpy(const FString& NodeVar, const FString& RawPinName, bool bAllowGuidCleanup);
+
 void AddNodePropertyTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info, const TCHAR* PropertyName)
 {
 	if (!Node || !PropertyName)
@@ -615,12 +618,6 @@ UEdGraph* ResolveBlendStackGraph_ExportBpy(const UK2Node* Node)
 		return nullptr;
 	}
 
-	const FString NodeClassName = Node->GetClass()->GetName();
-	if (!NodeClassName.StartsWith(TEXT("AnimGraphNode_BlendStack")))
-	{
-		return nullptr;
-	}
-
 	auto TryGetGraphProperty = [Node](const TCHAR* PropertyName) -> UEdGraph*
 	{
 		if (!PropertyName)
@@ -649,7 +646,7 @@ UEdGraph* ResolveBlendStackGraph_ExportBpy(const UK2Node* Node)
 	{
 		if (UEdGraph* Graph = TryGetGraphProperty(PropertyName))
 		{
-			if ((IsBlendStackGraphLike_ExportBpy(Graph) || FString(PropertyName).Equals(TEXT("BoundGraph"), ESearchCase::IgnoreCase)) &&
+			if (IsBlendStackGraphLike_ExportBpy(Graph) &&
 				Graph->GetOuter() == Node)
 			{
 				return Graph;
@@ -676,19 +673,14 @@ UEdGraph* ResolveBlendStackGraph_ExportBpy(const UK2Node* Node)
 
 		const FString PropertyName = GraphProperty->GetName();
 		const bool bPropertyLooksRelevant =
-			PropertyName.Equals(TEXT("BoundGraph"), ESearchCase::IgnoreCase) ||
 			PropertyName.Contains(TEXT("BlendStack"), ESearchCase::IgnoreCase) ||
-			PropertyName.Contains(TEXT("BoundGraph"), ESearchCase::IgnoreCase);
+			PropertyName.Contains(TEXT("AnimationBlendStackGraph"), ESearchCase::IgnoreCase);
 		if (!bPropertyLooksRelevant && !IsBlendStackGraphLike_ExportBpy(Graph))
 		{
 			continue;
 		}
 
 		int32 Score = Graph->Nodes.Num();
-		if (PropertyName.Equals(TEXT("BoundGraph"), ESearchCase::IgnoreCase))
-		{
-			Score += 1000;
-		}
 		if (PropertyName.Contains(TEXT("BlendStack"), ESearchCase::IgnoreCase))
 		{
 			Score += 500;
@@ -755,6 +747,103 @@ FString SerializeJsonCompact_ExportBpy(const TSharedPtr<FJsonObject>& JsonObject
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
 	FJsonSerializer::Serialize(JsonObject.ToSharedRef(), Writer);
 	return Output;
+}
+
+bool ParseJsonObject_ExportBpy(const FString& JsonText, TSharedPtr<FJsonObject>& OutJsonObject)
+{
+	OutJsonObject.Reset();
+	if (JsonText.IsEmpty())
+	{
+		return false;
+	}
+
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+	return FJsonSerializer::Deserialize(Reader, OutJsonObject) && OutJsonObject.IsValid();
+}
+
+FString JsonValueToPythonLiteral_ExportBpy(const TSharedPtr<FJsonValue>& JsonValue, int32 IndentLevel);
+
+FString JsonObjectToPythonLiteral_ExportBpy(const TSharedPtr<FJsonObject>& JsonObject, int32 IndentLevel)
+{
+	if (!JsonObject.IsValid())
+	{
+		return TEXT("{}");
+	}
+
+	TArray<FString> Keys;
+	JsonObject->Values.GetKeys(Keys);
+	Keys.Sort();
+	if (Keys.IsEmpty())
+	{
+		return TEXT("{}");
+	}
+
+	const FString Indent = FString::ChrN(IndentLevel, TEXT(' '));
+	const FString ChildIndent = FString::ChrN(IndentLevel + 4, TEXT(' '));
+
+	FString Result = TEXT("{\n");
+	for (const FString& Key : Keys)
+	{
+		const TSharedPtr<FJsonValue>* JsonValue = JsonObject->Values.Find(Key);
+		if (!JsonValue || !JsonValue->IsValid())
+		{
+			continue;
+		}
+
+		Result += ChildIndent +
+			MakePythonStringLiteral_ExportBpy(Key) +
+			TEXT(": ") +
+			JsonValueToPythonLiteral_ExportBpy(*JsonValue, IndentLevel + 4) +
+			TEXT(",\n");
+	}
+
+	Result += Indent + TEXT("}");
+	return Result;
+}
+
+FString JsonArrayToPythonLiteral_ExportBpy(const TArray<TSharedPtr<FJsonValue>>& JsonArray, int32 IndentLevel)
+{
+	if (JsonArray.IsEmpty())
+	{
+		return TEXT("[]");
+	}
+
+	const FString Indent = FString::ChrN(IndentLevel, TEXT(' '));
+	const FString ChildIndent = FString::ChrN(IndentLevel + 4, TEXT(' '));
+
+	FString Result = TEXT("[\n");
+	for (const TSharedPtr<FJsonValue>& JsonValue : JsonArray)
+	{
+		Result += ChildIndent + JsonValueToPythonLiteral_ExportBpy(JsonValue, IndentLevel + 4) + TEXT(",\n");
+	}
+
+	Result += Indent + TEXT("]");
+	return Result;
+}
+
+FString JsonValueToPythonLiteral_ExportBpy(const TSharedPtr<FJsonValue>& JsonValue, int32 IndentLevel)
+{
+	if (!JsonValue.IsValid())
+	{
+		return TEXT("None");
+	}
+
+	switch (JsonValue->Type)
+	{
+	case EJson::String:
+		return MakePythonStringLiteral_ExportBpy(JsonValue->AsString());
+	case EJson::Number:
+		return FString::SanitizeFloat(JsonValue->AsNumber());
+	case EJson::Boolean:
+		return JsonValue->AsBool() ? TEXT("True") : TEXT("False");
+	case EJson::Array:
+		return JsonArrayToPythonLiteral_ExportBpy(JsonValue->AsArray(), IndentLevel);
+	case EJson::Object:
+		return JsonObjectToPythonLiteral_ExportBpy(JsonValue->AsObject(), IndentLevel);
+	case EJson::Null:
+	default:
+		return TEXT("None");
+	}
 }
 
 FString MakePythonMultilineStringLiteral_ExportBpy(const FString& Text)
@@ -2148,6 +2237,1028 @@ TArray<FString> InlineExtraPropLines_ExportBpy(const FNodeInfo& Info)
 	return Lines;
 }
 
+bool ShouldExternalizeNodeProp_ExportBpy(const FString& Key)
+{
+	return Key == TEXT("BoundGraphJson") ||
+		Key == TEXT("BlendStackGraphJson") ||
+		Key == TEXT("StateMachineGraphJson") ||
+		Key == TEXT("CustomTransitionGraphJson");
+}
+
+FString BuildNestedGraphModuleStem_ExportBpy(
+	const FString& ParentModuleName,
+	const FString& OwnerNodeClass,
+	const FString& GraphName)
+{
+	const FString ParentStem = ParentModuleName.StartsWith(TEXT("other_"))
+		? ParentModuleName
+		: (TEXT("other_") + ParentModuleName);
+
+	FString NodeCategory = OwnerNodeClass;
+	if (NodeCategory == TEXT("AnimStateNode"))
+	{
+		NodeCategory = TEXT("State");
+	}
+	else if (NodeCategory == TEXT("AnimStateTransitionNode"))
+	{
+		NodeCategory = TEXT("Transition");
+	}
+	else if (NodeCategory == TEXT("AnimStateConduitNode"))
+	{
+		NodeCategory = TEXT("Conduit");
+	}
+	else if (NodeCategory == TEXT("AnimStateEntryNode"))
+	{
+		NodeCategory = TEXT("Entry");
+	}
+	else
+	{
+		const TArray<FString> Prefixes = {
+			TEXT("AnimGraphNode_"),
+			TEXT("AnimState"),
+			TEXT("K2Node_"),
+			TEXT("EdGraphNode_")
+		};
+		for (const FString& Prefix : Prefixes)
+		{
+			if (NodeCategory.StartsWith(Prefix))
+			{
+				NodeCategory.RightChopInline(Prefix.Len(), EAllowShrinking::No);
+				break;
+			}
+		}
+
+		if (NodeCategory.EndsWith(TEXT("Node")))
+		{
+			NodeCategory.LeftChopInline(4, EAllowShrinking::No);
+		}
+	}
+	NodeCategory = SanitizePythonIdentifier_ExportBpy(NodeCategory, TEXT("node"));
+
+	const FString GraphToken = SanitizePythonIdentifier_ExportBpy(GraphName, TEXT("graph"));
+	FString Result = ParentStem;
+	if (!GraphToken.Equals(NodeCategory, ESearchCase::IgnoreCase) &&
+		!GraphToken.StartsWith(NodeCategory + TEXT("_"), ESearchCase::IgnoreCase))
+	{
+		Result += TEXT("__") + NodeCategory;
+	}
+	Result += TEXT("__") + GraphToken;
+	return Result;
+}
+
+FString MakeUniqueNestedGraphModuleStem_ExportBpy(
+	const FString& DesiredStem,
+	TMap<FString, int32>& InOutStemCounts)
+{
+	int32& Count = InOutStemCounts.FindOrAdd(DesiredStem);
+	++Count;
+	if (Count <= 1)
+	{
+		return DesiredStem;
+	}
+
+	return FString::Printf(TEXT("%s_%d"), *DesiredStem, Count);
+}
+
+bool WriteNestedGraphModule_ExportBpy(
+	const FString& OutDir,
+	const FString& ModuleStem,
+	TMap<FString, int32>& InOutStemCounts,
+	const TSharedPtr<FJsonObject>& GraphJson,
+	FString& OutError);
+
+FString BuildNestedGraphModuleStemForJsonNode_ExportBpy(
+	const FString& ParentModuleName,
+	const FString& NodeClassName,
+	const FString& GraphName)
+{
+	return BuildNestedGraphModuleStem_ExportBpy(ParentModuleName, NodeClassName, GraphName);
+}
+
+bool CloneJsonObject_ExportBpy(
+	const TSharedPtr<FJsonObject>& Source,
+	TSharedPtr<FJsonObject>& OutClone)
+{
+	OutClone.Reset();
+	if (!Source.IsValid())
+	{
+		return false;
+	}
+
+	return ParseJsonObject_ExportBpy(SerializeJsonCompact_ExportBpy(Source), OutClone) && OutClone.IsValid();
+}
+
+bool JsonObjectToStringMap_ExportBpy(
+	const TSharedPtr<FJsonObject>& JsonObject,
+	TMap<FString, FString>& OutMap)
+{
+	OutMap.Reset();
+	if (!JsonObject.IsValid())
+	{
+		return false;
+	}
+
+	TArray<FString> Keys;
+	JsonObject->Values.GetKeys(Keys);
+	for (const FString& Key : Keys)
+	{
+		const TSharedPtr<FJsonValue>* JsonValue = JsonObject->Values.Find(Key);
+		if (!JsonValue || !JsonValue->IsValid())
+		{
+			continue;
+		}
+
+		FString StringValue;
+		switch ((*JsonValue)->Type)
+		{
+		case EJson::String:
+			StringValue = (*JsonValue)->AsString();
+			break;
+		case EJson::Number:
+			StringValue = FString::SanitizeFloat((*JsonValue)->AsNumber());
+			break;
+		case EJson::Boolean:
+			StringValue = (*JsonValue)->AsBool() ? TEXT("True") : TEXT("False");
+			break;
+		case EJson::Object:
+			StringValue = SerializeJsonCompact_ExportBpy((*JsonValue)->AsObject());
+			break;
+		case EJson::Array:
+		{
+			TSharedPtr<FJsonObject> Wrapper = MakeShared<FJsonObject>();
+			Wrapper->SetArrayField(TEXT("Value"), (*JsonValue)->AsArray());
+			StringValue = SerializeJsonCompact_ExportBpy(Wrapper);
+			StringValue.RemoveFromStart(TEXT("{\"Value\":"));
+			StringValue.RemoveFromEnd(TEXT("}"));
+			break;
+		}
+		default:
+			break;
+		}
+
+		OutMap.Add(Key, StringValue);
+	}
+
+	return OutMap.Num() > 0;
+}
+
+FString NormalizeFunctionOwnerClassName_ExportBpy(const FString& RawOwner)
+{
+	if (RawOwner.IsEmpty())
+	{
+		return FString();
+	}
+
+	FString Owner = RawOwner;
+	int32 ScopeIndex = INDEX_NONE;
+	if (Owner.FindLastChar(TEXT('.'), ScopeIndex))
+	{
+		Owner = Owner.Mid(ScopeIndex + 1);
+	}
+	return Owner;
+}
+
+void ParseSerializedFunctionRef_ExportBpy(
+	const FString& FunctionRef,
+	FString& OutFunctionName,
+	FString& OutOwnerClassName)
+{
+	OutFunctionName = FunctionRef;
+	OutOwnerClassName.Reset();
+
+	FString OwnerPath;
+	if (FunctionRef.Split(TEXT("::"), &OwnerPath, &OutFunctionName))
+	{
+		OutOwnerClassName = NormalizeFunctionOwnerClassName_ExportBpy(OwnerPath);
+	}
+}
+
+bool BuildNodeInfoFromSerializedJson_ExportBpy(
+	const TSharedPtr<FJsonObject>& NodeJson,
+	FNodeInfo& OutInfo,
+	FString& OutNodeUid)
+{
+	OutInfo = FNodeInfo{};
+	OutNodeUid.Reset();
+	if (!NodeJson.IsValid())
+	{
+		return false;
+	}
+
+	OutNodeUid = GetJsonStringField_ExportBpy(NodeJson, TEXT("uid"));
+	OutInfo.NodeType = GetJsonStringField_ExportBpy(NodeJson, TEXT("node_class"));
+	OutInfo.FunctionName = GetJsonStringField_ExportBpy(NodeJson, TEXT("member_name"));
+	OutInfo.TargetType = GetJsonStringField_ExportBpy(NodeJson, TEXT("target_type"));
+	OutInfo.NodeGuid = GetJsonStringField_ExportBpy(NodeJson, TEXT("node_guid"), OutNodeUid);
+	OutInfo.Position.X = NodeJson->HasField(TEXT("pos_x")) ? NodeJson->GetNumberField(TEXT("pos_x")) : 0.0;
+	OutInfo.Position.Y = NodeJson->HasField(TEXT("pos_y")) ? NodeJson->GetNumberField(TEXT("pos_y")) : 0.0;
+
+	const FString FunctionRef = GetJsonStringField_ExportBpy(NodeJson, TEXT("function_ref"));
+	if (OutInfo.NodeType == TEXT("K2Node_Message"))
+	{
+		ParseSerializedFunctionRef_ExportBpy(FunctionRef, OutInfo.FunctionName, OutInfo.ClassName);
+	}
+	else if (!FunctionRef.IsEmpty())
+	{
+		OutInfo.bIsCallFunctionLike = true;
+		ParseSerializedFunctionRef_ExportBpy(FunctionRef, OutInfo.FunctionName, OutInfo.ClassName);
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* CustomParamsArray = nullptr;
+	if (NodeJson->TryGetArrayField(TEXT("custom_params"), CustomParamsArray) && CustomParamsArray)
+	{
+		for (const TSharedPtr<FJsonValue>& ParamValue : *CustomParamsArray)
+		{
+			const TSharedPtr<FJsonObject> ParamObject = ParamValue.IsValid() ? ParamValue->AsObject() : nullptr;
+			if (!ParamObject.IsValid())
+			{
+				continue;
+			}
+
+			OutInfo.CustomParams.Add(TPair<FString, FString>(
+				GetJsonStringField_ExportBpy(ParamObject, TEXT("name")),
+				GetJsonStringField_ExportBpy(ParamObject, TEXT("type"))));
+		}
+	}
+
+	const TSharedPtr<FJsonObject>* DefaultsObject = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("defaults"), DefaultsObject) && DefaultsObject)
+	{
+		JsonObjectToStringMap_ExportBpy(*DefaultsObject, OutInfo.DefaultValues);
+	}
+
+	const TSharedPtr<FJsonObject>* InputTypesObject = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("input_pin_types"), InputTypesObject) && InputTypesObject)
+	{
+		JsonObjectToStringMap_ExportBpy(*InputTypesObject, OutInfo.InputPinTypes);
+	}
+
+	const TSharedPtr<FJsonObject>* OutputTypesObject = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("output_pin_types"), OutputTypesObject) && OutputTypesObject)
+	{
+		JsonObjectToStringMap_ExportBpy(*OutputTypesObject, OutInfo.OutputPinTypes);
+	}
+
+	const TSharedPtr<FJsonObject>* PinAliasesObject = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("pin_aliases"), PinAliasesObject) && PinAliasesObject)
+	{
+		JsonObjectToStringMap_ExportBpy(*PinAliasesObject, OutInfo.PinAliases);
+	}
+
+	const TSharedPtr<FJsonObject>* PinIdsObject = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("pin_ids"), PinIdsObject) && PinIdsObject)
+	{
+		JsonObjectToStringMap_ExportBpy(*PinIdsObject, OutInfo.PinIds);
+	}
+
+	const TSharedPtr<FJsonObject>* NodePropsObject = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("node_props"), NodePropsObject) && NodePropsObject)
+	{
+		JsonObjectToStringMap_ExportBpy(*NodePropsObject, OutInfo.NodeProps);
+	}
+
+	return !OutInfo.NodeType.IsEmpty();
+}
+
+FString AppendPosArgToCtorLine_ExportBpy(const FString& CtorLine, const FVector2D& Position)
+{
+	int32 LastParen = INDEX_NONE;
+	if (!CtorLine.FindLastChar(TEXT(')'), LastParen) || LastParen <= 0)
+	{
+		return CtorLine;
+	}
+
+	const FString PosArg = FString::Printf(
+		TEXT("pos=(%s, %s)"),
+		*FString::SanitizeFloat(Position.X),
+		*FString::SanitizeFloat(Position.Y));
+	const bool bHasNoArgs = CtorLine[LastParen - 1] == TEXT('(');
+	const FString InsertText = bHasNoArgs ? PosArg : (TEXT(", ") + PosArg);
+	return CtorLine.Left(LastParen) + InsertText + CtorLine.Mid(LastParen);
+}
+
+FString BuildSerializedPinRef_ExportBpy(const FString& NodeVar, const FString& RawPinName)
+{
+	return BuildPinRefAttribute_ExportBpy(NodeVar, RawPinName, false);
+}
+
+FString NodeToCtorLineForSidecar_ExportBpy(const FNodeInfo& Info)
+{
+	const FString& NodeType = Info.NodeType;
+
+	if (NodeType == TEXT("K2Node_FunctionEntry"))
+	{
+		return FString::Printf(TEXT("%s = g.entry()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_FunctionResult"))
+	{
+		return FString::Printf(TEXT("%s = g.result()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_IfThenElse"))
+	{
+		return FString::Printf(TEXT("%s = g.branch()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_ExecutionSequence"))
+	{
+		return FString::Printf(TEXT("%s = g.sequence()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_VariableGet"))
+	{
+		return FString::Printf(TEXT("%s = g.get_var(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(Info.FunctionName));
+	}
+	if (NodeType == TEXT("K2Node_VariableSet"))
+	{
+		return FString::Printf(TEXT("%s = g.set_var(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(Info.FunctionName));
+	}
+	if (NodeType == TEXT("K2Node_Message"))
+	{
+		FString FunctionRef = Info.FunctionName;
+		if (!Info.ClassName.IsEmpty())
+		{
+			FunctionRef = Info.ClassName + TEXT("::") + Info.FunctionName;
+		}
+		return FString::Printf(TEXT("%s = g.message(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(FunctionRef));
+	}
+	if (Info.bIsCallFunctionLike)
+	{
+		FString FunctionRef = Info.FunctionName;
+		if (!Info.ClassName.IsEmpty())
+		{
+			FunctionRef = Info.ClassName + TEXT("::") + Info.FunctionName;
+		}
+		if (NodeType != TEXT("K2Node_CallFunction"))
+		{
+			return FString::Printf(
+				TEXT("%s = g.call(%s, node_class=%s)"),
+				*Info.VarName,
+				*MakePythonStringLiteral_ExportBpy(FunctionRef),
+				*MakePythonStringLiteral_ExportBpy(NodeType));
+		}
+		return FString::Printf(TEXT("%s = g.call(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(FunctionRef));
+	}
+	if (NodeType == TEXT("K2Node_Event"))
+	{
+		return FString::Printf(TEXT("%s = g.event(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(Info.FunctionName));
+	}
+	if (NodeType == TEXT("K2Node_CustomEvent"))
+	{
+		if (Info.CustomParams.Num() > 0)
+		{
+			TArray<FString> ParamLiterals;
+			ParamLiterals.Reserve(Info.CustomParams.Num());
+			for (const TPair<FString, FString>& Param : Info.CustomParams)
+			{
+				ParamLiterals.Add(FString::Printf(
+					TEXT("(%s, %s)"),
+					*MakePythonStringLiteral_ExportBpy(Param.Key),
+					*MakePythonStringLiteral_ExportBpy(Param.Value)));
+			}
+
+			return FString::Printf(
+				TEXT("%s = g.custom_event(%s, params=[%s])"),
+				*Info.VarName,
+				*MakePythonStringLiteral_ExportBpy(Info.FunctionName),
+				*FString::Join(ParamLiterals, TEXT(", ")));
+		}
+
+		return FString::Printf(TEXT("%s = g.custom_event(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(Info.FunctionName));
+	}
+	if (NodeType == TEXT("K2Node_DynamicCast"))
+	{
+		if (!Info.TargetType.IsEmpty())
+		{
+			return FString::Printf(TEXT("%s = g.cast(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(Info.TargetType));
+		}
+	}
+	if (NodeType == TEXT("K2Node_Select"))
+	{
+		return FString::Printf(TEXT("%s = g.select()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_SwitchEnum"))
+	{
+		if (!Info.TargetType.IsEmpty())
+		{
+			return FString::Printf(TEXT("%s = g.switch_enum(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(Info.TargetType));
+		}
+		return FString::Printf(TEXT("%s = g.switch_enum()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_SwitchInteger"))
+	{
+		return FString::Printf(TEXT("%s = g.switch_int()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_BreakStruct"))
+	{
+		if (!Info.TargetType.IsEmpty())
+		{
+			return FString::Printf(TEXT("%s = g.break_struct(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(Info.TargetType));
+		}
+		return FString::Printf(TEXT("%s = g.break_struct()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_MakeStruct"))
+	{
+		if (!Info.TargetType.IsEmpty())
+		{
+			return FString::Printf(TEXT("%s = g.make_struct(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(Info.TargetType));
+		}
+		return FString::Printf(TEXT("%s = g.make_struct()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_Self"))
+	{
+		return FString::Printf(TEXT("%s = g.self_ref()"), *Info.VarName);
+	}
+	if (NodeType == TEXT("K2Node_CallDelegate"))
+	{
+		return FString::Printf(TEXT("%s = g.call_dispatcher(%s)"), *Info.VarName, *MakePythonStringLiteral_ExportBpy(Info.FunctionName));
+	}
+
+	FString TypeStr = NodeType;
+	TypeStr.RemoveFromStart(TEXT("K2Node_"));
+
+	FString Args = FString::Printf(TEXT("type=%s"), *MakePythonStringLiteral_ExportBpy(TypeStr));
+	if (!Info.FunctionName.IsEmpty())
+	{
+		Args += FString::Printf(TEXT(", name=%s"), *MakePythonStringLiteral_ExportBpy(Info.FunctionName));
+	}
+	if (!Info.ClassName.IsEmpty())
+	{
+		Args += FString::Printf(TEXT(", class_name=%s"), *MakePythonStringLiteral_ExportBpy(Info.ClassName));
+	}
+	if (!Info.TargetType.IsEmpty())
+	{
+		Args += FString::Printf(TEXT(", target_type=%s"), *MakePythonStringLiteral_ExportBpy(Info.TargetType));
+	}
+
+	return FString::Printf(TEXT("%s = g.node(%s)"), *Info.VarName, *Args);
+}
+
+TArray<FString> NodeToDefaultValueLinesForSidecar_ExportBpy(const FNodeInfo& Info)
+{
+	TArray<FString> Lines;
+	for (const TPair<FString, FString>& KV : Info.DefaultValues)
+	{
+		Lines.Add(FString::Printf(
+			TEXT("%s.pin(%s, %s)"),
+			*Info.VarName,
+			*MakePythonStringLiteral_ExportBpy(KV.Key),
+			*FormatPythonValueLiteral_ExportBpy(KV.Value)));
+	}
+	return Lines;
+}
+
+void AssignReadableNamesForSidecar_ExportBpy(TArray<FNodeInfo>& Nodes)
+{
+	TMap<FString, int32> NameCount;
+	for (FNodeInfo& Info : Nodes)
+	{
+		FString BaseName;
+		bool bAlwaysNumber = false;
+
+		if (Info.NodeType == TEXT("K2Node_FunctionEntry"))
+		{
+			BaseName = TEXT("Entry");
+		}
+		else if (Info.NodeType == TEXT("K2Node_FunctionResult"))
+		{
+			BaseName = TEXT("Return");
+			bAlwaysNumber = true;
+		}
+		else if (Info.NodeType == TEXT("K2Node_IfThenElse"))
+		{
+			BaseName = TEXT("Branch");
+			bAlwaysNumber = true;
+		}
+		else if (Info.NodeType == TEXT("K2Node_SwitchEnum"))
+		{
+			BaseName = TEXT("SwitchEnum");
+			bAlwaysNumber = true;
+		}
+		else if (Info.NodeType == TEXT("K2Node_SwitchInteger"))
+		{
+			BaseName = TEXT("SwitchInt");
+			bAlwaysNumber = true;
+		}
+		else if (Info.NodeType == TEXT("K2Node_Select"))
+		{
+			BaseName = TEXT("Select");
+			bAlwaysNumber = true;
+		}
+		else if (Info.NodeType == TEXT("K2Node_BreakStruct"))
+		{
+			BaseName = TEXT("BreakStruct");
+			bAlwaysNumber = true;
+		}
+		else if (Info.NodeType == TEXT("K2Node_MakeStruct"))
+		{
+			BaseName = TEXT("MakeStruct");
+			bAlwaysNumber = true;
+		}
+		else if (Info.NodeType == TEXT("K2Node_DynamicCast"))
+		{
+			BaseName = TEXT("DynamicCast");
+			bAlwaysNumber = true;
+		}
+		else if (Info.NodeType == TEXT("K2Node_ExecutionSequence"))
+		{
+			BaseName = TEXT("Sequence");
+			bAlwaysNumber = true;
+		}
+		else if (Info.NodeType == TEXT("K2Node_VariableSet"))
+		{
+			BaseName = TEXT("Set_") + Info.FunctionName;
+		}
+		else if (!Info.FunctionName.IsEmpty())
+		{
+			BaseName = Info.FunctionName;
+		}
+		else
+		{
+			BaseName = Info.NodeType;
+			BaseName.RemoveFromStart(TEXT("K2Node_"));
+		}
+
+		const FString SafeBase = SanitizePythonIdentifier_ExportBpy(BaseName, TEXT("Node"));
+		int32& Count = NameCount.FindOrAdd(SafeBase);
+		if (bAlwaysNumber)
+		{
+			Info.VarName = FString::Printf(TEXT("%s_%d"), *SafeBase, Count);
+		}
+		else if (Count == 0)
+		{
+			Info.VarName = SafeBase;
+		}
+		else
+		{
+			Info.VarName = FString::Printf(TEXT("%s_%d"), *SafeBase, Count);
+		}
+		++Count;
+	}
+}
+
+bool WriteNestedGraphModule_ExportBpy(
+	const FString& OutDir,
+	const FString& ModuleStem,
+	const TSharedPtr<FJsonObject>& GraphJson,
+	FString& OutError);
+
+bool PrepareNestedGraphSidecars_ExportBpy(
+	const FString& OutDir,
+	const FString& ModuleStem,
+	TMap<FString, int32>& InOutStemCounts,
+	const TSharedPtr<FJsonObject>& SourceGraphJson,
+	TSharedPtr<FJsonObject>& OutGraphJson,
+	TMap<FString, TMap<FString, FString>>& OutExternalizedNodeProps,
+	FString& OutError)
+{
+	OutExternalizedNodeProps.Reset();
+	if (!CloneJsonObject_ExportBpy(SourceGraphJson, OutGraphJson))
+	{
+		OutError = FString::Printf(TEXT("Cannot clone nested graph payload for %s"), *ModuleStem);
+		return false;
+	}
+
+	const TArray<FString> GraphPropKeys = {
+		TEXT("BoundGraphJson"),
+		TEXT("BlendStackGraphJson"),
+		TEXT("StateMachineGraphJson"),
+		TEXT("CustomTransitionGraphJson")
+	};
+
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	if (!OutGraphJson->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes)
+	{
+		return true;
+	}
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *Nodes)
+	{
+		const TSharedPtr<FJsonObject> NodeJson = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+		if (!NodeJson.IsValid())
+		{
+			continue;
+		}
+
+		const TSharedPtr<FJsonObject>* NodePropsPtr = nullptr;
+		if (!NodeJson->TryGetObjectField(TEXT("node_props"), NodePropsPtr) || !NodePropsPtr || !(*NodePropsPtr).IsValid())
+		{
+			continue;
+		}
+		TSharedPtr<FJsonObject> NodePropsJson = *NodePropsPtr;
+
+		const FString NodeUid = GetJsonStringField_ExportBpy(NodeJson, TEXT("uid"));
+		const FString NodeClassName = GetJsonStringField_ExportBpy(NodeJson, TEXT("node_class"));
+		for (const FString& PropKey : GraphPropKeys)
+		{
+			FString NestedGraphText;
+			if (!NodePropsJson->TryGetStringField(PropKey, NestedGraphText) || NestedGraphText.IsEmpty())
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> NestedGraphJson;
+			if (!ParseJsonObject_ExportBpy(NestedGraphText, NestedGraphJson) || !NestedGraphJson.IsValid())
+			{
+				OutError = FString::Printf(
+					TEXT("Cannot parse nested graph payload %s on sidecar %s node %s"),
+					*PropKey,
+					*ModuleStem,
+					*NodeUid);
+				return false;
+			}
+
+			FString NestedGraphName;
+			NestedGraphJson->TryGetStringField(TEXT("name"), NestedGraphName);
+			if (NestedGraphName.IsEmpty())
+			{
+				NestedGraphName = PropKey;
+			}
+
+			const FString DesiredChildModuleStem = BuildNestedGraphModuleStemForJsonNode_ExportBpy(
+				ModuleStem,
+				NodeClassName,
+				NestedGraphName);
+			const FString ChildModuleStem = MakeUniqueNestedGraphModuleStem_ExportBpy(
+				DesiredChildModuleStem,
+				InOutStemCounts);
+			if (!WriteNestedGraphModule_ExportBpy(OutDir, ChildModuleStem, InOutStemCounts, NestedGraphJson, OutError))
+			{
+				return false;
+			}
+
+			NodePropsJson->RemoveField(PropKey);
+			OutExternalizedNodeProps.FindOrAdd(NodeUid).Add(PropKey, ChildModuleStem);
+		}
+	}
+
+	return true;
+}
+
+bool WriteNestedGraphModule_ExportBpy(
+	const FString& OutDir,
+	const FString& ModuleStem,
+	TMap<FString, int32>& InOutStemCounts,
+	const TSharedPtr<FJsonObject>& GraphJson,
+	FString& OutError)
+{
+	if (!GraphJson.IsValid())
+	{
+		OutError = TEXT("Cannot write nested graph sidecar: graph json is invalid");
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> GraphPayloadJson;
+	TMap<FString, TMap<FString, FString>> ExternalizedNodeProps;
+	if (!PrepareNestedGraphSidecars_ExportBpy(OutDir, ModuleStem, InOutStemCounts, GraphJson, GraphPayloadJson, ExternalizedNodeProps, OutError))
+	{
+		return false;
+	}
+
+	const FString GraphName = GetJsonStringField_ExportBpy(GraphPayloadJson, TEXT("name"), ModuleStem);
+	const FString GraphGuid = GetJsonStringField_ExportBpy(GraphPayloadJson, TEXT("graph_guid"));
+	const FString GraphOuter = GetJsonStringField_ExportBpy(GraphPayloadJson, TEXT("graph_outer"));
+	const FString GraphType = GetJsonStringField_ExportBpy(GraphPayloadJson, TEXT("graph_type"), TEXT("event_graph"));
+	const FString GraphCategory = GetJsonStringField_ExportBpy(GraphPayloadJson, TEXT("category"));
+	const bool bIsPure = GraphPayloadJson->HasField(TEXT("is_pure")) ? GraphPayloadJson->GetBoolField(TEXT("is_pure")) : false;
+	const bool bThreadSafe = GraphPayloadJson->HasField(TEXT("thread_safe")) ? GraphPayloadJson->GetBoolField(TEXT("thread_safe")) : false;
+
+	FString InputsLiteral;
+	const TArray<TSharedPtr<FJsonValue>>* InputsArray = nullptr;
+	if (GraphPayloadJson->TryGetArrayField(TEXT("inputs"), InputsArray) && InputsArray)
+	{
+		bool bFirst = true;
+		for (const TSharedPtr<FJsonValue>& InputValue : *InputsArray)
+		{
+			const TSharedPtr<FJsonObject> InputObj = InputValue.IsValid() ? InputValue->AsObject() : nullptr;
+			if (!InputObj.IsValid())
+			{
+				continue;
+			}
+
+			if (!bFirst)
+			{
+				InputsLiteral += TEXT(", ");
+			}
+			InputsLiteral += FString::Printf(
+				TEXT("(%s, %s)"),
+				*MakePythonStringLiteral_ExportBpy(GetJsonStringField_ExportBpy(InputObj, TEXT("name"))),
+				*MakePythonStringLiteral_ExportBpy(GetJsonStringField_ExportBpy(InputObj, TEXT("type"))));
+			bFirst = false;
+		}
+	}
+
+	FString OutputsLiteral;
+	const TArray<TSharedPtr<FJsonValue>>* OutputsArray = nullptr;
+	if (GraphPayloadJson->TryGetArrayField(TEXT("outputs"), OutputsArray) && OutputsArray)
+	{
+		bool bFirst = true;
+		for (const TSharedPtr<FJsonValue>& OutputValue : *OutputsArray)
+		{
+			const TSharedPtr<FJsonObject> OutputObj = OutputValue.IsValid() ? OutputValue->AsObject() : nullptr;
+			if (!OutputObj.IsValid())
+			{
+				continue;
+			}
+
+			if (!bFirst)
+			{
+				OutputsLiteral += TEXT(", ");
+			}
+			OutputsLiteral += FString::Printf(
+				TEXT("(%s, %s)"),
+				*MakePythonStringLiteral_ExportBpy(GetJsonStringField_ExportBpy(OutputObj, TEXT("name"))),
+				*MakePythonStringLiteral_ExportBpy(GetJsonStringField_ExportBpy(OutputObj, TEXT("type"))));
+			bFirst = false;
+		}
+	}
+
+	TArray<FNodeInfo> NodeInfos;
+	TArray<FString> NodeUids;
+	TMap<FString, FString> NodeVarByUid;
+	const TArray<TSharedPtr<FJsonValue>>* NodesArray = nullptr;
+	if (GraphPayloadJson->TryGetArrayField(TEXT("nodes"), NodesArray) && NodesArray)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArray)
+		{
+			const TSharedPtr<FJsonObject> NodeJson = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			FNodeInfo Info;
+			FString NodeUid;
+			if (!BuildNodeInfoFromSerializedJson_ExportBpy(NodeJson, Info, NodeUid))
+			{
+				continue;
+			}
+			NodeInfos.Add(Info);
+			NodeUids.Add(NodeUid);
+		}
+	}
+
+	AssignReadableNamesForSidecar_ExportBpy(NodeInfos);
+	for (int32 Index = 0; Index < NodeInfos.Num() && Index < NodeUids.Num(); ++Index)
+	{
+		NodeVarByUid.Add(NodeUids[Index], NodeInfos[Index].VarName);
+	}
+
+	FString Content;
+	Content += TEXT("# Auto-generated by ExportBpy\n");
+	Content += TEXT("import importlib.util\n");
+	Content += TEXT("import os\n");
+	Content += TEXT("from ue_bp_dsl import *\n\n");
+	if (!ExternalizedNodeProps.IsEmpty())
+	{
+		Content += TEXT("def _load_sidecar_graph(stem):\n");
+		Content += TEXT("    path = os.path.join(os.path.dirname(__file__), f\"{stem}.bp.py\")\n");
+		Content += TEXT("    spec = importlib.util.spec_from_file_location(f\"_exportbpy_sidecar_{stem}\", path)\n");
+		Content += TEXT("    if spec is None or spec.loader is None:\n");
+		Content += TEXT("        raise ImportError(f\"Cannot load sidecar graph module: {path}\")\n");
+		Content += TEXT("    module = importlib.util.module_from_spec(spec)\n");
+		Content += TEXT("    spec.loader.exec_module(module)\n");
+		Content += TEXT("    return getattr(module, \"GRAPH\")\n\n");
+	}
+	Content += TEXT("def _build_graph():\n");
+	Content += FString::Printf(
+		TEXT("    bp = Blueprint(path=%s, parent=%s, bp_type=%s, name=%s)\n"),
+		*MakePythonStringLiteral_ExportBpy(TEXT("/Engine/Transient/ExportBpyNested")),
+		*MakePythonStringLiteral_ExportBpy(TEXT("/Script/CoreUObject.Object")),
+		*MakePythonStringLiteral_ExportBpy(TEXT("Normal")),
+		*MakePythonStringLiteral_ExportBpy(GraphName));
+
+	FString ContextHeader;
+	if (GraphType == TEXT("function"))
+	{
+		FString Args = MakePythonStringLiteral_ExportBpy(GraphName);
+		if (!InputsLiteral.IsEmpty())
+		{
+			Args += FString::Printf(TEXT(", inputs=[%s]"), *InputsLiteral);
+		}
+		if (!OutputsLiteral.IsEmpty())
+		{
+			Args += FString::Printf(TEXT(", outputs=[%s]"), *OutputsLiteral);
+		}
+		if (bIsPure)
+		{
+			Args += TEXT(", pure=True");
+		}
+		if (bThreadSafe)
+		{
+			Args += TEXT(", thread_safe=True");
+		}
+		if (!GraphCategory.IsEmpty())
+		{
+			Args += FString::Printf(TEXT(", category=%s"), *MakePythonStringLiteral_ExportBpy(GraphCategory));
+		}
+		ContextHeader = FString::Printf(TEXT("with bp.function(%s) as g:"), *Args);
+	}
+	else if (GraphType == TEXT("macro"))
+	{
+		FString Args = MakePythonStringLiteral_ExportBpy(GraphName);
+		if (!InputsLiteral.IsEmpty())
+		{
+			Args += FString::Printf(TEXT(", inputs=[%s]"), *InputsLiteral);
+		}
+		if (!OutputsLiteral.IsEmpty())
+		{
+			Args += FString::Printf(TEXT(", outputs=[%s]"), *OutputsLiteral);
+		}
+		ContextHeader = FString::Printf(TEXT("with bp.macro(%s) as g:"), *Args);
+	}
+	else
+	{
+		ContextHeader = FString::Printf(TEXT("with bp.event_graph(%s) as g:"), *MakePythonStringLiteral_ExportBpy(GraphName));
+	}
+	Content += TEXT("    ") + ContextHeader + TEXT("\n");
+
+	if (NodeInfos.IsEmpty())
+	{
+		Content += TEXT("        pass\n");
+	}
+	else
+	{
+		Content += TEXT("        # Nodes\n");
+		for (int32 Index = 0; Index < NodeInfos.Num(); ++Index)
+		{
+			const FNodeInfo& Info = NodeInfos[Index];
+			const FString& NodeUid = NodeUids.IsValidIndex(Index) ? NodeUids[Index] : FString();
+			Content += TEXT("        ") + AppendPosArgToCtorLine_ExportBpy(NodeToCtorLineForSidecar_ExportBpy(Info), Info.Position) + TEXT("\n");
+			if (!Info.NodeGuid.IsEmpty())
+			{
+				Content += FString::Printf(
+					TEXT("        %s.set_node_guid(%s)\n"),
+					*Info.VarName,
+					*MakePythonStringLiteral_ExportBpy(Info.NodeGuid));
+			}
+
+			for (const FString& DefaultLine : NodeToDefaultValueLinesForSidecar_ExportBpy(Info))
+			{
+				Content += TEXT("        ") + DefaultLine + TEXT("\n");
+			}
+
+			auto AppendSortedSetterLines = [&](const TMap<FString, FString>& Map, const FString& MethodName)
+			{
+				TArray<FString> Keys;
+				Map.GetKeys(Keys);
+				Keys.Sort();
+				for (const FString& Key : Keys)
+				{
+					const FString* Value = Map.Find(Key);
+					if (!Value)
+					{
+						continue;
+					}
+
+					Content += FString::Printf(
+						TEXT("        %s.%s(%s, %s)\n"),
+						*Info.VarName,
+						*MethodName,
+						*MakePythonStringLiteral_ExportBpy(Key),
+						*MakePythonStringLiteral_ExportBpy(*Value));
+				}
+			};
+
+			AppendSortedSetterLines(Info.InputPinTypes, TEXT("set_input_pin_type"));
+			AppendSortedSetterLines(Info.OutputPinTypes, TEXT("set_output_pin_type"));
+			AppendSortedSetterLines(Info.PinAliases, TEXT("set_pin_alias"));
+			AppendSortedSetterLines(Info.PinIds, TEXT("set_pin_id"));
+
+			TArray<FString> PropKeys;
+			Info.NodeProps.GetKeys(PropKeys);
+			PropKeys.Sort();
+			for (const FString& PropKey : PropKeys)
+			{
+				const FString* PropValue = Info.NodeProps.Find(PropKey);
+				if (!PropValue)
+				{
+					continue;
+				}
+
+				Content += FString::Printf(
+					TEXT("        %s.set_extra_prop(%s, %s)\n"),
+					*Info.VarName,
+					*MakePythonStringLiteral_ExportBpy(PropKey),
+					*FormatPythonValueLiteral_ExportBpy(*PropValue));
+			}
+
+			if (const TMap<FString, FString>* NestedProps = ExternalizedNodeProps.Find(NodeUid))
+			{
+				TArray<FString> NestedKeys;
+				NestedProps->GetKeys(NestedKeys);
+				NestedKeys.Sort();
+				for (const FString& PropKey : NestedKeys)
+				{
+					const FString* ModuleName = NestedProps->Find(PropKey);
+					if (!ModuleName || ModuleName->IsEmpty())
+					{
+						continue;
+					}
+
+					Content += FString::Printf(
+						TEXT("        %s.set_extra_prop(%s, nested_graph_prop(_load_sidecar_graph(%s)))\n"),
+						*Info.VarName,
+						*MakePythonStringLiteral_ExportBpy(PropKey),
+						*MakePythonStringLiteral_ExportBpy(*ModuleName));
+				}
+			}
+		}
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* ConnectionsArray = nullptr;
+	if (GraphPayloadJson->TryGetArrayField(TEXT("connections"), ConnectionsArray) && ConnectionsArray && ConnectionsArray->Num() > 0)
+	{
+		Content += TEXT("\n        # Connections\n");
+		TSet<FString> SeenConnections;
+		for (const TSharedPtr<FJsonValue>& ConnectionValue : *ConnectionsArray)
+		{
+			const TSharedPtr<FJsonObject> ConnectionObject = ConnectionValue.IsValid() ? ConnectionValue->AsObject() : nullptr;
+			if (!ConnectionObject.IsValid())
+			{
+				continue;
+			}
+
+			const FString SrcUid = GetJsonStringField_ExportBpy(ConnectionObject, TEXT("src_node"));
+			const FString DstUid = GetJsonStringField_ExportBpy(ConnectionObject, TEXT("dst_node"));
+			const FString SrcPin = GetJsonStringField_ExportBpy(ConnectionObject, TEXT("src_pin"));
+			const FString DstPin = GetJsonStringField_ExportBpy(ConnectionObject, TEXT("dst_pin"));
+			const FString* SrcVar = NodeVarByUid.Find(SrcUid);
+			const FString* DstVar = NodeVarByUid.Find(DstUid);
+			if (!SrcVar || !DstVar || SrcPin.IsEmpty() || DstPin.IsEmpty())
+			{
+				continue;
+			}
+
+			const FString ConnectionLine =
+				BuildSerializedPinRef_ExportBpy(*SrcVar, SrcPin) +
+				TEXT(" >> ") +
+				BuildSerializedPinRef_ExportBpy(*DstVar, DstPin);
+			if (SeenConnections.Contains(ConnectionLine))
+			{
+				continue;
+			}
+			SeenConnections.Add(ConnectionLine);
+			Content += TEXT("        ") + ConnectionLine + TEXT("\n");
+		}
+	}
+
+	Content += TEXT("\n");
+	Content += TEXT("    graph = bp.to_dict()[\"graphs\"][0]\n");
+	Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+		*MakePythonStringLiteral_ExportBpy(TEXT("name")),
+		*MakePythonStringLiteral_ExportBpy(GraphName));
+	Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+		*MakePythonStringLiteral_ExportBpy(TEXT("graph_type")),
+		*MakePythonStringLiteral_ExportBpy(GraphType));
+	if (InputsArray && InputsArray->Num() > 0)
+	{
+		Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+			*MakePythonStringLiteral_ExportBpy(TEXT("inputs")),
+			*JsonArrayToPythonLiteral_ExportBpy(*InputsArray, 0));
+	}
+	if (OutputsArray && OutputsArray->Num() > 0)
+	{
+		Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+			*MakePythonStringLiteral_ExportBpy(TEXT("outputs")),
+			*JsonArrayToPythonLiteral_ExportBpy(*OutputsArray, 0));
+	}
+	if (!GraphGuid.IsEmpty())
+	{
+		Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+			*MakePythonStringLiteral_ExportBpy(TEXT("graph_guid")),
+			*MakePythonStringLiteral_ExportBpy(GraphGuid));
+	}
+	if (!GraphOuter.IsEmpty())
+	{
+		Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+			*MakePythonStringLiteral_ExportBpy(TEXT("graph_outer")),
+			*MakePythonStringLiteral_ExportBpy(GraphOuter));
+	}
+	if (!GraphCategory.IsEmpty())
+	{
+		Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+			*MakePythonStringLiteral_ExportBpy(TEXT("category")),
+			*MakePythonStringLiteral_ExportBpy(GraphCategory));
+	}
+	Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+		*MakePythonStringLiteral_ExportBpy(TEXT("is_pure")),
+		bIsPure ? TEXT("True") : TEXT("False"));
+	Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+		*MakePythonStringLiteral_ExportBpy(TEXT("thread_safe")),
+		bThreadSafe ? TEXT("True") : TEXT("False"));
+
+	const TSharedPtr<FJsonObject>* MetadataObject = nullptr;
+	if (GraphPayloadJson->TryGetObjectField(TEXT("metadata"), MetadataObject) && MetadataObject && (*MetadataObject).IsValid() && (*MetadataObject)->Values.Num() > 0)
+	{
+		Content += FString::Printf(TEXT("    graph[%s] = %s\n"),
+			*MakePythonStringLiteral_ExportBpy(TEXT("metadata")),
+			*JsonObjectToPythonLiteral_ExportBpy(*MetadataObject, 0));
+	}
+	Content += TEXT("    return graph\n\n");
+	Content += TEXT("GRAPH = _build_graph()\n");
+
+	const FString OutPath = FPaths::Combine(OutDir, ModuleStem + TEXT(".bp.py"));
+	if (!FFileHelper::SaveStringToFile(Content, *OutPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		OutError = FString::Printf(TEXT("Cannot write nested graph sidecar %s"), *OutPath);
+		return false;
+	}
+
+	return true;
+}
 FString BuildModuleName_ExportBpy(const FString& Prefix, const FString& GraphName)
 {
 	return Prefix + SanitizePythonIdentifier_ExportBpy(GraphName, TEXT("graph"));
@@ -3270,6 +4381,14 @@ bool UBPDirectExporter::ExportBlueprintToPy(
 	const FString BPName = FPaths::GetBaseFilename(BlueprintPath);
 	const FString BPOutDir = FPaths::Combine(OutputDir, BPName);
 	IFileManager::Get().MakeDirectory(*BPOutDir, true);
+	{
+		TArray<FString> ExistingSidecarFiles;
+		IFileManager::Get().FindFiles(ExistingSidecarFiles, *(FPaths::Combine(BPOutDir, TEXT("other_*.bp.py"))), true, false);
+		for (const FString& FileName : ExistingSidecarFiles)
+		{
+			IFileManager::Get().Delete(*(FPaths::Combine(BPOutDir, FileName)), false, true);
+		}
+	}
 
 	auto AppendConnectionSections = [&](const TArray<UK2Node*>& SourceNodes, const TArray<FNodeInfo>& NodeInfos, const TMap<UK2Node*, FString>& NodeVarMap, FString& InOutLines)
 	{
@@ -4235,6 +5354,69 @@ bool UBPDirectExporter::GenerateGraphFile(
 		}
 	}
 
+	// ── Determine graph context header ─────────────────────────────────────────
+	UBlueprint* OwnerBP = Cast<UBlueprint>(Graph->GetOuter());
+	const FString RootGraphType = GetRootGraphType_ExportBpy(OwnerBP, Graph);
+	const bool bIsFunction = RootGraphType == TEXT("function");
+	const bool bIsMacro = RootGraphType == TEXT("macro");
+
+	FString GraphName = Graph->GetName();
+	OutModuleName = BuildModuleName_ExportBpy(Prefix, GraphName);
+	const FString MetaModuleName = OutModuleName + TEXT("_meta");
+	TMap<FString, TMap<FString, FString>> ExternalizedNodePropModules;
+	TMap<FString, int32> NestedModuleStemCounts;
+	for (FNodeInfo& Info : NodeInfos)
+	{
+		TArray<FString> PropKeys;
+		Info.NodeProps.GetKeys(PropKeys);
+		PropKeys.Sort();
+		for (const FString& PropKey : PropKeys)
+		{
+			if (!ShouldExternalizeNodeProp_ExportBpy(PropKey))
+			{
+				continue;
+			}
+
+			const FString* JsonText = Info.NodeProps.Find(PropKey);
+			if (!JsonText || JsonText->IsEmpty())
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> NestedGraphJson;
+			if (!ParseJsonObject_ExportBpy(*JsonText, NestedGraphJson) || !NestedGraphJson.IsValid())
+			{
+				continue;
+			}
+
+			FString NestedGraphName;
+			NestedGraphJson->TryGetStringField(TEXT("name"), NestedGraphName);
+			if (NestedGraphName.IsEmpty())
+			{
+				NestedGraphName = PropKey;
+			}
+
+			const FString DesiredModuleStem = BuildNestedGraphModuleStem_ExportBpy(
+				OutModuleName,
+				Info.NodeType,
+				NestedGraphName);
+			const FString ModuleStem = MakeUniqueNestedGraphModuleStem_ExportBpy(
+				DesiredModuleStem,
+				NestedModuleStemCounts);
+			if (!WriteNestedGraphModule_ExportBpy(
+				OutDir,
+				ModuleStem,
+				NestedModuleStemCounts,
+				NestedGraphJson,
+				OutError))
+			{
+				return false;
+			}
+
+			ExternalizedNodePropModules.FindOrAdd(Info.VarName).Add(PropKey, ModuleStem);
+		}
+	}
+
 	TMap<UK2Node*, FString> NodeVarMap;
 	TMap<FString, FString> NodeGuidMap;
 	TMap<FString, FVector2D> NodePosMap;
@@ -4267,19 +5449,20 @@ bool UBPDirectExporter::GenerateGraphFile(
 		}
 		if (NodeInfos[i].NodeProps.Num() > 0)
 		{
-			NodePropsMap.Add(NodeInfos[i].VarName, NodeInfos[i].NodeProps);
+			TMap<FString, FString> FilteredNodeProps = NodeInfos[i].NodeProps;
+			if (const TMap<FString, FString>* ExternalizedProps = ExternalizedNodePropModules.Find(NodeInfos[i].VarName))
+			{
+				for (const TPair<FString, FString>& ExternalizedEntry : *ExternalizedProps)
+				{
+					FilteredNodeProps.Remove(ExternalizedEntry.Key);
+				}
+			}
+			if (FilteredNodeProps.Num() > 0)
+			{
+				NodePropsMap.Add(NodeInfos[i].VarName, FilteredNodeProps);
+			}
 		}
 	}
-
-	// ── Determine graph context header ─────────────────────────────────────────
-	UBlueprint* OwnerBP = Cast<UBlueprint>(Graph->GetOuter());
-	const FString RootGraphType = GetRootGraphType_ExportBpy(OwnerBP, Graph);
-	const bool bIsFunction = RootGraphType == TEXT("function");
-	const bool bIsMacro = RootGraphType == TEXT("macro");
-
-	FString GraphName = Graph->GetName();
-	OutModuleName = BuildModuleName_ExportBpy(Prefix, GraphName);
-	const FString MetaModuleName = OutModuleName + TEXT("_meta");
 
 	FString Lines;
 	Lines += TEXT("# Auto-generated by ExportBpy\n");
@@ -4287,6 +5470,14 @@ bool UBPDirectExporter::GenerateGraphFile(
 	Lines += TEXT("import os\n");
 	Lines += TEXT("from ue_bp_dsl import *\n");
 	Lines += TEXT("\n");
+	Lines += TEXT("def _load_sidecar_graph(stem):\n");
+	Lines += TEXT("    path = os.path.join(os.path.dirname(__file__), f\"{stem}.bp.py\")\n");
+	Lines += TEXT("    spec = importlib.util.spec_from_file_location(f\"_exportbpy_sidecar_{stem}\", path)\n");
+	Lines += TEXT("    if spec is None or spec.loader is None:\n");
+	Lines += TEXT("        raise ImportError(f\"Cannot load sidecar graph module: {path}\")\n");
+	Lines += TEXT("    module = importlib.util.module_from_spec(spec)\n");
+	Lines += TEXT("    spec.loader.exec_module(module)\n");
+	Lines += TEXT("    return getattr(module, \"GRAPH\")\n\n");
 	Lines += TEXT("def _load_meta():\n");
 	Lines += FString::Printf(TEXT("    meta_path = os.path.join(os.path.dirname(__file__), %s)\n"), *MakePythonStringLiteral_ExportBpy(MetaModuleName + TEXT(".py")));
 	Lines += FString::Printf(TEXT("    spec = importlib.util.spec_from_file_location(%s, meta_path)\n"), *MakePythonStringLiteral_ExportBpy(TEXT("_exportbpy_meta_") + MetaModuleName));
@@ -4549,6 +5740,26 @@ bool UBPDirectExporter::GenerateGraphFile(
 			for (const FString& ExtraPropLine : InlineExtraPropLines_ExportBpy(Info))
 			{
 				Lines += TEXT("        ") + ExtraPropLine + TEXT("\n");
+			}
+			if (const TMap<FString, FString>* ExternalizedProps = ExternalizedNodePropModules.Find(Info.VarName))
+			{
+				TArray<FString> ExternalizedKeys;
+				ExternalizedProps->GetKeys(ExternalizedKeys);
+				ExternalizedKeys.Sort();
+				for (const FString& PropKey : ExternalizedKeys)
+				{
+					const FString* ModuleStem = ExternalizedProps->Find(PropKey);
+					if (!ModuleStem || ModuleStem->IsEmpty())
+					{
+						continue;
+					}
+
+					Lines += FString::Printf(
+						TEXT("        %s.set_extra_prop(%s, nested_graph_prop(_load_sidecar_graph(%s)))\n"),
+						*Info.VarName,
+						*MakePythonStringLiteral_ExportBpy(PropKey),
+						*MakePythonStringLiteral_ExportBpy(*ModuleStem));
+				}
 			}
 		}
 		Lines += TEXT("\n");
@@ -5748,3 +6959,4 @@ TArray<TSharedPtr<FJsonValue>> UBPDirectExporter::SerializeConnections(UEdGraph*
 
 	return Result;
 }
+

@@ -31,6 +31,13 @@ GRAPH_PREFIXES = ("evt_", "fn_", "macro_", "tl_")
 MAIN_BP_FILE = "__bp__.bp.py"
 
 
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    raw_value = str(os.environ.get(name, "")).strip().lower()
+    if not raw_value:
+        return bool(default)
+    return raw_value in {"1", "true", "yes", "on"}
+
+
 def _begin_local_python_package_import(package_root: str) -> Tuple[List[str], Dict[str, Any]]:
     plugin_python_dir = os.path.dirname(os.path.abspath(__file__))
     original_sys_path = list(sys.path)
@@ -446,6 +453,11 @@ def _import_blueprint_object_with_details(
     disable_py_post_repair = str(
         os.environ.get("EXPORTBPY_DISABLE_PY_POST_REPAIR", "")
     ).strip().lower() in {"1", "true", "yes", "on"}
+    enable_py_post_save = _env_flag_enabled("EXPORTBPY_ENABLE_PY_POST_SAVE", default=False)
+    enable_py_import_validation = _env_flag_enabled(
+        "EXPORTBPY_ENABLE_PY_IMPORT_VALIDATION",
+        default=False,
+    )
     run_legacy_post_import_repairs = (
         not disable_py_post_repair
         and (
@@ -504,25 +516,37 @@ def _import_blueprint_object_with_details(
             and delegate_restore_ok
             and delegate_recompile_ok
             and delegate_final_restore_ok
+            and enable_py_post_save
         ):
             _save_asset_if_possible(bridge_asset_path)
-    elif ok:
+    elif ok and enable_py_post_save:
         _save_asset_if_possible(bridge_asset_path)
 
-    validation_summary = (
-        _validate_imported_blueprint(asset_path, payload, preflight_stats=preflight_stats)
-        if ok
-        else {}
-    )
-    if ok and validation_summary.get("missing_components"):
-        _save_asset_if_possible(bridge_asset_path)
-        retried_summary = _validate_imported_blueprint(
+    if ok and enable_py_import_validation:
+        validation_summary = _validate_imported_blueprint(
             asset_path,
             payload,
             preflight_stats=preflight_stats,
         )
-        if retried_summary:
-            validation_summary = retried_summary
+        if ok and validation_summary.get("missing_components"):
+            if enable_py_post_save:
+                _save_asset_if_possible(bridge_asset_path)
+            retried_summary = _validate_imported_blueprint(
+                asset_path,
+                payload,
+                preflight_stats=preflight_stats,
+            )
+            if retried_summary:
+                validation_summary = retried_summary
+    elif ok:
+        validation_summary = {
+            "ok": True,
+            "warnings": [
+                "python import validation skipped; set EXPORTBPY_ENABLE_PY_IMPORT_VALIDATION=1 to enable"
+            ],
+        }
+    else:
+        validation_summary = {}
     if validation_summary and isinstance(validation_summary, dict):
         validation_warnings = validation_summary.get("warnings")
         if not isinstance(validation_warnings, list):

@@ -25,6 +25,7 @@ from .core import (
     vec3,
     struct,
     enum,
+    nested_graph_prop,
 )
 
 __all__ = [
@@ -43,4 +44,5 @@ __all__ = [
     "vec3",
     "struct",
     "enum",
+    "nested_graph_prop",
 ]

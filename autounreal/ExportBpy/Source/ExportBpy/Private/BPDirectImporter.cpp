@@ -157,8 +157,16 @@ bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
 	bool bStrict,
 	FString& OutError);
 bool RestoreStateMachineAliasNodesAfterCreation_ImportBpy(
+	UBlueprint* BP,
+	UEdGraph* Graph,
 	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
 	const TMap<FString, UEdGraphNode*>& NodeMap,
+	FString& OutError);
+bool ReplayStateMachineAliasNodesFromGraphJsonText_ImportBpy(
+	UBlueprint* BP,
+	UEdGraph* Graph,
+	const FString& GraphJsonText,
+	const TCHAR* StageTag,
 	FString& OutError);
 FString DescribePinType_ImportBpy(const FEdGraphPinType& PinType);
 bool TryParseGuid_ImportBpy(const FString& GuidText, FGuid& OutGuid);
@@ -5091,6 +5099,115 @@ void SetUseCachedPoseNameOfCache_ImportBpy(UAnimGraphNode_UseCachedPose* UseCach
 	}
 }
 
+FString GetSerializedCachePoseNameFromNodeProps_ImportBpy(const TSharedPtr<FJsonObject>& NodePropsObj)
+{
+	if (!NodePropsObj.IsValid())
+	{
+		return FString();
+	}
+
+	FString CachePoseName;
+	if (!NodePropsObj->TryGetStringField(TEXT("CachePoseName"), CachePoseName) || CachePoseName.IsEmpty())
+	{
+		NodePropsObj->TryGetStringField(TEXT("CacheName"), CachePoseName);
+	}
+	return CachePoseName;
+}
+
+void LogCachedPoseNodeSnapshot_ImportBpy(UEdGraphNode* Node, const TCHAR* Phase)
+{
+	if (!Node)
+	{
+		return;
+	}
+
+	if (UAnimGraphNode_SaveCachedPose* SaveCachedPoseNode = Cast<UAnimGraphNode_SaveCachedPose>(Node))
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag][CachedPose][%s] save graph=%s node=%s cache_name=%s node_cache_pose_name=%s"),
+			Phase ? Phase : TEXT("unknown"),
+			Node->GetGraph() ? *Node->GetGraph()->GetName() : TEXT("<null>"),
+			*DescribeNode_ImportBpy(Node),
+			*SaveCachedPoseNode->CacheName,
+			*SaveCachedPoseNode->Node.CachePoseName.ToString());
+		return;
+	}
+
+	if (UAnimGraphNode_UseCachedPose* UseCachedPoseNode = Cast<UAnimGraphNode_UseCachedPose>(Node))
+	{
+		FString NameOfCache;
+		if (const FStrProperty* NameOfCacheProperty =
+				FindFProperty<FStrProperty>(UAnimGraphNode_UseCachedPose::StaticClass(), TEXT("NameOfCache")))
+		{
+			NameOfCache = NameOfCacheProperty->GetPropertyValue_InContainer(UseCachedPoseNode);
+		}
+
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag][CachedPose][%s] use graph=%s node=%s node_cache_pose_name=%s name_of_cache=%s save_node=%s"),
+			Phase ? Phase : TEXT("unknown"),
+			Node->GetGraph() ? *Node->GetGraph()->GetName() : TEXT("<null>"),
+			*DescribeNode_ImportBpy(Node),
+			*UseCachedPoseNode->Node.CachePoseName.ToString(),
+			*NameOfCache,
+			UseCachedPoseNode->SaveCachedPoseNode.IsValid()
+				? *DescribeNode_ImportBpy(UseCachedPoseNode->SaveCachedPoseNode.Get())
+				: TEXT("<null>"));
+	}
+}
+
+void ReplayCachedPoseNodeState_ImportBpy(UEdGraphNode* Node, const TSharedPtr<FJsonObject>& NodePropsObj)
+{
+	if (!Node || !NodePropsObj.IsValid())
+	{
+		return;
+	}
+
+	const FString CachePoseName = GetSerializedCachePoseNameFromNodeProps_ImportBpy(NodePropsObj);
+	if (CachePoseName.IsEmpty())
+	{
+		return;
+	}
+
+	if (UAnimGraphNode_SaveCachedPose* SaveCachedPoseNode = Cast<UAnimGraphNode_SaveCachedPose>(Node))
+	{
+		SaveCachedPoseNode->CacheName = CachePoseName;
+		SaveCachedPoseNode->Node.CachePoseName = FName(*CachePoseName);
+		return;
+	}
+
+	if (UAnimGraphNode_UseCachedPose* UseCachedPoseNode = Cast<UAnimGraphNode_UseCachedPose>(Node))
+	{
+		UseCachedPoseNode->Node.CachePoseName = FName(*CachePoseName);
+		SetUseCachedPoseNameOfCache_ImportBpy(UseCachedPoseNode, CachePoseName);
+	}
+}
+
+void LogCachedPoseGraphSnapshot_ImportBpy(UEdGraph* Graph, const TCHAR* Phase)
+{
+	if (!Graph)
+	{
+		return;
+	}
+
+	TArray<UAnimGraphNode_SaveCachedPose*> SaveCachedPoseNodes;
+	Graph->GetNodesOfClass(SaveCachedPoseNodes);
+	for (UAnimGraphNode_SaveCachedPose* SaveCachedPoseNode : SaveCachedPoseNodes)
+	{
+		LogCachedPoseNodeSnapshot_ImportBpy(SaveCachedPoseNode, Phase);
+	}
+
+	TArray<UAnimGraphNode_UseCachedPose*> UseCachedPoseNodes;
+	Graph->GetNodesOfClass(UseCachedPoseNodes);
+	for (UAnimGraphNode_UseCachedPose* UseCachedPoseNode : UseCachedPoseNodes)
+	{
+		LogCachedPoseNodeSnapshot_ImportBpy(UseCachedPoseNode, Phase);
+	}
+}
+
 void ResolveUseCachedPoseLinksInGraph_ImportBpy(UEdGraph* Graph)
 {
 	if (!Graph)
@@ -9520,32 +9637,16 @@ bool ApplyNodeProps_ImportBpy(
 
 	if (UAnimGraphNode_SaveCachedPose* SaveCachedPoseNode = Cast<UAnimGraphNode_SaveCachedPose>(Node))
 	{
-		FString CachePoseName;
-		if (!(*NodePropsObj)->TryGetStringField(TEXT("CachePoseName"), CachePoseName) || CachePoseName.IsEmpty())
-		{
-			(*NodePropsObj)->TryGetStringField(TEXT("CacheName"), CachePoseName);
-		}
-
-		if (!CachePoseName.IsEmpty())
-		{
-			SaveCachedPoseNode->CacheName = CachePoseName;
-			SaveCachedPoseNode->Node.CachePoseName = FName(*CachePoseName);
-		}
+		ReplayCachedPoseNodeState_ImportBpy(SaveCachedPoseNode, *NodePropsObj);
+		LogCachedPoseNodeSnapshot_ImportBpy(SaveCachedPoseNode, TEXT("pre_reconstruct_seed"));
+		bNeedsReconstruct = true;
 	}
 
 	if (UAnimGraphNode_UseCachedPose* UseCachedPoseNode = Cast<UAnimGraphNode_UseCachedPose>(Node))
 	{
-		FString CachePoseName;
-		if (!(*NodePropsObj)->TryGetStringField(TEXT("CachePoseName"), CachePoseName) || CachePoseName.IsEmpty())
-		{
-			(*NodePropsObj)->TryGetStringField(TEXT("CacheName"), CachePoseName);
-		}
-
-		if (!CachePoseName.IsEmpty())
-		{
-			UseCachedPoseNode->Node.CachePoseName = FName(*CachePoseName);
-			SetUseCachedPoseNameOfCache_ImportBpy(UseCachedPoseNode, CachePoseName);
-		}
+		ReplayCachedPoseNodeState_ImportBpy(UseCachedPoseNode, *NodePropsObj);
+		LogCachedPoseNodeSnapshot_ImportBpy(UseCachedPoseNode, TEXT("pre_reconstruct_seed"));
+		bNeedsReconstruct = true;
 	}
 
 	if (!bDeferNestedGraphImports)
@@ -9756,6 +9857,16 @@ bool ApplyNodeProps_ImportBpy(
 					NestedBlueprint,
 					StateMachineNode->EditorStateMachineGraph,
 					StateMachineGraphJsonTextPostReconstruct,
+					OutError))
+			{
+				return false;
+			}
+
+			if (!ReplayStateMachineAliasNodesFromGraphJsonText_ImportBpy(
+					NestedBlueprint,
+					StateMachineNode->EditorStateMachineGraph,
+					StateMachineGraphJsonTextPostReconstruct,
+					TEXT("StateMachineNestedReplay"),
 					OutError))
 			{
 				return false;
@@ -10097,7 +10208,9 @@ bool ApplyNodeProps_ImportBpy(
 
 		if (bAllowReconstruct)
 		{
+			LogCachedPoseNodeSnapshot_ImportBpy(Node, TEXT("before_reconstruct"));
 			Node->ReconstructNode();
+			LogCachedPoseNodeSnapshot_ImportBpy(Node, TEXT("after_reconstruct"));
 			if (IsGetSubsystemNode_ImportBpy(Node))
 			{
 				if (!ApplyGetSubsystemClassToNode_ImportBpy(Node, NodeJson, OutError))
@@ -10129,6 +10242,9 @@ bool ApplyNodeProps_ImportBpy(
 					ApplyJsonValueToProperty_ImportBpy(Node, Property, JsonValue);
 				}
 			}
+
+			ReplayCachedPoseNodeState_ImportBpy(Node, *NodePropsObj);
+			LogCachedPoseNodeSnapshot_ImportBpy(Node, TEXT("after_cached_pose_replay_post_reconstruct"));
 		}
 
 		if (!ReplayNestedGraphsPostReconstruct())
@@ -10194,6 +10310,13 @@ bool ApplyNodeProps_ImportBpy(
 		{
 			return false;
 		}
+	}
+
+	if (Cast<UAnimGraphNode_SaveCachedPose>(Node) || Cast<UAnimGraphNode_UseCachedPose>(Node))
+	{
+		ReplayCachedPoseNodeState_ImportBpy(Node, *NodePropsObj);
+		ResolveUseCachedPoseLinksInGraph_ImportBpy(Node->GetGraph());
+		LogCachedPoseNodeSnapshot_ImportBpy(Node, TEXT("after_graph_cached_pose_resolve"));
 	}
 
 	RemoveUnlinkedOrphanPins_ImportBpy(Node);
@@ -12270,7 +12393,98 @@ void AssignAnimationGraphResultNode_ImportBpy(UEdGraph* Graph, UEdGraphNode* Nod
 	}
 }
 
+FString NormalizeAliasedStateUidList_ImportBpy(const FString& AliasedStateUids)
+{
+	TArray<FString> AliasedUidList;
+	AliasedStateUids.ParseIntoArray(AliasedUidList, TEXT("|"), true);
+	for (FString& AliasedUid : AliasedUidList)
+	{
+		AliasedUid.TrimStartAndEndInline();
+	}
+	AliasedUidList.RemoveAll([](const FString& Value)
+	{
+		return Value.IsEmpty();
+	});
+	AliasedUidList.Sort();
+	return FString::Join(AliasedUidList, TEXT("|"));
+}
+
+bool IsSerializedStateAliasNodeClass_ImportBpy(const FString& NodeClassName)
+{
+	return NodeClassName.Equals(TEXT("AnimStateAliasNode"), ESearchCase::CaseSensitive) ||
+		NodeClassName.Equals(TEXT("K2Node_AnimStateAliasNode"), ESearchCase::CaseSensitive);
+}
+
+UAnimStateNodeBase* ResolveAliasedStateNodeFromImportedMap_ImportBpy(
+	UEdGraph* Graph,
+	const TMap<FString, UEdGraphNode*>& NodeMap,
+	const FString& AliasedStateIdentity)
+{
+	if (AliasedStateIdentity.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	if (const UEdGraphNode* const* ExactNode = NodeMap.Find(AliasedStateIdentity))
+	{
+		if (const UAnimStateNodeBase* ExactState = Cast<UAnimStateNodeBase>(*ExactNode))
+		{
+			return const_cast<UAnimStateNodeBase*>(ExactState);
+		}
+	}
+
+	FGuid ParsedGuid;
+	const bool bHasParsedGuid = TryParseGuid_ImportBpy(AliasedStateIdentity, ParsedGuid);
+	auto MatchesIdentity = [&AliasedStateIdentity, bHasParsedGuid, &ParsedGuid](const UEdGraphNode* Node) -> bool
+	{
+		if (!Node)
+		{
+			return false;
+		}
+		if (bHasParsedGuid && Node->NodeGuid == ParsedGuid)
+		{
+			return true;
+		}
+
+		const FString NodeGuidDigits = Node->NodeGuid.ToString(EGuidFormats::Digits);
+		const FString NodeGuidHyphenated = Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+		return NodeGuidDigits.Equals(AliasedStateIdentity, ESearchCase::IgnoreCase) ||
+			NodeGuidHyphenated.Equals(AliasedStateIdentity, ESearchCase::IgnoreCase);
+	};
+
+	for (const TPair<FString, UEdGraphNode*>& Pair : NodeMap)
+	{
+		if (UAnimStateNodeBase* StateNode = Cast<UAnimStateNodeBase>(Pair.Value))
+		{
+			if (MatchesIdentity(StateNode))
+			{
+				return StateNode;
+			}
+		}
+	}
+
+	if (!Graph)
+	{
+		return nullptr;
+	}
+
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (UAnimStateNodeBase* StateNode = Cast<UAnimStateNodeBase>(Node))
+		{
+			if (MatchesIdentity(StateNode))
+			{
+				return StateNode;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
 bool RestoreStateMachineAliasNodesAfterCreation_ImportBpy(
+	UBlueprint* BP,
+	UEdGraph* Graph,
 	const TArray<TSharedPtr<FJsonValue>>* NodesArr,
 	const TMap<FString, UEdGraphNode*>& NodeMap,
 	FString& OutError)
@@ -12283,22 +12497,44 @@ bool RestoreStateMachineAliasNodesAfterCreation_ImportBpy(
 	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
 	{
 		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
-		if (!NodeObj.IsValid() || NodeObj->GetStringField(TEXT("node_class")) != TEXT("AnimStateAliasNode"))
+		FString SerializedNodeClass;
+		if (!NodeObj.IsValid() ||
+			!NodeObj->TryGetStringField(TEXT("node_class"), SerializedNodeClass) ||
+			!IsSerializedStateAliasNodeClass_ImportBpy(SerializedNodeClass))
 		{
 			continue;
 		}
 
 		const FString Uid = NodeObj->GetStringField(TEXT("uid"));
-		UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
-		if (!ExistingNode || !*ExistingNode)
+		UAnimStateAliasNode* AliasNode = nullptr;
+		if (UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid))
 		{
-			continue;
+			AliasNode = Cast<UAnimStateAliasNode>(*ExistingNode);
 		}
 
-		UAnimStateAliasNode* const AliasNode = Cast<UAnimStateAliasNode>(*ExistingNode);
 		if (!AliasNode)
 		{
-			continue;
+			UEdGraphNode* const LiveNode = FindImportedAnimNodeFromSerializedJson_ImportBpy(BP, NodeObj);
+			if (LiveNode && (!Graph || LiveNode->GetGraph() == Graph))
+			{
+				AliasNode = Cast<UAnimStateAliasNode>(LiveNode);
+			}
+		}
+
+		if (!AliasNode)
+		{
+			FString AliasNodeGuid;
+			NodeObj->TryGetStringField(TEXT("node_guid"), AliasNodeGuid);
+			if (AliasNodeGuid.IsEmpty())
+			{
+				AliasNodeGuid = Uid;
+			}
+			OutError = FString::Printf(
+				TEXT("State alias replay could not resolve alias node uid='%s' guid='%s' on graph '%s'"),
+				*Uid,
+				*AliasNodeGuid,
+				Graph ? *Graph->GetPathName() : TEXT("<null>"));
+			return false;
 		}
 
 		const FString AliasedStateUids = GetNodePropString_ImportBpy(NodeObj, TEXT("AliasedStateUids"));
@@ -12314,8 +12550,11 @@ bool RestoreStateMachineAliasNodesAfterCreation_ImportBpy(
 		AliasedStateUids.ParseIntoArray(AliasedUidList, TEXT("|"), true);
 		for (const FString& AliasedUid : AliasedUidList)
 		{
-			UEdGraphNode* const* TargetNode = NodeMap.Find(AliasedUid);
-			UAnimStateNodeBase* const TargetState = TargetNode ? Cast<UAnimStateNodeBase>(*TargetNode) : nullptr;
+			UAnimStateNodeBase* const TargetState =
+				ResolveAliasedStateNodeFromImportedMap_ImportBpy(
+					AliasNode->GetGraph() ? AliasNode->GetGraph() : Graph,
+					NodeMap,
+					AliasedUid);
 			if (!TargetState)
 			{
 				OutError = FString::Printf(
@@ -12327,7 +12566,97 @@ bool RestoreStateMachineAliasNodesAfterCreation_ImportBpy(
 
 			AliasedStates.Add(TargetState);
 		}
+
+		UE_LOG(
+			LogTemp,
+			Display,
+			TEXT("[ExportBpy][ImportDiag][StateAlias] graph=%s node=%s restored_alias_refs=%d serialized_aliases=%s"),
+			AliasNode->GetGraph() ? *AliasNode->GetGraph()->GetPathName() : TEXT("<null>"),
+			*DescribeNode_ImportBpy(AliasNode),
+			AliasedStates.Num(),
+			*NormalizeAliasedStateUidList_ImportBpy(AliasedStateUids));
 	}
+
+	return true;
+}
+
+bool ReplayStateMachineAliasNodesFromGraphJsonText_ImportBpy(
+	UBlueprint* BP,
+	UEdGraph* Graph,
+	const FString& GraphJsonText,
+	const TCHAR* StageTag,
+	FString& OutError)
+{
+	if (!BP || !Graph || GraphJsonText.IsEmpty())
+	{
+		return true;
+	}
+
+	TSharedPtr<FJsonObject> GraphJson;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(GraphJsonText);
+	if (!FJsonSerializer::Deserialize(Reader, GraphJson) || !GraphJson.IsValid())
+	{
+		OutError = FString::Printf(
+			TEXT("Cannot parse state machine graph json for alias replay on graph %s"),
+			*GetPathNameSafe(Graph));
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+	if (!GraphJson->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+	{
+		return true;
+	}
+
+	TMap<FString, UEdGraphNode*> NodeMap;
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		FString SerializedUid;
+		NodeObj->TryGetStringField(TEXT("uid"), SerializedUid);
+		if (SerializedUid.IsEmpty())
+		{
+			continue;
+		}
+
+		if (UEdGraphNode* ImportedNode = FindImportedAnimNodeFromSerializedJson_ImportBpy(BP, NodeObj))
+		{
+			if (ImportedNode->GetGraph() == Graph)
+			{
+				NodeMap.Add(SerializedUid, ImportedNode);
+			}
+		}
+	}
+
+	if (!RestoreStateMachineAliasNodesAfterCreation_ImportBpy(BP, Graph, NodesArr, NodeMap, OutError))
+	{
+		return false;
+	}
+
+	int32 AliasNodeCount = 0;
+	int32 AliasedRefCount = 0;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (UAnimStateAliasNode* AliasNode = Cast<UAnimStateAliasNode>(Node))
+		{
+			++AliasNodeCount;
+			AliasedRefCount += AliasNode->GetAliasedStates().Num();
+		}
+	}
+
+	UE_LOG(
+		LogTemp,
+		Display,
+		TEXT("[ExportBpy][ImportDiag][StateAlias][%s] graph=%s alias_nodes=%d aliased_refs=%d"),
+		StageTag ? StageTag : TEXT("Unknown"),
+		*GetPathNameSafe(Graph),
+		AliasNodeCount,
+		AliasedRefCount);
 
 	return true;
 }
@@ -13001,6 +13330,8 @@ static bool ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(
 			continue;
 		}
 
+		bool bTouchedCachedPoseNodes = false;
+
 		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
 		{
 			const TSharedPtr<FJsonObject> NodeObj = NodeValue->AsObject();
@@ -13015,7 +13346,10 @@ static bool ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(
 			UAnimGraphNode_StateMachineBase* const StateMachineNode =
 				Cast<UAnimGraphNode_StateMachineBase>(ExistingNode);
 			const bool bIsBlendStackNode = ResolveBlendStackGraph_ImportBpy(ExistingNode) != nullptr;
-			if (!StateMachineNode && !bIsBlendStackNode)
+			const bool bIsCachedPoseNode =
+				Cast<UAnimGraphNode_SaveCachedPose>(ExistingNode) != nullptr ||
+				Cast<UAnimGraphNode_UseCachedPose>(ExistingNode) != nullptr;
+			if (!StateMachineNode && !bIsBlendStackNode && !bIsCachedPoseNode)
 			{
 				continue;
 			}
@@ -13025,6 +13359,10 @@ static bool ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(
 				LogBlendStackGraphBindingsAndDuplicates_ImportBpy(
 					ExistingNode,
 					TEXT("PostCompileReplayBeforeApply"));
+			}
+			if (bIsCachedPoseNode)
+			{
+				LogCachedPoseNodeSnapshot_ImportBpy(ExistingNode, TEXT("post_compile_replay_before_apply"));
 			}
 
 			if (!ApplyNodeJsonToNode_ImportBpy(ExistingNode, NodeObj, OutError, false))
@@ -13049,6 +13387,18 @@ static bool ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(
 						BlendStackGraph->Nodes.Num());
 				}
 			}
+
+			if (bIsCachedPoseNode)
+			{
+				bTouchedCachedPoseNodes = true;
+				LogCachedPoseNodeSnapshot_ImportBpy(ExistingNode, TEXT("post_compile_replay_after_apply"));
+			}
+		}
+
+		if (bTouchedCachedPoseNodes)
+		{
+			ResolveUseCachedPoseLinksInGraph_ImportBpy(Graph);
+			LogCachedPoseGraphSnapshot_ImportBpy(Graph, TEXT("post_compile_replay_after_graph_resolve"));
 		}
 	}
 
@@ -15923,6 +16273,168 @@ void CollectAnimNodeFunctionRefBindingMismatches_ImportBpy(
 	}
 }
 
+FString GetSerializedStateAliasNodeGuid_ImportBpy(const TSharedPtr<FJsonObject>& NodeObj)
+{
+	if (!NodeObj.IsValid())
+	{
+		return FString();
+	}
+
+	FString NodeGuid;
+	NodeObj->TryGetStringField(TEXT("node_guid"), NodeGuid);
+	if (NodeGuid.IsEmpty())
+	{
+		NodeObj->TryGetStringField(TEXT("uid"), NodeGuid);
+	}
+	return NodeGuid;
+}
+
+void CollectSerializedStateAliasNodesRecursive_ImportBpy(
+	const TSharedPtr<FJsonObject>& GraphObj,
+	TSet<FString>& VisitedGraphGuids,
+	TMap<FString, FString>& OutAliasNodeToAliasedStateUids)
+{
+	if (!GraphObj.IsValid())
+	{
+		return;
+	}
+
+	FString GraphGuid;
+	if (GraphObj->TryGetStringField(TEXT("graph_guid"), GraphGuid) && !GraphGuid.IsEmpty())
+	{
+		if (VisitedGraphGuids.Contains(GraphGuid))
+		{
+			return;
+		}
+		VisitedGraphGuids.Add(GraphGuid);
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+	if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+	{
+		return;
+	}
+
+	static const TCHAR* NestedGraphFields[] = {
+		TEXT("BoundGraphJson"),
+		TEXT("StateMachineGraphJson"),
+		TEXT("BlendStackGraphJson"),
+		TEXT("CustomTransitionGraphJson")
+	};
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		FString NodeClassName;
+		NodeObj->TryGetStringField(TEXT("node_class"), NodeClassName);
+		if (IsSerializedStateAliasNodeClass_ImportBpy(NodeClassName))
+		{
+			const FString NodeGuid = GetSerializedStateAliasNodeGuid_ImportBpy(NodeObj);
+			if (!NodeGuid.IsEmpty())
+			{
+				OutAliasNodeToAliasedStateUids.Add(
+					NodeGuid,
+					NormalizeAliasedStateUidList_ImportBpy(
+						GetNodePropString_ImportBpy(NodeObj, TEXT("AliasedStateUids"))));
+			}
+		}
+
+		const TSharedPtr<FJsonObject>* NodePropsObj = nullptr;
+		if (!NodeObj->TryGetObjectField(TEXT("node_props"), NodePropsObj) || !NodePropsObj || !NodePropsObj->IsValid())
+		{
+			continue;
+		}
+
+		for (const TCHAR* FieldName : NestedGraphFields)
+		{
+			FString NestedGraphJson;
+			if (!(*NodePropsObj)->TryGetStringField(FieldName, NestedGraphJson) || NestedGraphJson.IsEmpty())
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> NestedGraphObj;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(NestedGraphJson);
+			if (!FJsonSerializer::Deserialize(Reader, NestedGraphObj) || !NestedGraphObj.IsValid())
+			{
+				continue;
+			}
+
+			CollectSerializedStateAliasNodesRecursive_ImportBpy(
+				NestedGraphObj,
+				VisitedGraphGuids,
+				OutAliasNodeToAliasedStateUids);
+		}
+	}
+}
+
+void CollectStateMachineAliasNodeMismatches_ImportBpy(
+	const TSharedPtr<FJsonObject>& SourceRoot,
+	const TSharedPtr<FJsonObject>& LiveRoot,
+	TArray<FString>& OutMismatches)
+{
+	OutMismatches.Reset();
+	if (!SourceRoot.IsValid() || !LiveRoot.IsValid())
+	{
+		return;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* SourceGraphsArr = nullptr;
+	const TArray<TSharedPtr<FJsonValue>>* LiveGraphsArr = nullptr;
+	if (!SourceRoot->TryGetArrayField(TEXT("graphs"), SourceGraphsArr) || !SourceGraphsArr ||
+		!LiveRoot->TryGetArrayField(TEXT("graphs"), LiveGraphsArr) || !LiveGraphsArr)
+	{
+		return;
+	}
+
+	TMap<FString, FString> ExpectedAliasesByNodeGuid;
+	TMap<FString, FString> ActualAliasesByNodeGuid;
+	TSet<FString> VisitedGraphGuids;
+	for (const TSharedPtr<FJsonValue>& GraphValue : *SourceGraphsArr)
+	{
+		CollectSerializedStateAliasNodesRecursive_ImportBpy(
+			GraphValue.IsValid() ? GraphValue->AsObject() : nullptr,
+			VisitedGraphGuids,
+			ExpectedAliasesByNodeGuid);
+	}
+
+	VisitedGraphGuids.Reset();
+	for (const TSharedPtr<FJsonValue>& GraphValue : *LiveGraphsArr)
+	{
+		CollectSerializedStateAliasNodesRecursive_ImportBpy(
+			GraphValue.IsValid() ? GraphValue->AsObject() : nullptr,
+			VisitedGraphGuids,
+			ActualAliasesByNodeGuid);
+	}
+
+	for (const TPair<FString, FString>& ExpectedPair : ExpectedAliasesByNodeGuid)
+	{
+		const FString* ActualAliases = ActualAliasesByNodeGuid.Find(ExpectedPair.Key);
+		if (!ActualAliases)
+		{
+			OutMismatches.Add(FString::Printf(
+				TEXT("missing_state_alias_node guid=%s expected_aliases=%s"),
+				*ExpectedPair.Key,
+				*ExpectedPair.Value));
+			continue;
+		}
+
+		if (!ActualAliases->Equals(ExpectedPair.Value, ESearchCase::CaseSensitive))
+		{
+			OutMismatches.Add(FString::Printf(
+				TEXT("state_alias_uids_mismatch guid=%s expected=%s actual=%s"),
+				*ExpectedPair.Key,
+				*ExpectedPair.Value,
+				**ActualAliases));
+		}
+	}
+}
+
 void CollectMotionMatchingPoseHistoryMismatches_ImportBpy(
 	UBlueprint* BP,
 	const TSharedPtr<FJsonObject>& Root,
@@ -16547,6 +17059,10 @@ bool ValidateRoundtripAgainstRootJson_ImportBpy(
 		CollectMotionMatchingPoseHistoryMismatches_ImportBpy(BP, Root, PoseHistoryMismatches);
 		Mismatches.Append(PoseHistoryMismatches);
 
+		TArray<FString> StateAliasMismatches;
+		CollectStateMachineAliasNodeMismatches_ImportBpy(Root, LiveRoot, StateAliasMismatches);
+		Mismatches.Append(StateAliasMismatches);
+
 		TArray<FString> EventAndDelegateMismatches;
 		CollectEventAndDelegateBindingMismatches_ImportBpy(BP, EventAndDelegateMismatches);
 		Mismatches.Append(EventAndDelegateMismatches);
@@ -16985,6 +17501,28 @@ bool ReloadBlueprintAssetForPostSaveValidation_ImportBpy(
 		*ObjectPath,
 		*Package->GetName(),
 		*GetPathNameSafe(ExistingBlueprint));
+
+	// Safety check: UPackageTools::ReloadPackages internally calls check(CurrentWorldPtr) when
+	// the reloaded package is not the current world.  If no map is currently open (or GC has
+	// already cleared the editor world), that check fires and crashes the editor.  Skip the
+	// reload in that case and continue with the existing in-memory blueprint so that the
+	// remaining validation steps can still run.
+	const bool bEditorWorldAvailable =
+		GIsEditor && GEditor && (GEditor->GetEditorWorldContext().World() != nullptr);
+
+	if (!bEditorWorldAvailable)
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag][PostSaveReload] skipping_reload_no_world target=%s — "
+			     "UPackageTools::ReloadPackages requires a valid editor world; "
+			     "post-save validation will run against the in-memory blueprint instead."),
+			*ObjectPath);
+
+		OutBlueprint = ExistingBlueprint;
+		return true;
+	}
 
 	const TArray<UPackage*> PackagesToReload{Package};
 	FText ReloadErrorText;
@@ -19014,7 +19552,7 @@ bool UBPDirectImporter::PopulateGraph(
 		}
 	}
 
-	if (!RestoreStateMachineAliasNodesAfterCreation_ImportBpy(NodesArr, NodeMap, OutError))
+	if (!RestoreStateMachineAliasNodesAfterCreation_ImportBpy(BP, Graph, NodesArr, NodeMap, OutError))
 	{
 		return false;
 	}

@@ -87,6 +87,7 @@ class _Graph:
     is_pure:     bool  = False
     thread_safe: bool  = False
     category:    str   = ""
+    graph_guid:  str   = ""
     metadata:    Dict[str, Any] = field(default_factory=dict)
     uid_factory: Any = None
 
@@ -628,8 +629,9 @@ class Blueprint:
 
     # ── Graphs ────────────────────────────────────────────────
 
-    def event_graph(self, name: str = "EventGraph") -> GraphContext:
-        g = _Graph(name=name, graph_type="event_graph")
+    def event_graph(self, name: str = "EventGraph", *,
+                    graph_guid: str = "") -> GraphContext:
+        g = _Graph(name=name, graph_type="event_graph", graph_guid=graph_guid)
         return GraphContext(self, g)
 
     def function(self, name: str, *,
@@ -637,20 +639,24 @@ class Blueprint:
                  outputs:  Optional[List[Tuple[str, str]]] = None,
                  pure:     bool = False,
                  thread_safe: bool = False,
-                 category: str  = "") -> GraphContext:
+                 category: str  = "",
+                 graph_guid: str = "") -> GraphContext:
         g = _Graph(
             name=name, graph_type="function",
             inputs=inputs or [], outputs=outputs or [],
             is_pure=pure, thread_safe=thread_safe, category=category,
+            graph_guid=graph_guid,
         )
         return GraphContext(self, g)
 
     def macro(self, name: str, *,
               inputs:  Optional[List[Tuple[str, str]]] = None,
-              outputs: Optional[List[Tuple[str, str]]] = None) -> GraphContext:
+              outputs: Optional[List[Tuple[str, str]]] = None,
+              graph_guid: str = "") -> GraphContext:
         g = _Graph(
             name=name, graph_type="macro",
             inputs=inputs or [], outputs=outputs or [],
+            graph_guid=graph_guid,
         )
         return GraphContext(self, g)
 
@@ -790,7 +796,7 @@ def _serialize_graph(g: _Graph) -> Dict[str, Any]:
         }
         return node_props, pin_aliases, pin_ids
 
-    return {
+    graph_dict = {
         "name":       g.name,
         "graph_type": g.graph_type,
         "inputs":     [{"name": n, "type": t} for n, t in g.inputs],
@@ -845,6 +851,9 @@ def _serialize_graph(g: _Graph) -> Dict[str, Any]:
         ],
         "metadata": g.metadata,
     }
+    if g.graph_guid:
+        graph_dict["graph_guid"] = g.graph_guid
+    return graph_dict
 
 
 def _serialize_timeline(t: _Timeline) -> Dict[str, Any]:

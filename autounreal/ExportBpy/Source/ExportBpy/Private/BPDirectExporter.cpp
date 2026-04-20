@@ -3024,6 +3024,10 @@ bool WriteNestedGraphModule_ExportBpy(
 	if (GraphType == TEXT("function"))
 	{
 		FString Args = MakePythonStringLiteral_ExportBpy(GraphName);
+		if (!GraphGuid.IsEmpty())
+		{
+			Args += FString::Printf(TEXT(", graph_guid=%s"), *MakePythonStringLiteral_ExportBpy(GraphGuid));
+		}
 		if (!InputsLiteral.IsEmpty())
 		{
 			Args += FString::Printf(TEXT(", inputs=[%s]"), *InputsLiteral);
@@ -3049,6 +3053,10 @@ bool WriteNestedGraphModule_ExportBpy(
 	else if (GraphType == TEXT("macro"))
 	{
 		FString Args = MakePythonStringLiteral_ExportBpy(GraphName);
+		if (!GraphGuid.IsEmpty())
+		{
+			Args += FString::Printf(TEXT(", graph_guid=%s"), *MakePythonStringLiteral_ExportBpy(GraphGuid));
+		}
 		if (!InputsLiteral.IsEmpty())
 		{
 			Args += FString::Printf(TEXT(", inputs=[%s]"), *InputsLiteral);
@@ -3061,7 +3069,12 @@ bool WriteNestedGraphModule_ExportBpy(
 	}
 	else
 	{
-		ContextHeader = FString::Printf(TEXT("with bp.event_graph(%s) as g:"), *MakePythonStringLiteral_ExportBpy(GraphName));
+		FString Args = MakePythonStringLiteral_ExportBpy(GraphName);
+		if (!GraphGuid.IsEmpty())
+		{
+			Args += FString::Printf(TEXT(", graph_guid=%s"), *MakePythonStringLiteral_ExportBpy(GraphGuid));
+		}
+		ContextHeader = FString::Printf(TEXT("with bp.event_graph(%s) as g:"), *Args);
 	}
 	Content += TEXT("    ") + ContextHeader + TEXT("\n");
 
@@ -5544,6 +5557,12 @@ bool UBPDirectExporter::GenerateGraphFile(
 			}
 		}
 		FString Args = MakePythonStringLiteral_ExportBpy(GraphName);
+		if (Graph->GraphGuid.IsValid())
+		{
+			Args += FString::Printf(
+				TEXT(", graph_guid=%s"),
+				*MakePythonStringLiteral_ExportBpy(Graph->GraphGuid.ToString(EGuidFormats::Digits)));
+		}
 		if (!InputsStr.IsEmpty())
 			Args += FString::Printf(TEXT(", inputs=[%s]"), *InputsStr);
 		if (!OutputsStr.IsEmpty())
@@ -5602,6 +5621,12 @@ bool UBPDirectExporter::GenerateGraphFile(
 		}
 
 		FString Args = MakePythonStringLiteral_ExportBpy(GraphName);
+		if (Graph->GraphGuid.IsValid())
+		{
+			Args += FString::Printf(
+				TEXT(", graph_guid=%s"),
+				*MakePythonStringLiteral_ExportBpy(Graph->GraphGuid.ToString(EGuidFormats::Digits)));
+		}
 		if (!InputsStr.IsEmpty())
 		{
 			Args += FString::Printf(TEXT(", inputs=[%s]"), *InputsStr);
@@ -5614,7 +5639,14 @@ bool UBPDirectExporter::GenerateGraphFile(
 	}
 	else
 	{
-		CtxHeader = FString::Printf(TEXT("with bp.event_graph(%s) as g:"), *MakePythonStringLiteral_ExportBpy(GraphName));
+		FString Args = MakePythonStringLiteral_ExportBpy(GraphName);
+		if (Graph->GraphGuid.IsValid())
+		{
+			Args += FString::Printf(
+				TEXT(", graph_guid=%s"),
+				*MakePythonStringLiteral_ExportBpy(Graph->GraphGuid.ToString(EGuidFormats::Digits)));
+		}
+		CtxHeader = FString::Printf(TEXT("with bp.event_graph(%s) as g:"), *Args);
 	}
 
 	Lines += TEXT("    ") + CtxHeader + TEXT("\n\n");

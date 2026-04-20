@@ -78,6 +78,7 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/CompilerResultsLog.h"
+#include "BlueprintCompilationManager.h"
 #include "KismetCompiler.h"
 #include "Logging/TokenizedMessage.h"
 #include "Editor.h"
@@ -5796,7 +5797,64 @@ void ReplayFunctionGraphMetadataToSignature_ImportBpy(
 		return;
 	}
 
+	auto IncrementNameCount = [](TMap<FString, int32>& Map, UEdGraph* Graph)
+	{
+		if (!Graph)
+		{
+			return;
+		}
+
+		const FString Name = Graph->GetName();
+		if (Name.IsEmpty())
+		{
+			return;
+		}
+
+		int32& Count = Map.FindOrAdd(Name);
+		++Count;
+	};
+
+	TMap<FString, int32> RootGraphNameCounts;
+	for (UEdGraph* Graph : BP->UbergraphPages)
+	{
+		IncrementNameCount(RootGraphNameCounts, Graph);
+	}
+	for (UEdGraph* Graph : BP->FunctionGraphs)
+	{
+		IncrementNameCount(RootGraphNameCounts, Graph);
+	}
+	for (UEdGraph* Graph : BP->MacroGraphs)
+	{
+		IncrementNameCount(RootGraphNameCounts, Graph);
+	}
+	for (UEdGraph* Graph : BP->DelegateSignatureGraphs)
+	{
+		IncrementNameCount(RootGraphNameCounts, Graph);
+	}
+	for (const FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
+	{
+		for (UEdGraph* Graph : InterfaceDesc.Graphs)
+		{
+			IncrementNameCount(RootGraphNameCounts, Graph);
+		}
+	}
+
+	TMap<FString, int32> AllGraphNameCounts;
+	{
+		TArray<UEdGraph*> AllGraphs;
+		BP->GetAllGraphs(AllGraphs);
+		for (UEdGraph* Graph : AllGraphs)
+		{
+			IncrementNameCount(AllGraphNameCounts, Graph);
+		}
+	}
+
+	int32 ExpectedFunctionGraphCount = 0;
+	int32 ExpectedMetadataReplayCount = 0;
 	int32 ReplayedGraphCount = 0;
+	int32 SkippedAnimLayerGraphCount = 0;
+	TArray<FString> SkippedAnimLayerSamples;
+	TArray<FString> MissingGraphSamples;
 	for (const TSharedPtr<FJsonObject>& GraphJson : SortedGraphs)
 	{
 		if (!GraphJson.IsValid() || IsNodeOwnedNestedGraphJson_ImportBpy(GraphJson))
@@ -5812,10 +5870,25 @@ void ReplayFunctionGraphMetadataToSignature_ImportBpy(
 		{
 			continue;
 		}
+		++ExpectedFunctionGraphCount;
+		++ExpectedMetadataReplayCount;
 
 		UEdGraph* Graph = FindRootGraphByName_ImportBpy(BP, GraphName);
 		if (!Graph)
 		{
+			if (MissingGraphSamples.Num() < 12)
+			{
+				const int32 RootCount = RootGraphNameCounts.FindRef(GraphName);
+				const int32 AllCount = AllGraphNameCounts.FindRef(GraphName);
+				FString GraphOuterKind;
+				GraphJson->TryGetStringField(TEXT("graph_outer"), GraphOuterKind);
+				MissingGraphSamples.Add(FString::Printf(
+					TEXT("%s(reason=no_root_match,outer=%s,root_count=%d,all_count=%d)"),
+					*GraphName,
+					GraphOuterKind.IsEmpty() ? TEXT("<none>") : *GraphOuterKind,
+					RootCount,
+					AllCount));
+			}
 			continue;
 		}
 
@@ -5823,6 +5896,45 @@ void ReplayFunctionGraphMetadataToSignature_ImportBpy(
 		Graph->GetNodesOfClass(EntryNodes);
 		if (EntryNodes.Num() == 0 || !EntryNodes[0])
 		{
+			bool bHasAnimGraphRoot = false;
+			if (Graph)
+			{
+				for (UEdGraphNode* Node : Graph->Nodes)
+				{
+					if (Node && Node->GetClass() &&
+						Node->GetClass()->GetName().Equals(TEXT("AnimGraphNode_Root"), ESearchCase::CaseSensitive))
+					{
+						bHasAnimGraphRoot = true;
+						break;
+					}
+				}
+			}
+
+			if (bHasAnimGraphRoot)
+			{
+				--ExpectedMetadataReplayCount;
+				++SkippedAnimLayerGraphCount;
+				if (SkippedAnimLayerSamples.Num() < 12)
+				{
+					SkippedAnimLayerSamples.Add(FString::Printf(
+						TEXT("%s(path=%s)"),
+						*GraphName,
+						*GetPathNameSafe(Graph)));
+				}
+				continue;
+			}
+
+			if (MissingGraphSamples.Num() < 12)
+			{
+				const int32 RootCount = RootGraphNameCounts.FindRef(GraphName);
+				const int32 AllCount = AllGraphNameCounts.FindRef(GraphName);
+				MissingGraphSamples.Add(FString::Printf(
+					TEXT("%s(reason=no_entry_node,root_count=%d,all_count=%d,path=%s)"),
+					*GraphName,
+					RootCount,
+					AllCount,
+					*GetPathNameSafe(Graph)));
+			}
 			continue;
 		}
 
@@ -5861,9 +5973,15 @@ void ReplayFunctionGraphMetadataToSignature_ImportBpy(
 	UE_LOG(
 		LogTemp,
 		Warning,
-		TEXT("[ExportBpy][ImportDiag][FunctionMetaReplay] blueprint=%s replayed_function_graphs=%d"),
+		TEXT("[ExportBpy][ImportDiag][FunctionMetaReplay] blueprint=%s expected_function_graphs=%d expected_metadata_replay_graphs=%d replayed_function_graphs=%d missing_function_graphs=%d skipped_anim_layer_graphs=%d skipped_anim_layer_samples=%s missing_samples=%s"),
 		*BP->GetPathName(),
-		ReplayedGraphCount);
+		ExpectedFunctionGraphCount,
+		ExpectedMetadataReplayCount,
+		ReplayedGraphCount,
+		FMath::Max(0, ExpectedMetadataReplayCount - ReplayedGraphCount),
+		SkippedAnimLayerGraphCount,
+		SkippedAnimLayerSamples.Num() > 0 ? *FString::Join(SkippedAnimLayerSamples, TEXT(" | ")) : TEXT("<none>"),
+		MissingGraphSamples.Num() > 0 ? *FString::Join(MissingGraphSamples, TEXT(" | ")) : TEXT("<none>"));
 }
 
 void ParseGraphPins_ImportBpy(
@@ -13991,6 +14109,13 @@ UEdGraph* FindRootGraphByName_ImportBpy(UBlueprint* BP, const FString& GraphName
 			return Graph;
 		}
 	}
+	for (UEdGraph* Graph : BP->DelegateSignatureGraphs)
+	{
+		if (MatchByName(Graph))
+		{
+			return Graph;
+		}
+	}
 	for (const FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
 	{
 		for (UEdGraph* Graph : InterfaceDesc.Graphs)
@@ -13999,6 +14124,23 @@ UEdGraph* FindRootGraphByName_ImportBpy(UBlueprint* BP, const FString& GraphName
 			{
 				return Graph;
 			}
+		}
+	}
+
+	TArray<UEdGraph*> AllGraphs;
+	BP->GetAllGraphs(AllGraphs);
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		if (MatchByName(Graph) && Graph->GetOuter() == BP)
+		{
+			return Graph;
+		}
+	}
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		if (MatchByName(Graph))
+		{
+			return Graph;
 		}
 	}
 
@@ -17502,23 +17644,32 @@ bool ReloadBlueprintAssetForPostSaveValidation_ImportBpy(
 		*Package->GetName(),
 		*GetPathNameSafe(ExistingBlueprint));
 
-	// Safety check: UPackageTools::ReloadPackages internally calls check(CurrentWorldPtr) when
-	// the reloaded package is not the current world.  If no map is currently open (or GC has
-	// already cleared the editor world), that check fires and crashes the editor.  Skip the
-	// reload in that case and continue with the existing in-memory blueprint so that the
-	// remaining validation steps can still run.
-	const bool bEditorWorldAvailable =
-		GIsEditor && GEditor && (GEditor->GetEditorWorldContext().World() != nullptr);
+	// Drain any pending BP compilation work before we attempt a package reload. ReloadPackages
+	// is not resilient when the target blueprint is still compiling or carrying a REINST class.
+	FBlueprintCompilationManager::FlushCompilationQueue(nullptr);
 
-	if (!bEditorWorldAvailable)
+	const UWorld* const EditorWorld =
+		(GIsEditor && GEditor) ? GEditor->GetEditorWorldContext(false).World() : nullptr;
+	const bool bEditorWorldAvailable = (EditorWorld != nullptr);
+	const bool bEditorBusy =
+		GEditor && (GEditor->PlayWorld != nullptr || GEditor->bIsSimulatingInEditor);
+	const bool bBlueprintStillCompiling = ExistingBlueprint->bBeingCompiled;
+	const bool bHasReinstancedClass =
+		ExistingBlueprint->GeneratedClass &&
+		ExistingBlueprint->GeneratedClass->GetName().StartsWith(TEXT("REINST_"));
+
+	if (!bEditorWorldAvailable || bEditorBusy || bBlueprintStillCompiling || bHasReinstancedClass)
 	{
 		UE_LOG(
 			LogTemp,
 			Warning,
-			TEXT("[ExportBpy][ImportDiag][PostSaveReload] skipping_reload_no_world target=%s — "
-			     "UPackageTools::ReloadPackages requires a valid editor world; "
-			     "post-save validation will run against the in-memory blueprint instead."),
-			*ObjectPath);
+			TEXT("[ExportBpy][ImportDiag][PostSaveReload] skipping_reload target=%s "
+			     "world=%d busy=%d compiling=%d reinst=%d; using in-memory blueprint for validation."),
+			*ObjectPath,
+			bEditorWorldAvailable ? 1 : 0,
+			bEditorBusy ? 1 : 0,
+			bBlueprintStillCompiling ? 1 : 0,
+			bHasReinstancedClass ? 1 : 0);
 
 		OutBlueprint = ExistingBlueprint;
 		return true;

@@ -156,11 +156,17 @@ def _write_graph_file(path: str, graph: Any, *, meta_module_name: str) -> None:
         thread_safe_arg = ""
         if getattr(graph, "thread_safe", False):
             thread_safe_arg = ", thread_safe=True"
+        graph_guid_arg = ""
+        if getattr(graph, "graph_guid", ""):
+            graph_guid_arg = f", graph_guid={graph.graph_guid!r}"
         lines.append(
-            f"{indent}with bp.function({graph.name!r}, inputs={graph.inputs!r}, outputs={graph.outputs!r}, pure={graph.is_pure!r}{thread_safe_arg}) as g:"
+            f"{indent}with bp.function({graph.name!r}, inputs={graph.inputs!r}, outputs={graph.outputs!r}, pure={graph.is_pure!r}{thread_safe_arg}{graph_guid_arg}) as g:"
         )
     else:
-        lines.append(f"{indent}with bp.event_graph({graph.name!r}) as g:")
+        graph_guid_arg = ""
+        if getattr(graph, "graph_guid", ""):
+            graph_guid_arg = f", graph_guid={graph.graph_guid!r}"
+        lines.append(f"{indent}with bp.event_graph({graph.name!r}{graph_guid_arg}) as g:")
     indent = "        "
 
     node_vars: Dict[str, str] = {}

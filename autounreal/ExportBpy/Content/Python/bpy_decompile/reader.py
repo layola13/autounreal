@@ -41,6 +41,7 @@ class Connection:
 class GraphInfo:
     graph_kind: str
     graph_name: str
+    graph_guid: str = ""
     nodes: List[NodeInfo] = field(default_factory=list)
     connections: List[Connection] = field(default_factory=list)
     node_guid: Dict[str, str] = field(default_factory=dict)
@@ -112,9 +113,10 @@ _current_graph: Optional["_GraphCapture"] = None
 
 
 class _GraphCapture:
-    def __init__(self, kind: str, name: str):
+    def __init__(self, kind: str, name: str, graph_guid: str = ""):
         self.kind = kind
         self.name = name
+        self.graph_guid = graph_guid
         self._nodes: List[NodeInfo] = []
         self._connections: List[Connection] = []
         self._node_map: Dict[str, NodeInfo] = {}
@@ -177,13 +179,13 @@ class _BPCapture:
         self.components: List[Dict[str, Any]] = []
         self._graphs_pending: List[_GraphCapture] = []
 
-    def event_graph(self, name: str) -> _GraphCapture:
-        graph = _GraphCapture("event_graph", name)
+    def event_graph(self, name: str, **kwargs) -> _GraphCapture:
+        graph = _GraphCapture("event_graph", name, graph_guid=kwargs.get("graph_guid", ""))
         self._graphs_pending.append(graph)
         return graph
 
-    def function(self, name: str) -> _GraphCapture:
-        graph = _GraphCapture("function", name)
+    def function(self, name: str, **kwargs) -> _GraphCapture:
+        graph = _GraphCapture("function", name, graph_guid=kwargs.get("graph_guid", ""))
         self._graphs_pending.append(graph)
         return graph
 
@@ -243,6 +245,7 @@ def _parse_graph_file(path: str, kind: str) -> GraphInfo:
         return GraphInfo(
             graph_kind=graph_capture.kind,
             graph_name=graph_capture.name,
+            graph_guid=graph_capture.graph_guid,
             nodes=graph_capture._nodes,
             connections=graph_capture._connections,
         )

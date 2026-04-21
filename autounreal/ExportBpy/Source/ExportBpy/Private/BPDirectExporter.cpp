@@ -14,6 +14,7 @@
 #include "AnimGraphNode_Base.h"
 #include "AnimGraphNode_BlendListByEnum.h"
 #include "AnimGraphNode_StateMachineBase.h"
+#include "AnimGraphNode_StateResult.h"
 #include "AnimGraphNode_SaveCachedPose.h"
 #include "AnimGraphNode_UseCachedPose.h"
 #include "AnimStateNode.h"
@@ -497,6 +498,112 @@ void AddGenericNodePropertyText_ExportBpy(
 	{
 		NodeProps->SetStringField(PropertyName, ExportedValue);
 	}
+}
+
+static FString ReadNodePropertyAsText_ExportBpy(
+	const UEdGraphNode* Node,
+	const TCHAR* PropertyName)
+{
+	if (!Node || !PropertyName || !*PropertyName)
+	{
+		return FString();
+	}
+
+	FProperty* Property = Node->GetClass()->FindPropertyByName(FName(PropertyName));
+	if (!Property)
+	{
+		return FString();
+	}
+
+	void* ValuePtr = Property->ContainerPtrToValuePtr<void>(const_cast<UEdGraphNode*>(Node));
+	if (!ValuePtr)
+	{
+		return FString();
+	}
+
+	FString ExportedValue;
+	Property->ExportTextItem_Direct(ExportedValue, ValuePtr, nullptr, const_cast<UEdGraphNode*>(Node), PPF_None);
+	return ExportedValue;
+}
+
+static FString ExtractStateResultHookFunctionName_ExportBpy(
+	const FString& StateResultNodeStructText,
+	const TCHAR* HookName)
+{
+	if (StateResultNodeStructText.IsEmpty() || !HookName || !*HookName)
+	{
+		return FString();
+	}
+
+	const FString HookToken = FString::Printf(TEXT("%s=(FunctionName=\""), HookName);
+	const int32 HookPos = StateResultNodeStructText.Find(HookToken, ESearchCase::CaseSensitive);
+	if (HookPos == INDEX_NONE)
+	{
+		return FString();
+	}
+
+	const int32 NameStart = HookPos + HookToken.Len();
+	const int32 NameEnd = StateResultNodeStructText.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, NameStart);
+	if (NameEnd == INDEX_NONE || NameEnd <= NameStart)
+	{
+		return FString();
+	}
+
+	return StateResultNodeStructText.Mid(NameStart, NameEnd - NameStart);
+}
+
+static FString EnsureStateEnteredNotifyNameFromStateResult_ExportBpy(
+	const FString& ExistingStateEnteredText,
+	const FString& DesiredNotifyName)
+{
+	if (DesiredNotifyName.IsEmpty())
+	{
+		return ExistingStateEnteredText;
+	}
+
+	if (ExistingStateEnteredText.IsEmpty() || ExistingStateEnteredText.Equals(TEXT("()"), ESearchCase::CaseSensitive))
+	{
+		return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
+	}
+
+	// Keep existing struct if it already points to the desired notify.
+	const FString ExistingToken = FString::Printf(TEXT("NotifyName=\"%s\""), *DesiredNotifyName);
+	if (ExistingStateEnteredText.Contains(ExistingToken, ESearchCase::CaseSensitive))
+	{
+		return ExistingStateEnteredText;
+	}
+
+	// Keep any existing Guid/fields and prepend NotifyName.
+	if (ExistingStateEnteredText.StartsWith(TEXT("(")) && ExistingStateEnteredText.EndsWith(TEXT(")")) &&
+		ExistingStateEnteredText.Len() >= 2)
+	{
+		const FString Inner = ExistingStateEnteredText.Mid(1, ExistingStateEnteredText.Len() - 2).TrimStartAndEnd();
+		if (Inner.IsEmpty())
+		{
+			return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
+		}
+		return FString::Printf(TEXT("(NotifyName=\"%s\",%s)"), *DesiredNotifyName, *Inner);
+	}
+
+	return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
+}
+
+static FString ExtractStateNotifyNameFromStateEnteredText_ExportBpy(const FString& StateEnteredText)
+{
+	const FString Token = TEXT("NotifyName=\"");
+	const int32 Pos = StateEnteredText.Find(Token, ESearchCase::CaseSensitive);
+	if (Pos == INDEX_NONE)
+	{
+		return FString();
+	}
+
+	const int32 NameStart = Pos + Token.Len();
+	const int32 NameEnd = StateEnteredText.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, NameStart);
+	if (NameEnd == INDEX_NONE || NameEnd <= NameStart)
+	{
+		return FString();
+	}
+	return StateEnteredText.Mid(NameStart, NameEnd - NameStart);
 }
 
 FString GetReferencedNodeSerializedUid_ExportBpy(const UEdGraphNode* ReferencedNode)
@@ -6801,6 +6908,140 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeGenericNode(UEdGraphNode* No
 		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("StateLeft"), true);
 		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("StateFullyBlended"), true);
 		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("bAlwaysResetOnEntry"), true);
+
+		// UE may keep state-entry hook on StateResult while StateEntered.NotifyName is left blank.
+		// Export a stable StateEntered value with NotifyName so roundtrip import does not lose bindings.
+		FString ExistingStateEnteredText;
+		NodeProps->TryGetStringField(TEXT("StateEntered"), ExistingStateEnteredText);
+		const FString ExistingNotifyName =
+			ExtractStateNotifyNameFromStateEnteredText_ExportBpy(ExistingStateEnteredText);
+
+		TSet<FName> BlueprintFunctionNames;
+		if (UBlueprint* OwnerBlueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node))
+		{
+			for (UEdGraph* FunctionGraph : OwnerBlueprint->FunctionGraphs)
+			{
+				if (FunctionGraph)
+				{
+					BlueprintFunctionNames.Add(FName(*FunctionGraph->GetName()));
+				}
+			}
+		}
+
+		auto IsKnownFunction = [&BlueprintFunctionNames](const FString& FunctionName) -> bool
+		{
+			return !FunctionName.IsEmpty() && BlueprintFunctionNames.Contains(FName(*FunctionName));
+		};
+
+		auto NormalizeKey = [](const FString& Input) -> FString
+		{
+			FString Out;
+			Out.Reserve(Input.Len());
+			for (int32 Index = 0; Index < Input.Len(); ++Index)
+			{
+				const TCHAR Ch = Input[Index];
+				if (FChar::IsAlnum(Ch))
+				{
+					Out.AppendChar(FChar::ToLower(Ch));
+				}
+			}
+			return Out;
+		};
+
+		auto BuildStateCamelToken = [](const FString& Input) -> FString
+		{
+			FString Out;
+			bool bNewWord = true;
+			for (int32 Index = 0; Index < Input.Len(); ++Index)
+			{
+				const TCHAR Ch = Input[Index];
+				if (!FChar::IsAlnum(Ch))
+				{
+					bNewWord = true;
+					continue;
+				}
+				if (bNewWord)
+				{
+					Out.AppendChar(FChar::ToUpper(Ch));
+					bNewWord = false;
+				}
+				else
+				{
+					Out.AppendChar(FChar::ToLower(Ch));
+				}
+			}
+			return Out;
+		};
+
+		FString DesiredNotifyName;
+		if (StateNode->BoundGraph)
+		{
+			for (UEdGraphNode* BoundNode : StateNode->BoundGraph->Nodes)
+			{
+				if (const UAnimGraphNode_StateResult* StateResultNode = Cast<UAnimGraphNode_StateResult>(BoundNode))
+				{
+					const FString StateResultNodeText =
+						ReadNodePropertyAsText_ExportBpy(StateResultNode, TEXT("Node"));
+					DesiredNotifyName = ExtractStateResultHookFunctionName_ExportBpy(
+						StateResultNodeText,
+						TEXT("StateEntryFunction"));
+					if (!DesiredNotifyName.IsEmpty())
+					{
+						break;
+					}
+				}
+			}
+		}
+
+		if (!IsKnownFunction(DesiredNotifyName))
+		{
+			if (IsKnownFunction(ExistingNotifyName))
+			{
+				DesiredNotifyName = ExistingNotifyName;
+			}
+			else
+			{
+				const FString StateTitle = StateNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
+				const FString StateGraphName = StateNode->BoundGraph ? StateNode->BoundGraph->GetName() : FString();
+				const FString StateTokenSource = !StateTitle.IsEmpty() ? StateTitle : StateGraphName;
+				const FString StateCamel = BuildStateCamelToken(StateTokenSource);
+				const FString StateKey = NormalizeKey(StateTokenSource);
+				if (!StateCamel.IsEmpty())
+				{
+					const FString ExactCandidate = FString::Printf(TEXT("OnStateEntry_%s"), *StateCamel);
+					if (IsKnownFunction(ExactCandidate))
+					{
+						DesiredNotifyName = ExactCandidate;
+					}
+				}
+
+				if (DesiredNotifyName.IsEmpty() && !StateKey.IsEmpty())
+				{
+					for (const FName CandidateName : BlueprintFunctionNames)
+					{
+						const FString Candidate = CandidateName.ToString();
+						if (!Candidate.StartsWith(TEXT("OnStateEntry_"), ESearchCase::CaseSensitive))
+						{
+							continue;
+						}
+						const FString CandidateSuffix = Candidate.Mid(13);
+						if (NormalizeKey(CandidateSuffix).Equals(StateKey, ESearchCase::CaseSensitive))
+						{
+							DesiredNotifyName = Candidate;
+							break;
+						}
+					}
+				}
+			}
+		}
+
+		const FString PatchedStateEnteredText = EnsureStateEnteredNotifyNameFromStateResult_ExportBpy(
+			ExistingStateEnteredText,
+			DesiredNotifyName);
+		if (!PatchedStateEnteredText.IsEmpty())
+		{
+			NodeProps->SetStringField(TEXT("StateEntered"), PatchedStateEnteredText);
+		}
 	}
 
 	if (const UAnimStateConduitNode* ConduitNode = Cast<UAnimStateConduitNode>(Node))

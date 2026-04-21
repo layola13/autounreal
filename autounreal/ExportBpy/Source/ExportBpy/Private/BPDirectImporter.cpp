@@ -13328,6 +13328,7 @@ static bool ReplayTopLevelGraphSerializedConnectionsAfterCompile_ImportBpy(
 
 		GraphObj->TryGetStringField(TEXT("graph_type"), OutGraphType);
 		GraphObj->TryGetStringField(TEXT("name"), OutGraphName);
+
 		if (!IsNodeOwnedNestedGraphJson_ImportBpy(GraphObj))
 		{
 			return EnsureGraphExists_ImportBpy(BP, GraphObj, OutGraph, OutGraphType, OutGraphName, OutError);
@@ -13340,6 +13341,9 @@ static bool ReplayTopLevelGraphSerializedConnectionsAfterCompile_ImportBpy(
 
 		auto ResolveFromReachableInventory = [&]() -> UEdGraph*
 		{
+			TArray<UEdGraph*> Candidates;
+			Candidates.Reserve(ReachableGraphs.Num());
+
 			if (!GraphGuidText.IsEmpty())
 			{
 				FGuid ParsedGraphGuid;
@@ -13347,35 +13351,134 @@ static bool ReplayTopLevelGraphSerializedConnectionsAfterCompile_ImportBpy(
 				{
 					for (UEdGraph* CandidateGraph : ReachableGraphs)
 					{
-						if (CandidateGraph && CandidateGraph->GraphGuid == ParsedGraphGuid)
+						if (!CandidateGraph)
 						{
-							return CandidateGraph;
+							continue;
 						}
+						if (CandidateGraph->GraphGuid != ParsedGraphGuid)
+						{
+							continue;
+						}
+						if (!OutGraphName.IsEmpty() &&
+							!CandidateGraph->GetName().Equals(OutGraphName, ESearchCase::CaseSensitive))
+						{
+							continue;
+						}
+						if (!GraphOuterKind.IsEmpty() &&
+							!DescribeGraphOuterKind_ImportBpy(CandidateGraph).Equals(
+								GraphOuterKind, ESearchCase::IgnoreCase))
+						{
+							continue;
+						}
+						Candidates.Add(CandidateGraph);
 					}
 				}
 			}
 
-			if (OutGraphName.IsEmpty())
+			if (Candidates.Num() == 0)
 			{
-				return nullptr;
+				if (OutGraphName.IsEmpty())
+				{
+					return nullptr;
+				}
+
+				for (UEdGraph* CandidateGraph : ReachableGraphs)
+				{
+					if (!CandidateGraph ||
+						!CandidateGraph->GetName().Equals(OutGraphName, ESearchCase::CaseSensitive))
+					{
+						continue;
+					}
+					if (GraphOuterKind.IsEmpty() ||
+						DescribeGraphOuterKind_ImportBpy(CandidateGraph).Equals(
+							GraphOuterKind, ESearchCase::IgnoreCase))
+					{
+						Candidates.Add(CandidateGraph);
+					}
+				}
 			}
 
-			for (UEdGraph* CandidateGraph : ReachableGraphs)
+			if (Candidates.Num() <= 1)
 			{
-				if (!CandidateGraph ||
-					!CandidateGraph->GetName().Equals(OutGraphName, ESearchCase::CaseSensitive))
+				return Candidates.Num() == 1 ? Candidates[0] : nullptr;
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* SerializedNodesArr = nullptr;
+			int32 ExpectedNodeCount = INDEX_NONE;
+			TSet<FGuid> SerializedNodeGuids;
+			if (GraphObj->TryGetArrayField(TEXT("nodes"), SerializedNodesArr) && SerializedNodesArr)
+			{
+				ExpectedNodeCount = SerializedNodesArr->Num();
+				for (const TSharedPtr<FJsonValue>& NodeValue : *SerializedNodesArr)
+				{
+					const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+					if (!NodeObj.IsValid())
+					{
+						continue;
+					}
+					FString NodeGuidText;
+					if (!NodeObj->TryGetStringField(TEXT("node_guid"), NodeGuidText) || NodeGuidText.IsEmpty())
+					{
+						continue;
+					}
+					FGuid ParsedNodeGuid;
+					if (TryParseGuid_ImportBpy(NodeGuidText, ParsedNodeGuid))
+					{
+						SerializedNodeGuids.Add(ParsedNodeGuid);
+					}
+				}
+			}
+
+			struct FCandidateScore
+			{
+				UEdGraph* Graph = nullptr;
+				int32 NodeCountDelta = TNumericLimits<int32>::Max();
+				int32 GuidHits = -1;
+			};
+
+			TArray<FCandidateScore> ScoredCandidates;
+			ScoredCandidates.Reserve(Candidates.Num());
+			for (UEdGraph* CandidateGraph : Candidates)
+			{
+				if (!CandidateGraph)
 				{
 					continue;
 				}
-
-				if (GraphOuterKind.IsEmpty() ||
-					DescribeGraphOuterKind_ImportBpy(CandidateGraph).Equals(GraphOuterKind, ESearchCase::IgnoreCase))
+				FCandidateScore Score;
+				Score.Graph = CandidateGraph;
+				if (ExpectedNodeCount != INDEX_NONE)
 				{
-					return CandidateGraph;
+					Score.NodeCountDelta = FMath::Abs(CandidateGraph->Nodes.Num() - ExpectedNodeCount);
 				}
+				if (SerializedNodeGuids.Num() > 0)
+				{
+					int32 Hits = 0;
+					for (UEdGraphNode* Node : CandidateGraph->Nodes)
+					{
+						if (Node && SerializedNodeGuids.Contains(Node->NodeGuid))
+						{
+							++Hits;
+						}
+					}
+					Score.GuidHits = Hits;
+				}
+				ScoredCandidates.Add(Score);
 			}
 
-			return nullptr;
+			ScoredCandidates.Sort([](const FCandidateScore& A, const FCandidateScore& B)
+			{
+				if (A.NodeCountDelta != B.NodeCountDelta)
+				{
+					return A.NodeCountDelta < B.NodeCountDelta;
+				}
+				if (A.GuidHits != B.GuidHits)
+				{
+					return A.GuidHits > B.GuidHits;
+				}
+				return A.Graph < B.Graph;
+			});
+
+			return ScoredCandidates.Num() > 0 ? ScoredCandidates[0].Graph : nullptr;
 		};
 
 		OutGraph = ResolveFromReachableInventory();
@@ -15019,6 +15122,113 @@ bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 		GatherReachableGraphs_ImportBpy(RootGraph, VisitedGraphs, ReachableGraphs);
 	}
 
+	TSet<FName> BlueprintFunctionNames;
+	for (UEdGraph* FunctionGraph : BP->FunctionGraphs)
+	{
+		if (FunctionGraph)
+		{
+			BlueprintFunctionNames.Add(FName(*FunctionGraph->GetName()));
+		}
+	}
+
+	auto IsPlaceholderHookName = [](const FName& Name) -> bool
+	{
+		return Name == FName(TEXT("OnStateEntry")) || Name == FName(TEXT("OnUpdate"));
+	};
+
+	auto NormalizeKey = [](const FString& Input) -> FString
+	{
+		FString Out;
+		Out.Reserve(Input.Len());
+		for (int32 Index = 0; Index < Input.Len(); ++Index)
+		{
+			const TCHAR Ch = Input[Index];
+			if (FChar::IsAlnum(Ch))
+			{
+				Out.AppendChar(FChar::ToLower(Ch));
+			}
+		}
+		return Out;
+	};
+
+	auto BuildStateCamelToken = [](const FString& Input) -> FString
+	{
+		FString Out;
+		bool bNewWord = true;
+		for (int32 Index = 0; Index < Input.Len(); ++Index)
+		{
+			const TCHAR Ch = Input[Index];
+			if (!FChar::IsAlnum(Ch))
+			{
+				bNewWord = true;
+				continue;
+			}
+
+			if (bNewWord)
+			{
+				Out.AppendChar(FChar::ToUpper(Ch));
+				bNewWord = false;
+			}
+			else
+			{
+				Out.AppendChar(FChar::ToLower(Ch));
+			}
+		}
+		return Out;
+	};
+
+	auto ResolveBestEntryFunctionNameForState = [&BlueprintFunctionNames, &NormalizeKey, &BuildStateCamelToken](
+		const UAnimStateNode* StateNode,
+		const FName ParsedStateEntryName) -> FName
+	{
+		if (!StateNode)
+		{
+			return ParsedStateEntryName;
+		}
+
+		if (!ParsedStateEntryName.IsNone() &&
+			ParsedStateEntryName != FName(TEXT("OnStateEntry")) &&
+			ParsedStateEntryName != FName(TEXT("OnUpdate")) &&
+			BlueprintFunctionNames.Contains(ParsedStateEntryName))
+		{
+			return ParsedStateEntryName;
+		}
+
+		const FString StateTitle = StateNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
+		const FString StateGraphName = StateNode->BoundGraph ? StateNode->BoundGraph->GetName() : FString();
+		const FString StateTokenSource = !StateTitle.IsEmpty() ? StateTitle : StateGraphName;
+		const FString StateCamel = BuildStateCamelToken(StateTokenSource);
+		const FString StateKey = NormalizeKey(StateTokenSource);
+		if (!StateCamel.IsEmpty())
+		{
+			const FName ExactCandidate(*FString::Printf(TEXT("OnStateEntry_%s"), *StateCamel));
+			if (BlueprintFunctionNames.Contains(ExactCandidate))
+			{
+				return ExactCandidate;
+			}
+		}
+
+		if (!StateKey.IsEmpty())
+		{
+			for (const FName CandidateName : BlueprintFunctionNames)
+			{
+				const FString Candidate = CandidateName.ToString();
+				if (!Candidate.StartsWith(TEXT("OnStateEntry_"), ESearchCase::CaseSensitive))
+				{
+					continue;
+				}
+
+				const FString CandidateSuffix = Candidate.Mid(13);
+				if (NormalizeKey(CandidateSuffix).Equals(StateKey, ESearchCase::CaseSensitive))
+				{
+					return CandidateName;
+				}
+			}
+		}
+
+		return ParsedStateEntryName;
+	};
+
 	for (UEdGraph* Graph : ReachableGraphs)
 	{
 		if (!Graph)
@@ -15052,12 +15262,24 @@ bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 				}
 			}
 
-			if (DesiredNotifyName.IsNone() || !StateNode->StateEntered.NotifyName.IsNone())
+			DesiredNotifyName = ResolveBestEntryFunctionNameForState(StateNode, DesiredNotifyName);
+			if (DesiredNotifyName.IsNone())
 			{
 				continue;
 			}
 
-			const FName PreviousNotifyName = StateNode->StateEntered.NotifyName;
+			const FName ExistingNotifyName = StateNode->StateEntered.NotifyName;
+			const bool bExistingIsPlaceholder =
+				ExistingNotifyName == FName(TEXT("OnStateEntry")) ||
+				ExistingNotifyName == FName(TEXT("OnUpdate"));
+			const bool bExistingFunctionExists = BlueprintFunctionNames.Contains(ExistingNotifyName);
+			if (ExistingNotifyName == DesiredNotifyName ||
+				(!ExistingNotifyName.IsNone() && !bExistingIsPlaceholder && bExistingFunctionExists))
+			{
+				continue;
+			}
+
+			const FName PreviousNotifyName = ExistingNotifyName;
 			StateNode->Modify();
 			StateNode->StateEntered.NotifyName = DesiredNotifyName;
 			if (!StateNode->StateEntered.Guid.IsValid())
@@ -15145,15 +15367,31 @@ bool ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
 			{
 				continue;
 			}
+			if (StateEntryFunctionName == FName(TEXT("OnStateEntry")) ||
+				StateEntryFunctionName == FName(TEXT("OnUpdate")))
+			{
+				// Exported state-result text can carry placeholder names for transition states.
+				// Treat placeholders as non-authoritative and skip hard validation for them.
+				continue;
+			}
 
-			if (StateNode->StateEntered.NotifyName.IsNone())
+			const FName ActualNotifyName = StateNode->StateEntered.NotifyName;
+			const bool bMissingNotify = ActualNotifyName.IsNone();
+			const bool bPlaceholderNotify =
+				ActualNotifyName == FName(TEXT("OnStateEntry")) ||
+				ActualNotifyName == FName(TEXT("OnUpdate"));
+			const bool bUnresolvedNotify =
+				!bMissingNotify &&
+				ResolveSelfContextFunction_ImportBpy(StateNode->BoundGraph, ActualNotifyName.ToString()) == nullptr;
+			if (bMissingNotify || bPlaceholderNotify || bUnresolvedNotify)
 			{
 				MissingBindings.Add(FString::Printf(
-					TEXT("graph=%s state=%s node=%s expected_notify=%s"),
+					TEXT("graph=%s state=%s node=%s expected_notify=%s actual_notify=%s"),
 					*Graph->GetName(),
 					*StateNode->GetName(),
 					*DescribeNode_ImportBpy(StateNode),
-					*StateEntryFunctionName.ToString()));
+					*StateEntryFunctionName.ToString(),
+					ActualNotifyName.IsNone() ? TEXT("None") : *ActualNotifyName.ToString()));
 			}
 		}
 	}
@@ -18215,7 +18453,10 @@ void CollectAnimNodePropertyBindingMismatches_ImportBpy(
 				continue;
 			}
 
+			// UE can preserve binding keys/types while omitting PathAsText in serialized map text
+			// after reload. Treat empty actual path text as "not comparable" instead of corruption.
 			if (!ExpectedDescriptor.PathAsText.IsEmpty() &&
+				!ActualDescriptor->PathAsText.IsEmpty() &&
 				!ActualDescriptor->PathAsText.Equals(ExpectedDescriptor.PathAsText, ESearchCase::CaseSensitive))
 			{
 				OutMismatches.Add(FString::Printf(
@@ -19503,7 +19744,8 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	bool bCompileBlueprint,
 	FString& OutError)
 {
-	ResetAllImportedNodeRegistries_ImportBpy();
+	// Live Coding can leave static registry storage in a bad state across patch reloads.
+	// Avoid hard reset at import entry; registries are overwritten per-uid during import.
 
 	if (GEditor && GEditor->PlayWorld)
 	{

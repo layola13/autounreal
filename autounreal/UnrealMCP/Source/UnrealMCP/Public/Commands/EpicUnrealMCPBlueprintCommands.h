@@ -60,6 +60,7 @@ private:
     TSharedPtr<FJsonObject> HandleReadBlueprintContentFast(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAnalyzeBlueprintGraph(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAnalyzeBlueprintGraphFast(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleValidateBlueprintFast(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleGetBlueprintProperties(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleGetBlueprintComponentProperties(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleGetBlueprintPropertiesSpecifiers(const TSharedPtr<FJsonObject>& Params);

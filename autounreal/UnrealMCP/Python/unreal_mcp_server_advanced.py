@@ -2767,6 +2767,28 @@ def analyze_blueprint_graph_fast(
 
 
 @mcp.tool()
+def validate_blueprint_fast(
+    blueprint_path: str,
+    state_machine_graph_name: str = "State Controller",
+    anim_graph_name: str = "AnimGraph",
+    critical_function_names: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """
+    Fast validation pass for animation-heavy Blueprints.
+
+    Returns quick structural checks for key graphs and critical function presence.
+    """
+    params: Dict[str, Any] = {
+        "blueprint_path": blueprint_path,
+        "state_machine_graph_name": state_machine_graph_name,
+        "anim_graph_name": anim_graph_name,
+    }
+    if critical_function_names is not None:
+        params["critical_function_names"] = critical_function_names
+    return _forward_unreal_command("validate_blueprint_fast", params)
+
+
+@mcp.tool()
 def get_blueprint_variable_details(
     blueprint_path: str,
     variable_name: str = None

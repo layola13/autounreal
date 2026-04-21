@@ -6478,6 +6478,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleCommand(const FSt
     {
         return HandleAnalyzeBlueprintGraphFast(Params);
     }
+    else if (CommandType == TEXT("validate_blueprint_fast") || CommandType == TEXT("validate_blueprint_fast_v1"))
+    {
+        return HandleValidateBlueprintFast(Params);
+    }
     else if (CommandType == TEXT("get_blueprint_properties"))
     {
         return HandleGetBlueprintProperties(Params);
@@ -11743,6 +11747,217 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleAnalyzeBlueprintG
     ResultObj->SetStringField(TEXT("blueprint_path"), BlueprintPath);
     ResultObj->SetObjectField(TEXT("graph_data"), GraphData);
     ResultObj->SetBoolField(TEXT("success"), true);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleValidateBlueprintFast(const TSharedPtr<FJsonObject>& Params)
+{
+    // Fast structural validator for animation-heavy blueprints.
+    FString BlueprintPath;
+    if (!Params->TryGetStringField(TEXT("blueprint_path"), BlueprintPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_path' parameter"));
+    }
+
+    FString StateMachineGraphName = TEXT("State Controller");
+    Params->TryGetStringField(TEXT("state_machine_graph_name"), StateMachineGraphName);
+
+    FString AnimGraphName = TEXT("AnimGraph");
+    Params->TryGetStringField(TEXT("anim_graph_name"), AnimGraphName);
+
+    const TArray<FString> DefaultCriticalFunctionNames = {
+        TEXT("OnStateEntry_LocomotionLoop"),
+        TEXT("SetBlendStackAnimFromChooser"),
+        TEXT("Update_MotionMatching")
+    };
+    TArray<FString> CriticalFunctionNames = DefaultCriticalFunctionNames;
+    const TArray<TSharedPtr<FJsonValue>>* CriticalFunctionJson = nullptr;
+    if (Params->TryGetArrayField(TEXT("critical_function_names"), CriticalFunctionJson) && CriticalFunctionJson)
+    {
+        CriticalFunctionNames.Reset();
+        for (const TSharedPtr<FJsonValue>& Value : *CriticalFunctionJson)
+        {
+            if (!Value.IsValid() || Value->Type != EJson::String)
+            {
+                continue;
+            }
+            const FString Name = Value->AsString().TrimStartAndEnd();
+            if (!Name.IsEmpty())
+            {
+                CriticalFunctionNames.Add(Name);
+            }
+        }
+    }
+
+    UBlueprint* Blueprint = Cast<UBlueprint>(UEditorAssetLibrary::LoadAsset(BlueprintPath));
+    if (!Blueprint)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Failed to load blueprint: %s"), *BlueprintPath));
+    }
+
+    auto MakeIssue = [](const FString& Severity, const FString& Code, const FString& Message) -> TSharedPtr<FJsonValueObject>
+    {
+        TSharedPtr<FJsonObject> Issue = MakeShared<FJsonObject>();
+        Issue->SetStringField(TEXT("severity"), Severity);
+        Issue->SetStringField(TEXT("code"), Code);
+        Issue->SetStringField(TEXT("message"), Message);
+        return MakeShared<FJsonValueObject>(Issue);
+    };
+
+    auto BuildGraphSummary = [](UEdGraph* Graph) -> TSharedPtr<FJsonObject>
+    {
+        TSharedPtr<FJsonObject> GraphObj = MakeShared<FJsonObject>();
+        if (!Graph)
+        {
+            GraphObj->SetBoolField(TEXT("exists"), false);
+            GraphObj->SetNumberField(TEXT("node_count"), 0);
+            GraphObj->SetNumberField(TEXT("connection_count"), 0);
+            GraphObj->SetObjectField(TEXT("node_class_counts"), MakeShared<FJsonObject>());
+            return GraphObj;
+        }
+
+        TMap<FString, int32> NodeClassCounts;
+        int32 NodeCount = 0;
+        int32 ConnectionCount = 0;
+        TSet<FString> SeenConnections;
+        for (UEdGraphNode* Node : Graph->Nodes)
+        {
+            if (!Node)
+            {
+                continue;
+            }
+
+            ++NodeCount;
+            const FString ClassName = Node->GetClass()->GetName();
+            int32& ClassCount = NodeClassCounts.FindOrAdd(ClassName);
+            ClassCount += 1;
+
+            for (UEdGraphPin* Pin : Node->Pins)
+            {
+                if (!Pin)
+                {
+                    continue;
+                }
+
+                for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+                {
+                    if (!LinkedPin || !LinkedPin->GetOwningNode() || !Pin->GetOwningNode())
+                    {
+                        continue;
+                    }
+
+                    const FString A = FString::Printf(TEXT("%s:%s"), *Pin->GetOwningNode()->GetName(), *Pin->PinName.ToString());
+                    const FString B = FString::Printf(TEXT("%s:%s"), *LinkedPin->GetOwningNode()->GetName(), *LinkedPin->PinName.ToString());
+                    const FString Key = (A <= B) ? FString::Printf(TEXT("%s|%s"), *A, *B) : FString::Printf(TEXT("%s|%s"), *B, *A);
+                    if (!SeenConnections.Contains(Key))
+                    {
+                        SeenConnections.Add(Key);
+                        ++ConnectionCount;
+                    }
+                }
+            }
+        }
+
+        TSharedPtr<FJsonObject> ClassCountObj = MakeShared<FJsonObject>();
+        for (const TPair<FString, int32>& It : NodeClassCounts)
+        {
+            ClassCountObj->SetNumberField(It.Key, It.Value);
+        }
+
+        GraphObj->SetBoolField(TEXT("exists"), true);
+        GraphObj->SetStringField(TEXT("graph_name"), Graph->GetName());
+        GraphObj->SetStringField(TEXT("graph_path"), Graph->GetPathName());
+        GraphObj->SetNumberField(TEXT("node_count"), NodeCount);
+        GraphObj->SetNumberField(TEXT("connection_count"), ConnectionCount);
+        GraphObj->SetObjectField(TEXT("node_class_counts"), ClassCountObj);
+        return GraphObj;
+    };
+
+    TArray<TSharedPtr<FJsonValue>> Issues;
+
+    UEdGraph* StateMachineGraph = FindBlueprintGraphByNameOrPath(Blueprint, StateMachineGraphName);
+    UEdGraph* AnimGraph = FindBlueprintGraphByNameOrPath(Blueprint, AnimGraphName);
+
+    TSharedPtr<FJsonObject> StateMachineSummary = BuildGraphSummary(StateMachineGraph);
+    TSharedPtr<FJsonObject> AnimGraphSummary = BuildGraphSummary(AnimGraph);
+
+    if (!StateMachineSummary->GetBoolField(TEXT("exists")))
+    {
+        const FString AvailableGraphList = FString::Join(GetAllBlueprintGraphNames(Blueprint), TEXT(", "));
+        Issues.Add(MakeIssue(
+            TEXT("error"),
+            TEXT("missing_state_machine_graph"),
+            FString::Printf(TEXT("Graph '%s' not found. Available graphs: %s"), *StateMachineGraphName, *AvailableGraphList)));
+    }
+    else
+    {
+        const int32 NodeCount = static_cast<int32>(StateMachineSummary->GetNumberField(TEXT("node_count")));
+        const int32 ConnectionCount = static_cast<int32>(StateMachineSummary->GetNumberField(TEXT("connection_count")));
+        if (NodeCount <= 2 || ConnectionCount == 0)
+        {
+            Issues.Add(MakeIssue(
+                TEXT("error"),
+                TEXT("state_machine_graph_sparse"),
+                FString::Printf(TEXT("State machine graph '%s' looks sparse (nodes=%d, connections=%d)."),
+                    *StateMachineGraphName, NodeCount, ConnectionCount)));
+        }
+    }
+
+    if (!AnimGraphSummary->GetBoolField(TEXT("exists")))
+    {
+        const FString AvailableGraphList = FString::Join(GetAllBlueprintGraphNames(Blueprint), TEXT(", "));
+        Issues.Add(MakeIssue(
+            TEXT("error"),
+            TEXT("missing_anim_graph"),
+            FString::Printf(TEXT("Graph '%s' not found. Available graphs: %s"), *AnimGraphName, *AvailableGraphList)));
+    }
+    else
+    {
+        const int32 ConnectionCount = static_cast<int32>(AnimGraphSummary->GetNumberField(TEXT("connection_count")));
+        if (ConnectionCount == 0)
+        {
+            Issues.Add(MakeIssue(
+                TEXT("error"),
+                TEXT("anim_graph_no_connections"),
+                FString::Printf(TEXT("Anim graph '%s' has no connections."), *AnimGraphName)));
+        }
+    }
+
+    UClass* GeneratedClass = Blueprint->GeneratedClass ? Blueprint->GeneratedClass : Blueprint->SkeletonGeneratedClass;
+    TArray<TSharedPtr<FJsonValue>> FunctionChecks;
+    for (const FString& FunctionName : CriticalFunctionNames)
+    {
+        TSharedPtr<FJsonObject> FunctionObj = MakeShared<FJsonObject>();
+        FunctionObj->SetStringField(TEXT("name"), FunctionName);
+
+        bool bExists = false;
+        if (GeneratedClass && !FunctionName.IsEmpty())
+        {
+            bExists = (GeneratedClass->FindFunctionByName(FName(*FunctionName)) != nullptr);
+        }
+        FunctionObj->SetBoolField(TEXT("exists"), bExists);
+        FunctionChecks.Add(MakeShared<FJsonValueObject>(FunctionObj));
+
+        if (!bExists)
+        {
+            Issues.Add(MakeIssue(
+                TEXT("error"),
+                TEXT("missing_critical_function"),
+                FString::Printf(TEXT("Critical function '%s' was not found on generated class."), *FunctionName)));
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetBoolField(TEXT("valid"), Issues.Num() == 0);
+    ResultObj->SetStringField(TEXT("blueprint_name"), Blueprint->GetName());
+    ResultObj->SetStringField(TEXT("blueprint_path"), Blueprint->GetPathName());
+    ResultObj->SetObjectField(TEXT("state_machine_graph"), StateMachineSummary);
+    ResultObj->SetObjectField(TEXT("anim_graph"), AnimGraphSummary);
+    ResultObj->SetArrayField(TEXT("critical_functions"), FunctionChecks);
+    ResultObj->SetArrayField(TEXT("issues"), Issues);
+    ResultObj->SetNumberField(TEXT("issue_count"), Issues.Num());
     return ResultObj;
 }
 

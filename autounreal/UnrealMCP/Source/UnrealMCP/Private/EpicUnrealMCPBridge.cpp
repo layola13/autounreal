@@ -180,6 +180,8 @@ EMCPCommandGroup GetCommandGroup(const FString& CanonicalCommand)
         TEXT("read_blueprint_content_fast"),
         TEXT("analyze_blueprint_graph"),
         TEXT("analyze_blueprint_graph_fast"),
+        TEXT("validate_blueprint_fast"),
+        TEXT("validate_blueprint_fast_v1"),
         TEXT("get_blueprint_properties"),
         TEXT("get_blueprint_component_properties"),
         TEXT("get_blueprint_properties_specifiers"),

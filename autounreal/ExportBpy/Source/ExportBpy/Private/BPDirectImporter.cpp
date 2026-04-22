@@ -137,6 +137,18 @@ enum class ETunnelKind_ImportBpy : uint8
 	Exit,
 };
 
+struct FStateMachineBindingSnapshot_ImportBpy
+{
+	FString NodeClassName;
+	FString NodeGuid;
+	FString GraphName;
+	FString StateEnteredText;
+	FString StateLeftText;
+	FString StateFullyBlendedText;
+	FName StateEntryFunctionName = NAME_None;
+	FName UpdateFunctionName = NAME_None;
+};
+
 USCS_Node* FindComponentNodeByName_ImportBpy(UBlueprint* BP, const FString& ComponentName);
 FString GetNodePropString_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson, const TCHAR* Key);
 UClass* ResolveNodeClass_ImportBpy(const FString& NodeClassName);
@@ -251,7 +263,8 @@ bool ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
 bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 	UBlueprint* BP,
 	int32& OutRepairedCount,
-	FString& OutError);
+	FString& OutError,
+	const TSharedPtr<FJsonObject>* RootJsonForBpyData = nullptr);
 void LogAnimBlueprintStateMachineEntryBindings_ImportBpy(
 	UBlueprint* BP,
 	const TCHAR* StageName);
@@ -280,6 +293,9 @@ void CollectStateMachineBindingContractMismatches_ImportBpy(
 	const TSharedPtr<FJsonObject>& SourceRoot,
 	const TSharedPtr<FJsonObject>& LiveRoot,
 	TArray<FString>& OutMismatches);
+void CollectSerializedStateMachineBindingSnapshotsFromRootJson_ImportBpy(
+	const TSharedPtr<FJsonObject>& Root,
+	TMap<FString, FStateMachineBindingSnapshot_ImportBpy>& OutSnapshotsByNodeGuid);
 void CollectLinkedAnimLayerContractMismatches_ImportBpy(
 	const TSharedPtr<FJsonObject>& SourceRoot,
 	const TSharedPtr<FJsonObject>& LiveRoot,
@@ -308,6 +324,28 @@ bool RunPostSaveReloadValidation_ImportBpy(
 	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs,
 	const TArray<FString>& CompileWarnings,
 	UBlueprint*& InOutBlueprint,
+	FString& OutError);
+
+bool ReplayAndValidateBlueprintDefaultsContract_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	const TCHAR* Stage,
+	FString& OutError);
+bool ValidateImportedAnimBlueprintAgainstSourceAsset_ImportBpy(
+	UBlueprint* ImportedBP,
+	const FString& SourceBlueprintPath,
+	const TCHAR* Stage,
+	FString& OutError);
+bool ValidateIncomingExecTopologyAgainstSourceBeforeImport_ImportBpy(
+	const TSharedPtr<FJsonObject>& IncomingRoot,
+	const FString& SourceBlueprintPath,
+	const TCHAR* Stage,
+	FString& OutError);
+bool ValidateFunctionExecTopologyParityAgainstSource_ImportBpy(
+	UBlueprint* SourceBP,
+	UBlueprint* ImportedBP,
+	const FName& FunctionName,
+	const TCHAR* Stage,
 	FString& OutError);
 void LogImportedAnimBlueprintReachableGraphInventory_ImportBpy(
 	UBlueprint* BP,
@@ -15323,7 +15361,8 @@ bool ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
 bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 	UBlueprint* BP,
 	int32& OutRepairedCount,
-	FString& OutError)
+	FString& OutError,
+	const TSharedPtr<FJsonObject>* RootJsonForBpyData)
 {
 	// Keep state-node entry event names aligned with state-result hook functions.
 	OutRepairedCount = 0;
@@ -15331,6 +15370,17 @@ bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 	if (!BP || !Cast<UAnimBlueprint>(BP))
 	{
 		return true;
+	}
+
+	// Pre-collect snapshots from bpy data if RootJson is provided
+	// This is needed because AnimGraphNode_StateResult.Node is only populated AFTER compilation,
+	// but we need the StateEntryFunctionName from the bpy data for repair
+	TMap<FString, FStateMachineBindingSnapshot_ImportBpy> BpyDataSnapshots;
+	if (RootJsonForBpyData && RootJsonForBpyData->IsValid())
+	{
+		CollectSerializedStateMachineBindingSnapshotsFromRootJson_ImportBpy(
+			*RootJsonForBpyData,
+			BpyDataSnapshots);
 	}
 
 	TArray<UEdGraph*> RootGraphs;
@@ -15470,12 +15520,37 @@ bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 			{
 				if (UAnimGraphNode_StateResult* StateResultNode = Cast<UAnimGraphNode_StateResult>(BoundNode))
 				{
-					const FString StateResultNodeText =
-						ReadNodePropertyAsText_ImportBpy(StateResultNode, TEXT("Node"));
-					DesiredNotifyName =
-						ExtractStateResultHookFunctionNameFromStructText_ImportBpy(
-							StateResultNodeText,
-							TEXT("StateEntryFunction"));
+					FString StateResultNodeText;
+					FName StateEntryFunctionFromBpy = NAME_None;
+
+					// First try to get from bpy data snapshots (which have the correct pre-compilation value)
+					if (!BpyDataSnapshots.IsEmpty())
+					{
+						// Normalize GUID to match how it's stored in snapshots (uppercase, DigitsWithHyphens)
+						const FString StateResultGuid = StateResultNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens).ToUpper();
+						const FStateMachineBindingSnapshot_ImportBpy* Snapshot = BpyDataSnapshots.Find(StateResultGuid);
+						if (Snapshot && !Snapshot->StateEntryFunctionName.IsNone())
+						{
+							StateEntryFunctionFromBpy = Snapshot->StateEntryFunctionName;
+						}
+					}
+
+					// Use bpy data if found, otherwise fall back to live node property
+					if (!StateEntryFunctionFromBpy.IsNone())
+					{
+						DesiredNotifyName = StateEntryFunctionFromBpy;
+					}
+					else
+					{
+						// Live node's Node property - only populated after compilation
+						StateResultNodeText =
+							ReadNodePropertyAsText_ImportBpy(StateResultNode, TEXT("Node"));
+						DesiredNotifyName =
+							ExtractStateResultHookFunctionNameFromStructText_ImportBpy(
+								StateResultNodeText,
+								TEXT("StateEntryFunction"));
+					}
+
 					if (!DesiredNotifyName.IsNone())
 					{
 						break;
@@ -17816,18 +17891,6 @@ void CollectStateMachineAliasNodeMismatches_ImportBpy(
 	}
 }
 
-struct FStateMachineBindingSnapshot_ImportBpy
-{
-	FString NodeClassName;
-	FString NodeGuid;
-	FString GraphName;
-	FString StateEnteredText;
-	FString StateLeftText;
-	FString StateFullyBlendedText;
-	FName StateEntryFunctionName = NAME_None;
-	FName UpdateFunctionName = NAME_None;
-};
-
 bool IsSerializedStructTextEmpty_ImportBpy(const FString& InText)
 {
 	FString Text = InText;
@@ -17880,6 +17943,53 @@ FName ExtractAnimStateNotifyNameFromSerializedText_ImportBpy(const FString& Seri
 	}
 
 	return FName(*NotifyName);
+}
+
+TArray<FName> ExtractAnimStateNotifyNamesFromSerializedText_ImportBpy(const FString& SerializedText)
+{
+	TArray<FName> Result;
+	if (SerializedText.IsEmpty())
+	{
+		return Result;
+	}
+
+	static const TCHAR* Needle = TEXT("NotifyName=\"");
+	const int32 NeedleLen = FCString::Strlen(Needle);
+	int32 SearchPos = 0;
+	while (SearchPos < SerializedText.Len())
+	{
+		const int32 NeedlePos = SerializedText.Find(
+			Needle,
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart,
+			SearchPos);
+		if (NeedlePos == INDEX_NONE)
+		{
+			break;
+		}
+
+		const int32 ValueStart = NeedlePos + NeedleLen;
+		const int32 ValueEnd = SerializedText.Find(
+			TEXT("\""),
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart,
+			ValueStart);
+		if (ValueEnd == INDEX_NONE || ValueEnd <= ValueStart)
+		{
+			break;
+		}
+
+		const FString NotifyName =
+			SerializedText.Mid(ValueStart, ValueEnd - ValueStart).TrimStartAndEnd();
+		if (!NotifyName.IsEmpty() && !NotifyName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+		{
+			Result.Add(FName(*NotifyName));
+		}
+
+		SearchPos = ValueEnd + 1;
+	}
+
+	return Result;
 }
 
 FName ExtractStateResultHookFunctionNameFromStructText_ImportBpy(
@@ -18282,6 +18392,63 @@ void CollectStateMachineBindingContractMismatches_ImportBpy(
 					FieldName ? FieldName : TEXT("<null>"),
 					*ExpectedNotifyName.ToString(),
 					*ActualNotifyName.ToString()));
+			}
+
+			const TArray<FName> ExpectedNotifyNames =
+				ExtractAnimStateNotifyNamesFromSerializedText_ImportBpy(ExpectedText);
+			const TArray<FName> ActualNotifyNames =
+				ExtractAnimStateNotifyNamesFromSerializedText_ImportBpy(ActualText);
+			if (ExpectedNotifyNames.Num() != ActualNotifyNames.Num())
+			{
+				TArray<FString> ExpectedNotifyNameStrings;
+				TArray<FString> ActualNotifyNameStrings;
+				ExpectedNotifyNameStrings.Reserve(ExpectedNotifyNames.Num());
+				ActualNotifyNameStrings.Reserve(ActualNotifyNames.Num());
+				for (const FName Name : ExpectedNotifyNames)
+				{
+					ExpectedNotifyNameStrings.Add(Name.ToString());
+				}
+				for (const FName Name : ActualNotifyNames)
+				{
+					ActualNotifyNameStrings.Add(Name.ToString());
+				}
+				OutMismatches.Add(FString::Printf(
+					TEXT("state_node_notify_count_mismatch guid=%s graph=%s node_class=%s field=%s expected=%s actual=%s"),
+					*NodeGuid,
+					*Expected.GraphName,
+					*Expected.NodeClassName,
+					FieldName ? FieldName : TEXT("<null>"),
+					*FString::Join(ExpectedNotifyNameStrings, TEXT(",")),
+					*FString::Join(ActualNotifyNameStrings, TEXT(","))));
+				return;
+			}
+
+			for (int32 Index = 0; Index < ExpectedNotifyNames.Num(); ++Index)
+			{
+				if (ExpectedNotifyNames[Index] != ActualNotifyNames[Index])
+				{
+					TArray<FString> ExpectedNotifyNameStrings;
+					TArray<FString> ActualNotifyNameStrings;
+					ExpectedNotifyNameStrings.Reserve(ExpectedNotifyNames.Num());
+					ActualNotifyNameStrings.Reserve(ActualNotifyNames.Num());
+					for (const FName Name : ExpectedNotifyNames)
+					{
+						ExpectedNotifyNameStrings.Add(Name.ToString());
+					}
+					for (const FName Name : ActualNotifyNames)
+					{
+						ActualNotifyNameStrings.Add(Name.ToString());
+					}
+					OutMismatches.Add(FString::Printf(
+						TEXT("state_node_notify_list_mismatch guid=%s graph=%s node_class=%s field=%s expected=%s actual=%s"),
+						*NodeGuid,
+						*Expected.GraphName,
+						*Expected.NodeClassName,
+						FieldName ? FieldName : TEXT("<null>"),
+						*FString::Join(ExpectedNotifyNameStrings, TEXT(",")),
+						*FString::Join(ActualNotifyNameStrings, TEXT(","))));
+					return;
+				}
 			}
 		};
 
@@ -20051,7 +20218,8 @@ bool RunPostSaveReloadValidation_ImportBpy(
 		if (!RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 				ReloadedBP,
 				RepairedStateEntryBindingsAfterReload,
-				OutError))
+				OutError,
+				&Root))
 		{
 			return false;
 		}
@@ -20076,6 +20244,24 @@ bool RunPostSaveReloadValidation_ImportBpy(
 			ReloadedBP,
 			Root,
 			TEXT("PostSaveReload"));
+
+		if (!ReplayAndValidateBlueprintDefaultsContract_ImportBpy(
+				ReloadedBP,
+				Root,
+				TEXT("post_save_reload"),
+				OutError))
+		{
+			return false;
+		}
+
+		if (!ValidateImportedAnimBlueprintAgainstSourceAsset_ImportBpy(
+				ReloadedBP,
+				GCurrentImportSourceBlueprintPath_ImportBpy,
+				TEXT("post_save_reload_source_contract"),
+				OutError))
+		{
+			return false;
+		}
 	}
 
 	if (!ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
@@ -20142,6 +20328,805 @@ bool RunPostSaveReloadValidation_ImportBpy(
 	}
 
 	InOutBlueprint = ReloadedBP;
+	return true;
+}
+
+bool ReplayAndValidateBlueprintDefaultsContract_ImportBpy(
+	UBlueprint* BP,
+	const TSharedPtr<FJsonObject>& Root,
+	const TCHAR* Stage,
+	FString& OutError)
+{
+	if (!BP || !Root.IsValid())
+	{
+		return true;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
+	if (!Root->TryGetArrayField(TEXT("graphs"), GraphsArr) || !GraphsArr)
+	{
+		return true;
+	}
+
+	for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
+	{
+		const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
+		if (!GraphObj.IsValid())
+		{
+			continue;
+		}
+
+		UEdGraph* Graph = nullptr;
+		FString GraphType;
+		FString GraphName;
+		if (!EnsureGraphExists_ImportBpy(BP, GraphObj, Graph, GraphType, GraphName, OutError))
+		{
+			OutError = FString::Printf(
+				TEXT("Defaults contract (%s): cannot resolve graph: %s"),
+				Stage ? Stage : TEXT("unknown"),
+				*OutError);
+			return false;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr || NodesArr->Num() == 0)
+		{
+			continue;
+		}
+
+		TMap<FString, UEdGraphNode*> NodeMap;
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			FString NodeUid;
+			if (!NodeObj->TryGetStringField(TEXT("uid"), NodeUid) || NodeUid.IsEmpty())
+			{
+				continue;
+			}
+
+			UEdGraphNode* LiveNode = FindImportedNodeBySerializedUid_ImportBpy(BP, NodeUid);
+			if (!LiveNode)
+			{
+				FGuid ParsedGuid;
+				if (TryParseGuid_ImportBpy(NodeUid, ParsedGuid))
+				{
+					LiveNode = FindImportedNodeByGuidScan_ImportBpy(BP, ParsedGuid);
+				}
+			}
+
+			if (LiveNode)
+			{
+				NodeMap.Add(NodeUid, LiveNode);
+			}
+		}
+
+		if (!ReplayAndValidateSerializedNodeDefaults_ImportBpy(NodesArr, NodeMap, GraphName, OutError))
+		{
+			OutError = FString::Printf(
+				TEXT("Defaults contract (%s) failed on graph '%s': %s"),
+				Stage ? Stage : TEXT("unknown"),
+				*GraphName,
+				*OutError);
+			return false;
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> MissingGraphs;
+	TArray<TSharedPtr<FJsonValue>> MissingDefaultKeys;
+	TArray<TSharedPtr<FJsonValue>> DefaultMismatches;
+	if (!ValidateBlueprintDefaultsAgainstRootJson_ImportBpy(
+			BP,
+			Root,
+			MissingGraphs,
+			MissingDefaultKeys,
+			DefaultMismatches,
+			OutError))
+	{
+		OutError = FString::Printf(
+			TEXT("Defaults contract (%s) validation failed: %s"),
+			Stage ? Stage : TEXT("unknown"),
+			*OutError);
+		return false;
+	}
+
+	if (MissingGraphs.Num() > 0 || MissingDefaultKeys.Num() > 0 || DefaultMismatches.Num() > 0)
+	{
+		OutError = FString::Printf(
+			TEXT("Defaults contract mismatch (%s): missing_graphs=%d missing_default_keys=%d default_mismatches=%d"),
+			Stage ? Stage : TEXT("unknown"),
+			MissingGraphs.Num(),
+			MissingDefaultKeys.Num(),
+			DefaultMismatches.Num());
+		return false;
+	}
+
+	return true;
+}
+
+UEdGraph* FindFunctionGraphByName_ImportBpy(UBlueprint* BP, const FName& FunctionName)
+{
+	if (!BP || FunctionName.IsNone())
+	{
+		return nullptr;
+	}
+
+	for (UEdGraph* Graph : BP->FunctionGraphs)
+	{
+		if (Graph && Graph->GetFName() == FunctionName)
+		{
+			return Graph;
+		}
+	}
+	return nullptr;
+}
+
+TMap<const UEdGraphNode*, FString> BuildSemanticNodeIdsForGraph_ImportBpy(UEdGraph* Graph)
+{
+	TMap<const UEdGraphNode*, FString> Result;
+	if (!Graph)
+	{
+		return Result;
+	}
+
+	TMap<FString, int32> SeenCounts;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+
+		if (Node->NodeGuid.IsValid())
+		{
+			Result.Add(Node, FString::Printf(TEXT("guid:%s"), *Node->NodeGuid.ToString(EGuidFormats::Digits)));
+			continue;
+		}
+
+		const FString ClassName = Node->GetClass()->GetName();
+		const FString Title = Node->GetNodeTitle(ENodeTitleType::ListView).ToString().TrimStartAndEnd();
+		const FString BaseKey = FString::Printf(TEXT("%s|%s"), *ClassName, *Title);
+		int32& Ordinal = SeenCounts.FindOrAdd(BaseKey);
+		++Ordinal;
+		Result.Add(Node, FString::Printf(TEXT("%s#%d"), *BaseKey, Ordinal));
+	}
+
+	return Result;
+}
+
+void CollectExecEdgesForGraph_ImportBpy(UEdGraph* Graph, TSet<FString>& OutEdges)
+{
+	OutEdges.Reset();
+	if (!Graph)
+	{
+		return;
+	}
+
+	const TMap<const UEdGraphNode*, FString> NodeIds = BuildSemanticNodeIdsForGraph_ImportBpy(Graph);
+	auto IsExecRerouteNode = [](const UEdGraphNode* Node) -> bool
+	{
+		return Node && Node->IsA<UK2Node_Knot>();
+	};
+
+	auto GatherResolvedExecTargets =
+		[&](UEdGraphPin* StartPin, TSet<const UEdGraphNode*>& OutTargets)
+	{
+		OutTargets.Reset();
+		if (!StartPin)
+		{
+			return;
+		}
+
+		TArray<UEdGraphPin*> Stack;
+		TSet<const UEdGraphPin*> VisitedPins;
+		Stack.Add(StartPin);
+
+		while (Stack.Num() > 0)
+		{
+			UEdGraphPin* Current = Stack.Pop(EAllowShrinking::No);
+			if (!Current || VisitedPins.Contains(Current))
+			{
+				continue;
+			}
+			VisitedPins.Add(Current);
+
+			UEdGraphNode* Owner = Current->GetOwningNode();
+			if (!Owner)
+			{
+				continue;
+			}
+
+			if (!IsExecRerouteNode(Owner))
+			{
+				if (Current->Direction == EGPD_Input)
+				{
+					OutTargets.Add(Owner);
+				}
+				continue;
+			}
+
+			for (UEdGraphPin* ReroutePin : Owner->Pins)
+			{
+				if (!ReroutePin ||
+					ReroutePin->Direction != EGPD_Output ||
+					ReroutePin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+				{
+					continue;
+				}
+
+				for (UEdGraphPin* Next : ReroutePin->LinkedTo)
+				{
+					if (Next)
+					{
+						Stack.Add(Next);
+					}
+				}
+			}
+		}
+	};
+
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+		if (IsExecRerouteNode(Node))
+		{
+			continue;
+		}
+
+		const FString* SrcId = NodeIds.Find(Node);
+		if (!SrcId)
+		{
+			continue;
+		}
+
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin ||
+				Pin->Direction != EGPD_Output ||
+				Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{
+				continue;
+			}
+
+			for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+			{
+				if (!LinkedPin)
+				{
+					continue;
+				}
+
+				TSet<const UEdGraphNode*> ResolvedTargets;
+				GatherResolvedExecTargets(LinkedPin, ResolvedTargets);
+				for (const UEdGraphNode* TargetNode : ResolvedTargets)
+				{
+					const FString* DstId = NodeIds.Find(TargetNode);
+					if (!DstId)
+					{
+						continue;
+					}
+
+					OutEdges.Add(FString::Printf(
+						TEXT("%s -> %s @ %s"),
+						**SrcId,
+						**DstId,
+						*Pin->PinName.ToString()));
+				}
+			}
+		}
+	}
+}
+
+bool ValidateFunctionExecTopologyParityAgainstSource_ImportBpy(
+	UBlueprint* SourceBP,
+	UBlueprint* ImportedBP,
+	const FName& FunctionName,
+	const TCHAR* Stage,
+	FString& OutError)
+{
+	if (!SourceBP || !ImportedBP || FunctionName.IsNone())
+	{
+		return true;
+	}
+
+	UEdGraph* SourceGraph = FindFunctionGraphByName_ImportBpy(SourceBP, FunctionName);
+	UEdGraph* ImportedGraph = FindFunctionGraphByName_ImportBpy(ImportedBP, FunctionName);
+	if (!SourceGraph || !ImportedGraph)
+	{
+		OutError = FString::Printf(
+			TEXT("Source topology validation (%s) missing function graph '%s' (source=%s imported=%s)"),
+			Stage ? Stage : TEXT("unknown"),
+			*FunctionName.ToString(),
+			SourceGraph ? TEXT("yes") : TEXT("no"),
+			ImportedGraph ? TEXT("yes") : TEXT("no"));
+		return false;
+	}
+
+	TSet<FString> SourceEdges;
+	TSet<FString> ImportedEdges;
+	CollectExecEdgesForGraph_ImportBpy(SourceGraph, SourceEdges);
+	CollectExecEdgesForGraph_ImportBpy(ImportedGraph, ImportedEdges);
+
+	TArray<FString> MissingEdges;
+	TArray<FString> ExtraEdges;
+	for (const FString& Edge : SourceEdges)
+	{
+		if (!ImportedEdges.Contains(Edge))
+		{
+			MissingEdges.Add(Edge);
+		}
+	}
+	for (const FString& Edge : ImportedEdges)
+	{
+		if (!SourceEdges.Contains(Edge))
+		{
+			ExtraEdges.Add(Edge);
+		}
+	}
+
+	if (MissingEdges.Num() > 0 || ExtraEdges.Num() > 0)
+	{
+		const FString MissingSample = MissingEdges.Num() > 0 ? MissingEdges[0] : TEXT("<none>");
+		const FString ExtraSample = ExtraEdges.Num() > 0 ? ExtraEdges[0] : TEXT("<none>");
+		OutError = FString::Printf(
+			TEXT("Source topology mismatch (%s) function '%s': missing_exec_edges=%d extra_exec_edges=%d missing_sample=%s extra_sample=%s"),
+			Stage ? Stage : TEXT("unknown"),
+			*FunctionName.ToString(),
+			MissingEdges.Num(),
+			ExtraEdges.Num(),
+			*MissingSample,
+			*ExtraSample);
+		return false;
+	}
+
+	return true;
+}
+
+FString BuildSerializedGraphIdentity_ImportBpy(const TSharedPtr<FJsonObject>& GraphObj)
+{
+	if (!GraphObj.IsValid())
+	{
+		return FString();
+	}
+
+	FString GraphGuid;
+	GraphObj->TryGetStringField(TEXT("graph_guid"), GraphGuid);
+	if (!GraphGuid.IsEmpty())
+	{
+		return FString::Printf(TEXT("guid:%s"), *GraphGuid);
+	}
+
+	FString GraphName;
+	FString GraphType;
+	FString GraphOuter;
+	FString GraphOuterNode;
+	GraphObj->TryGetStringField(TEXT("name"), GraphName);
+	GraphObj->TryGetStringField(TEXT("graph_type"), GraphType);
+	GraphObj->TryGetStringField(TEXT("graph_outer"), GraphOuter);
+	GraphObj->TryGetStringField(TEXT("graph_outer_node"), GraphOuterNode);
+	return FString::Printf(
+		TEXT("name:%s|type:%s|outer:%s|owner:%s"),
+		*GraphName,
+		*GraphType,
+		*GraphOuter,
+		*GraphOuterNode);
+}
+
+FString BuildSerializedNodeIdentity_ImportBpy(const TSharedPtr<FJsonObject>& NodeObj)
+{
+	if (!NodeObj.IsValid())
+	{
+		return TEXT("<invalid>");
+	}
+
+	FString NodeGuid;
+	NodeObj->TryGetStringField(TEXT("node_guid"), NodeGuid);
+	if (!NodeGuid.IsEmpty())
+	{
+		return FString::Printf(TEXT("guid:%s"), *NodeGuid);
+	}
+
+	FString Uid;
+	NodeObj->TryGetStringField(TEXT("uid"), Uid);
+	if (!Uid.IsEmpty())
+	{
+		return FString::Printf(TEXT("uid:%s"), *Uid);
+	}
+
+	FString NodeClass;
+	FString MemberName;
+	FString FunctionRef;
+	FString TargetType;
+	NodeObj->TryGetStringField(TEXT("node_class"), NodeClass);
+	NodeObj->TryGetStringField(TEXT("member_name"), MemberName);
+	NodeObj->TryGetStringField(TEXT("function_ref"), FunctionRef);
+	NodeObj->TryGetStringField(TEXT("target_type"), TargetType);
+	return FString::Printf(
+		TEXT("fp:%s|member:%s|fn:%s|target:%s"),
+		*NodeClass,
+		*MemberName,
+		*FunctionRef,
+		*TargetType);
+}
+
+bool IsSerializedExecOutputPin_ImportBpy(
+	const TSharedPtr<FJsonObject>& NodeObj,
+	const FString& PinName)
+{
+	if (!NodeObj.IsValid() || PinName.IsEmpty())
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* OutputPinTypesObj = nullptr;
+	if (NodeObj->TryGetObjectField(TEXT("output_pin_types"), OutputPinTypesObj) &&
+		OutputPinTypesObj && OutputPinTypesObj->IsValid())
+	{
+		FString PinType;
+		if ((*OutputPinTypesObj)->TryGetStringField(PinName, PinType))
+		{
+			return PinType.StartsWith(TEXT("exec"), ESearchCase::IgnoreCase);
+		}
+	}
+
+	// Compatibility fallback for payloads that omit output_pin_types.
+	return PinName.StartsWith(TEXT("then"), ESearchCase::IgnoreCase) ||
+		PinName.Equals(TEXT("exec"), ESearchCase::IgnoreCase) ||
+		PinName.Equals(TEXT("execute"), ESearchCase::IgnoreCase) ||
+		PinName.Equals(TEXT("completed"), ESearchCase::IgnoreCase);
+}
+
+FString NormalizeExecPinSemanticName_ImportBpy(const FString& PinName)
+{
+	FString Canonical;
+	Canonical.Reserve(PinName.Len());
+	for (const TCHAR Ch : PinName)
+	{
+		if (FChar::IsAlnum(Ch))
+		{
+			Canonical.AppendChar(FChar::ToLower(Ch));
+		}
+	}
+
+	if (Canonical == TEXT("true") || Canonical == TEXT("then"))
+	{
+		return TEXT("then");
+	}
+	if (Canonical == TEXT("false") || Canonical == TEXT("else"))
+	{
+		return TEXT("else");
+	}
+	if (Canonical == TEXT("exec") || Canonical == TEXT("execute"))
+	{
+		return TEXT("exec");
+	}
+
+	return Canonical.IsEmpty() ? TEXT("exec") : Canonical;
+}
+
+void CollectSerializedExecEdgesByGraph_ImportBpy(
+	const TSharedPtr<FJsonObject>& Root,
+	TMap<FString, TSet<FString>>& OutExecEdgesByGraph)
+{
+	OutExecEdgesByGraph.Reset();
+	if (!Root.IsValid())
+	{
+		return;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
+	if (!Root->TryGetArrayField(TEXT("graphs"), GraphsArr) || !GraphsArr)
+	{
+		return;
+	}
+
+	for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
+	{
+		const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
+		if (!GraphObj.IsValid())
+		{
+			continue;
+		}
+
+		const FString GraphId = BuildSerializedGraphIdentity_ImportBpy(GraphObj);
+		if (GraphId.IsEmpty())
+		{
+			continue;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+		{
+			continue;
+		}
+
+		TMap<FString, TSharedPtr<FJsonObject>> NodeByUid;
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			FString Uid;
+			NodeObj->TryGetStringField(TEXT("uid"), Uid);
+			if (!Uid.IsEmpty())
+			{
+				NodeByUid.Add(Uid, NodeObj);
+			}
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* ConnectionsArr = nullptr;
+		if (!GraphObj->TryGetArrayField(TEXT("connections"), ConnectionsArr) || !ConnectionsArr)
+		{
+			continue;
+		}
+
+		TSet<FString>& ExecEdges = OutExecEdgesByGraph.FindOrAdd(GraphId);
+		for (const TSharedPtr<FJsonValue>& ConnValue : *ConnectionsArr)
+		{
+			const TSharedPtr<FJsonObject> ConnObj = ConnValue.IsValid() ? ConnValue->AsObject() : nullptr;
+			if (!ConnObj.IsValid())
+			{
+				continue;
+			}
+
+			FString SrcUid;
+			FString DstUid;
+			FString SrcPin;
+			ConnObj->TryGetStringField(TEXT("src_node"), SrcUid);
+			ConnObj->TryGetStringField(TEXT("dst_node"), DstUid);
+			ConnObj->TryGetStringField(TEXT("src_pin"), SrcPin);
+			if (SrcUid.IsEmpty() || DstUid.IsEmpty() || SrcPin.IsEmpty())
+			{
+				continue;
+			}
+
+			const TSharedPtr<FJsonObject>* SrcNodePtr = NodeByUid.Find(SrcUid);
+			const TSharedPtr<FJsonObject>* DstNodePtr = NodeByUid.Find(DstUid);
+			if (!SrcNodePtr || !DstNodePtr)
+			{
+				continue;
+			}
+
+			if (!IsSerializedExecOutputPin_ImportBpy(*SrcNodePtr, SrcPin))
+			{
+				continue;
+			}
+
+			const FString SrcNodeId = BuildSerializedNodeIdentity_ImportBpy(*SrcNodePtr);
+			const FString DstNodeId = BuildSerializedNodeIdentity_ImportBpy(*DstNodePtr);
+			const FString PinIdentity = NormalizeExecPinSemanticName_ImportBpy(SrcPin);
+			ExecEdges.Add(FString::Printf(TEXT("%s -> %s @ pin:%s"), *SrcNodeId, *DstNodeId, *PinIdentity));
+		}
+	}
+}
+
+bool ValidateSerializedExecTopologyParityBetweenRoots_ImportBpy(
+	const TSharedPtr<FJsonObject>& SourceRoot,
+	const TSharedPtr<FJsonObject>& CandidateRoot,
+	const TCHAR* Stage,
+	FString& OutError)
+{
+	if (!SourceRoot.IsValid() || !CandidateRoot.IsValid())
+	{
+		return true;
+	}
+
+	TMap<FString, TSet<FString>> SourceExecEdgesByGraph;
+	TMap<FString, TSet<FString>> CandidateExecEdgesByGraph;
+	CollectSerializedExecEdgesByGraph_ImportBpy(SourceRoot, SourceExecEdgesByGraph);
+	CollectSerializedExecEdgesByGraph_ImportBpy(CandidateRoot, CandidateExecEdgesByGraph);
+
+	for (const TPair<FString, TSet<FString>>& SourceEntry : SourceExecEdgesByGraph)
+	{
+		const FString& GraphId = SourceEntry.Key;
+		const TSet<FString>* CandidateEdges = CandidateExecEdgesByGraph.Find(GraphId);
+		if (!CandidateEdges)
+		{
+			OutError = FString::Printf(
+				TEXT("Exec topology mismatch (%s): missing graph '%s'"),
+				Stage ? Stage : TEXT("unknown"),
+				*GraphId);
+			return false;
+		}
+
+		TArray<FString> MissingEdges;
+		TArray<FString> ExtraEdges;
+		for (const FString& Edge : SourceEntry.Value)
+		{
+			if (!CandidateEdges->Contains(Edge))
+			{
+				MissingEdges.Add(Edge);
+			}
+		}
+		for (const FString& Edge : *CandidateEdges)
+		{
+			if (!SourceEntry.Value.Contains(Edge))
+			{
+				ExtraEdges.Add(Edge);
+			}
+		}
+
+		if (MissingEdges.Num() > 0 || ExtraEdges.Num() > 0)
+		{
+			OutError = FString::Printf(
+				TEXT("Exec topology mismatch (%s) graph='%s': missing_exec_edges=%d extra_exec_edges=%d missing_sample=%s extra_sample=%s"),
+				Stage ? Stage : TEXT("unknown"),
+				*GraphId,
+				MissingEdges.Num(),
+				ExtraEdges.Num(),
+				MissingEdges.Num() > 0 ? *MissingEdges[0] : TEXT("<none>"),
+				ExtraEdges.Num() > 0 ? *ExtraEdges[0] : TEXT("<none>"));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool ValidateIncomingExecTopologyAgainstSourceBeforeImport_ImportBpy(
+	const TSharedPtr<FJsonObject>& IncomingRoot,
+	const FString& SourceBlueprintPath,
+	const TCHAR* Stage,
+	FString& OutError)
+{
+	if (!IncomingRoot.IsValid() || SourceBlueprintPath.IsEmpty())
+	{
+		return true;
+	}
+
+	UBlueprint* const SourceBP = LoadBlueprintAsset_ImportBpy(SourceBlueprintPath);
+	if (!SourceBP || !Cast<UAnimBlueprint>(SourceBP))
+	{
+		return true;
+	}
+
+	TSharedPtr<FJsonObject> SourceRoot = UBPDirectExporter::SerializeBlueprintToJson(SourceBP);
+	if (!SourceRoot.IsValid())
+	{
+		OutError = FString::Printf(
+			TEXT("Pre-import exec topology validation (%s) failed to serialize source blueprint '%s'"),
+			Stage ? Stage : TEXT("unknown"),
+			*SourceBlueprintPath);
+		return false;
+	}
+
+	return ValidateSerializedExecTopologyParityBetweenRoots_ImportBpy(
+		SourceRoot,
+		IncomingRoot,
+		Stage,
+		OutError);
+}
+
+bool ValidateImportedAnimBlueprintAgainstSourceAsset_ImportBpy(
+	UBlueprint* ImportedBP,
+	const FString& SourceBlueprintPath,
+	const TCHAR* Stage,
+	FString& OutError)
+{
+	if (!ImportedBP || SourceBlueprintPath.IsEmpty() || !Cast<UAnimBlueprint>(ImportedBP))
+	{
+		return true;
+	}
+
+	const FString ImportedPath = ImportedBP->GetPathName();
+	if (ImportedPath.Equals(SourceBlueprintPath, ESearchCase::CaseSensitive))
+	{
+		return true;
+	}
+
+	UBlueprint* const SourceBP = LoadBlueprintAsset_ImportBpy(SourceBlueprintPath);
+	if (!SourceBP || !Cast<UAnimBlueprint>(SourceBP))
+	{
+		return true;
+	}
+
+	FString SourceSerializedJson;
+	TSharedPtr<FJsonObject> SourceJsonRoot = UBPDirectExporter::SerializeBlueprintToJson(SourceBP);
+	if (!SourceJsonRoot.IsValid())
+	{
+		OutError = FString::Printf(
+			TEXT("Source contract validation (%s) failed to serialize source blueprint '%s'"),
+			Stage ? Stage : TEXT("unknown"),
+			*SourceBlueprintPath);
+		return false;
+	}
+	{
+		const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&SourceSerializedJson);
+		if (!FJsonSerializer::Serialize(SourceJsonRoot.ToSharedRef(), Writer))
+		{
+			OutError = FString::Printf(
+				TEXT("Source contract validation (%s) failed to emit serialized source blueprint '%s'"),
+				Stage ? Stage : TEXT("unknown"),
+				*SourceBlueprintPath);
+			return false;
+		}
+	}
+
+	TSharedPtr<FJsonObject> SourceRoot;
+	{
+		const TSharedRef<TJsonReader<>> SourceReader =
+			TJsonReaderFactory<>::Create(SourceSerializedJson);
+		if (!FJsonSerializer::Deserialize(SourceReader, SourceRoot) || !SourceRoot.IsValid())
+		{
+			OutError = FString::Printf(
+				TEXT("Source contract validation (%s) failed to parse source blueprint json for '%s'"),
+				Stage ? Stage : TEXT("unknown"),
+				*SourceBlueprintPath);
+			return false;
+		}
+	}
+
+	TArray<FString> NoWarnings;
+	if (!ValidateRoundtripAgainstRootJson_ImportBpy(
+			ImportedBP,
+			SourceRoot,
+			NoWarnings,
+			Stage ? Stage : TEXT("source_contract"),
+			OutError))
+	{
+		OutError = FString::Printf(
+			TEXT("Source contract mismatch (%s) imported='%s' source='%s': %s"),
+			Stage ? Stage : TEXT("unknown"),
+			*ImportedPath,
+			*SourceBlueprintPath,
+			*OutError);
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> ImportedRoot = UBPDirectExporter::SerializeBlueprintToJson(ImportedBP);
+	if (!ImportedRoot.IsValid())
+	{
+		OutError = FString::Printf(
+			TEXT("Source contract validation (%s) failed to serialize imported blueprint '%s'"),
+			Stage ? Stage : TEXT("unknown"),
+			*ImportedPath);
+		return false;
+	}
+
+	if (!ValidateSerializedExecTopologyParityBetweenRoots_ImportBpy(
+			SourceRoot,
+			ImportedRoot,
+			Stage ? Stage : TEXT("source_exec_contract"),
+			OutError))
+	{
+		OutError = FString::Printf(
+			TEXT("Source exec topology mismatch (%s) imported='%s' source='%s': %s"),
+			Stage ? Stage : TEXT("unknown"),
+			*ImportedPath,
+			*SourceBlueprintPath,
+			*OutError);
+		return false;
+	}
+
+	if (!ValidateFunctionExecTopologyParityAgainstSource_ImportBpy(
+			SourceBP,
+			ImportedBP,
+			TEXT("SetBlendStackAnimFromChooser"),
+			Stage,
+			OutError))
+	{
+		return false;
+	}
+
+	if (!ValidateFunctionExecTopologyParityAgainstSource_ImportBpy(
+			SourceBP,
+			ImportedBP,
+			TEXT("Update_States"),
+			Stage,
+			OutError))
+	{
+		return false;
+	}
+
 	return true;
 }
 
@@ -20292,6 +21277,15 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	const TGuardValue<FString> TargetBlueprintPathGuard(
 		GCurrentImportTargetBlueprintPath_ImportBpy,
 		TargetAssetPath);
+
+	if (!ValidateIncomingExecTopologyAgainstSourceBeforeImport_ImportBpy(
+			Root,
+			SourceBlueprintPath,
+			TEXT("pre_import_source_exec_contract"),
+			OutError))
+	{
+		return false;
+	}
 
 	// Determine parent class
 	FString ParentClassPath = Root->GetStringField(TEXT("parent"));
@@ -20760,7 +21754,8 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	if (!RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 			BP,
 			RepairedStateEntryBindings,
-			OutError))
+			OutError,
+			&Root))
 	{
 		return false;
 	}
@@ -20837,6 +21832,27 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 			OutError))
 	{
 		return false;
+	}
+
+	if (bIsAnimBlueprint)
+	{
+		if (!ReplayAndValidateBlueprintDefaultsContract_ImportBpy(
+				BP,
+				Root,
+				TEXT("post_compile"),
+				OutError))
+		{
+			return false;
+		}
+
+		if (!ValidateImportedAnimBlueprintAgainstSourceAsset_ImportBpy(
+				BP,
+				SourceBlueprintPath,
+				TEXT("post_compile_source_contract"),
+				OutError))
+		{
+			return false;
+		}
 	}
 
 	{
@@ -23709,6 +24725,8 @@ bool UBPDirectImporter::ConnectPins(
 {
 	UEdGraphPin* SrcPin = FindPinById_ImportBpy(SrcNode, SrcPinId);
 	UEdGraphPin* DstPin = FindPinById_ImportBpy(DstNode, DstPinId);
+	const FString RequestedSrcPin = !SrcPinFullName.IsEmpty() ? SrcPinFullName : SrcPinName;
+	const FString RequestedDstPin = !DstPinFullName.IsEmpty() ? DstPinFullName : DstPinName;
 	if (SrcPin && SrcPin->Direction != EGPD_Output)
 	{
 		// Some nodes (notably K2Node_EvaluateChooser2) expose multiple pins with the
@@ -23716,9 +24734,41 @@ bool UBPDirectImporter::ConnectPins(
 		// the node, fall back to directional name lookup instead of keeping a bad pin.
 		SrcPin = nullptr;
 	}
+	if (SrcPin)
+	{
+		const FString LiveName = SrcPin->PinName.ToString();
+		const FString NormalizedRequested = NormalizeRequestedPinName_ImportBpy(SrcNode, RequestedSrcPin);
+		const FString LiveNameNoGuid = StripGuidSuffix_ImportBpy(LiveName);
+		const FString RequestedNoGuid = StripGuidSuffix_ImportBpy(RequestedSrcPin);
+		const FString NormalizedNoGuid = StripGuidSuffix_ImportBpy(NormalizedRequested);
+		if (!LiveName.Equals(RequestedSrcPin, ESearchCase::IgnoreCase) &&
+			!LiveName.Equals(NormalizedRequested, ESearchCase::IgnoreCase) &&
+			!LiveNameNoGuid.Equals(RequestedNoGuid, ESearchCase::IgnoreCase) &&
+			!LiveNameNoGuid.Equals(NormalizedNoGuid, ESearchCase::IgnoreCase))
+		{
+			// PinId can drift across reconstruct/compile. Never trust id-only matches
+			// when serialized pin names disagree, otherwise exec topology can be rewired.
+			SrcPin = nullptr;
+		}
+	}
 	if (DstPin && DstPin->Direction != EGPD_Input)
 	{
 		DstPin = nullptr;
+	}
+	if (DstPin)
+	{
+		const FString LiveName = DstPin->PinName.ToString();
+		const FString NormalizedRequested = NormalizeRequestedPinName_ImportBpy(DstNode, RequestedDstPin);
+		const FString LiveNameNoGuid = StripGuidSuffix_ImportBpy(LiveName);
+		const FString RequestedNoGuid = StripGuidSuffix_ImportBpy(RequestedDstPin);
+		const FString NormalizedNoGuid = StripGuidSuffix_ImportBpy(NormalizedRequested);
+		if (!LiveName.Equals(RequestedDstPin, ESearchCase::IgnoreCase) &&
+			!LiveName.Equals(NormalizedRequested, ESearchCase::IgnoreCase) &&
+			!LiveNameNoGuid.Equals(RequestedNoGuid, ESearchCase::IgnoreCase) &&
+			!LiveNameNoGuid.Equals(NormalizedNoGuid, ESearchCase::IgnoreCase))
+		{
+			DstPin = nullptr;
+		}
 	}
 	if (!SrcPin)
 	{
@@ -23738,8 +24788,6 @@ bool UBPDirectImporter::ConnectPins(
 		DstPin = FindPinFlexible_ImportBpy(DstNode, !DstPinFullName.IsEmpty() ? DstPinFullName : DstPinName, EGPD_Input);
 	}
 
-	const FString RequestedSrcPin = !SrcPinFullName.IsEmpty() ? SrcPinFullName : SrcPinName;
-	const FString RequestedDstPin = !DstPinFullName.IsEmpty() ? DstPinFullName : DstPinName;
 	const auto IsPromotableOperatorCallNode = [](const UK2Node_CallFunction* CallNode) -> bool
 	{
 		if (!CallNode)

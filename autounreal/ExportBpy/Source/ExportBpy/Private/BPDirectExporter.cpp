@@ -559,7 +559,26 @@ static FString EnsureStateEnteredNotifyNameFromStateResult_ExportBpy(
 {
 	if (DesiredNotifyName.IsEmpty())
 	{
-		return ExistingStateEnteredText;
+		if (ExistingStateEnteredText.IsEmpty())
+		{
+			return FString(TEXT("(NotifyName=\"None\")"));
+		}
+		// DesiredNotifyName is empty means no binding was found in BoundGraph.
+		// Strip Guid from existing text for deterministic export.
+		FString Cleaned = ExistingStateEnteredText;
+		const FString GuidToken = TEXT("Guid=");
+		int32 GuidPos = Cleaned.Find(GuidToken, ESearchCase::CaseSensitive);
+		while (GuidPos != INDEX_NONE)
+		{
+			int32 GuidStart = (GuidPos > 0 && Cleaned[GuidPos - 1] == TEXT(','))
+				? GuidPos - 1 : GuidPos;
+			int32 ValueStart = GuidPos + GuidToken.Len();
+			int32 ValueEnd = Cleaned.Find(TEXT(","), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValueStart);
+			int32 FieldEnd = (ValueEnd == INDEX_NONE) ? Cleaned.Len() : ValueEnd;
+			Cleaned.RemoveAt(GuidStart, FieldEnd - GuidStart, EAllowShrinking::No);
+			GuidPos = Cleaned.Find(GuidToken, ESearchCase::CaseSensitive);
+		}
+		return Cleaned;
 	}
 
 	if (ExistingStateEnteredText.IsEmpty() || ExistingStateEnteredText.Equals(TEXT("()"), ESearchCase::CaseSensitive))
@@ -567,18 +586,56 @@ static FString EnsureStateEnteredNotifyNameFromStateResult_ExportBpy(
 		return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
 	}
 
-	// Keep existing struct if it already points to the desired notify.
+	// If the struct already references this notify, return a clean version
+	// with the same NotifyName but Guid stripped (Guid is runtime-generated,
+	// non-deterministic, and must not pollute roundtrip exports).
 	const FString ExistingToken = FString::Printf(TEXT("NotifyName=\"%s\""), *DesiredNotifyName);
 	if (ExistingStateEnteredText.Contains(ExistingToken, ESearchCase::CaseSensitive))
 	{
-		return ExistingStateEnteredText;
+		return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
 	}
 
-	// Keep any existing Guid/fields and prepend NotifyName.
+	// Replace the first NotifyName value in-place while preserving other fields.
+	const FString Needle = TEXT("NotifyName=\"");
+	const int32 NeedlePos = ExistingStateEnteredText.Find(Needle, ESearchCase::CaseSensitive);
+	if (NeedlePos != INDEX_NONE)
+	{
+		const int32 ValueStart = NeedlePos + Needle.Len();
+		const int32 ValueEnd = ExistingStateEnteredText.Find(
+			TEXT("\""),
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart,
+			ValueStart);
+		if (ValueEnd != INDEX_NONE && ValueEnd >= ValueStart)
+		{
+			FString Rewritten = ExistingStateEnteredText;
+			Rewritten.RemoveAt(ValueStart, ValueEnd - ValueStart, EAllowShrinking::No);
+			Rewritten.InsertAt(ValueStart, DesiredNotifyName);
+			return Rewritten;
+		}
+	}
+
+	// Fallback: keep existing struct fields (but strip Guid) and inject NotifyName at the front.
 	if (ExistingStateEnteredText.StartsWith(TEXT("(")) && ExistingStateEnteredText.EndsWith(TEXT(")")) &&
 		ExistingStateEnteredText.Len() >= 2)
 	{
-		const FString Inner = ExistingStateEnteredText.Mid(1, ExistingStateEnteredText.Len() - 2).TrimStartAndEnd();
+		FString Inner = ExistingStateEnteredText.Mid(1, ExistingStateEnteredText.Len() - 2).TrimStartAndEnd();
+		// Strip Guid since it is runtime-generated and non-deterministic.
+		const FString GuidToken = TEXT("Guid=");
+		int32 GuidPos = Inner.Find(GuidToken, ESearchCase::CaseSensitive);
+		while (GuidPos != INDEX_NONE)
+		{
+			int32 GuidStart = (GuidPos > 0 && Inner[GuidPos - 1] == TEXT(','))
+				? GuidPos - 1 : GuidPos;
+			int32 ValueStart = GuidPos + GuidToken.Len();
+			int32 ValueEnd = Inner.Find(TEXT(","), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValueStart);
+			int32 FieldEnd = (ValueEnd == INDEX_NONE)
+				? Inner.Len()
+				: ValueEnd;
+			Inner.RemoveAt(GuidStart, FieldEnd - GuidStart, EAllowShrinking::No);
+			GuidPos = Inner.Find(GuidToken, ESearchCase::CaseSensitive);
+		}
+		Inner = Inner.TrimStartAndEnd();
 		if (Inner.IsEmpty())
 		{
 			return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
@@ -2291,6 +2348,45 @@ FString FormatPythonValueLiteral_ExportBpy(const FString& RawValue)
 	return MakePythonStringLiteral_ExportBpy(Trimmed);
 }
 
+bool IsRealPinTypeString_ExportBpy(const FString& PinType)
+{
+	// Normalized pin types use "real/float" and "real/double".
+	return PinType.StartsWith(TEXT("real/"));
+}
+
+FString ForceRealLiteralIfNeeded_ExportBpy(const FString& Literal, const FString& PinType)
+{
+	if (!IsRealPinTypeString_ExportBpy(PinType))
+	{
+		return Literal;
+	}
+
+	FString Trimmed = Literal;
+	Trimmed.TrimStartAndEndInline();
+	if (Trimmed.IsEmpty())
+	{
+		return Literal;
+	}
+
+	// Preserve non-numeric forms as-is (quoted strings, tuples, structs, etc.).
+	if (!LooksLikeStrictPythonNumberLiteral_ExportBpy(Trimmed))
+	{
+		return Literal;
+	}
+
+	// Keep explicit float syntax untouched.
+	if (Trimmed.Contains(TEXT(".")) ||
+		Trimmed.Contains(TEXT("e")) ||
+		Trimmed.Contains(TEXT("E")))
+	{
+		return Trimmed;
+	}
+
+	// Integer-looking value on a real pin must stay real-typed.
+	const double NumericValue = FCString::Atod(*Trimmed);
+	return FString::Printf(TEXT("%.6f"), NumericValue);
+}
+
 TArray<FString> InlineExtraPropLines_ExportBpy(const FNodeInfo& Info)
 {
 	auto ShouldInlineNodeProp = [&](const FString& Key) -> bool
@@ -2381,17 +2477,17 @@ FString BuildNestedGraphModuleStem_ExportBpy(
 	}
 	else
 	{
-		const TArray<FString> Prefixes = {
+		static const TCHAR* Prefixes[] = {
 			TEXT("AnimGraphNode_"),
 			TEXT("AnimState"),
 			TEXT("K2Node_"),
 			TEXT("EdGraphNode_")
 		};
-		for (const FString& Prefix : Prefixes)
+		for (const TCHAR* Prefix : Prefixes)
 		{
 			if (NodeCategory.StartsWith(Prefix))
 			{
-				NodeCategory.RightChopInline(Prefix.Len(), EAllowShrinking::No);
+				NodeCategory.RightChopInline(FCString::Strlen(Prefix), EAllowShrinking::No);
 				break;
 			}
 		}
@@ -2804,11 +2900,15 @@ TArray<FString> NodeToDefaultValueLinesForSidecar_ExportBpy(const FNodeInfo& Inf
 	TArray<FString> Lines;
 	for (const TPair<FString, FString>& KV : Info.DefaultValues)
 	{
+		const FString* PinType = Info.InputPinTypes.Find(KV.Key);
+		const FString FormattedLiteral = ForceRealLiteralIfNeeded_ExportBpy(
+			FormatPythonValueLiteral_ExportBpy(KV.Value),
+			PinType ? *PinType : FString());
 		Lines.Add(FString::Printf(
 			TEXT("%s.pin(%s, %s)"),
 			*Info.VarName,
 			*MakePythonStringLiteral_ExportBpy(KV.Key),
-			*FormatPythonValueLiteral_ExportBpy(KV.Value)));
+			*FormattedLiteral));
 	}
 	return Lines;
 }
@@ -6415,10 +6515,14 @@ TArray<FString> UBPDirectExporter::NodeToDefaultValueLines(const FNodeInfo& Info
 	TArray<FString> Lines;
 	for (auto& KV : Info.DefaultValues)
 	{
+		const FString* PinType = Info.InputPinTypes.Find(KV.Key);
+		const FString FormattedLiteral = ForceRealLiteralIfNeeded_ExportBpy(
+			FormatPythonValueLiteral_ExportBpy(KV.Value),
+			PinType ? *PinType : FString());
 		Lines.Add(FString::Printf(TEXT("%s.pin(%s, %s)"),
 			*Info.VarName,
 			*MakePythonStringLiteral_ExportBpy(KV.Key),
-			*FormatPythonValueLiteral_ExportBpy(KV.Value)));
+			*FormattedLiteral));
 	}
 	return Lines;
 }
@@ -7393,9 +7497,34 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeGenericNode(UEdGraphNode* No
 			}
 		}
 
-		const FString PatchedStateEnteredText = EnsureStateEnteredNotifyNameFromStateResult_ExportBpy(
+		FString PatchedStateEnteredText = EnsureStateEnteredNotifyNameFromStateResult_ExportBpy(
 			ExistingStateEnteredText,
 			DesiredNotifyName);
+		// Rebuild cleanly: strip any Guid=... field and reconstruct as (NotifyName="...").
+		// This avoids subtle off-by-one bugs in the RemoveAt approach.
+		{
+			FString NotifyNameOnly;
+			const FString Needle = TEXT("NotifyName=\"");
+			const int32 NeedlePos = PatchedStateEnteredText.Find(Needle, ESearchCase::CaseSensitive);
+			if (NeedlePos != INDEX_NONE)
+			{
+				const int32 ValStart = NeedlePos + Needle.Len();
+				const int32 ValEnd = PatchedStateEnteredText.Find(
+					TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValStart);
+				if (ValEnd != INDEX_NONE && ValEnd > ValStart)
+				{
+					NotifyNameOnly = PatchedStateEnteredText.Mid(ValStart, ValEnd - ValStart);
+				}
+			}
+			if (!NotifyNameOnly.IsEmpty())
+			{
+				PatchedStateEnteredText = FString::Printf(TEXT("(NotifyName=\"%s\")"), *NotifyNameOnly);
+			}
+			else
+			{
+				PatchedStateEnteredText.Empty();
+			}
+		}
 		if (!PatchedStateEnteredText.IsEmpty())
 		{
 			NodeProps->SetStringField(TEXT("StateEntered"), PatchedStateEnteredText);

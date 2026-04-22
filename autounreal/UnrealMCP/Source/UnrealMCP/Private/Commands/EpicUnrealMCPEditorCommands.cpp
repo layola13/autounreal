@@ -57,6 +57,8 @@
 #include "PoseSearch/PoseSearchDatabase.h"
 #include "HAL/FileManager.h"
 #include "Subsystems/AssetEditorSubsystem.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Widgets/SWindow.h"
 
 namespace
 {
@@ -3839,8 +3841,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeEditorScreenshot
     FString RelativeFolder = TEXT("Saved/UnrealMCP/Screenshots");
     int32 RequestedWidth = 1920;
     int32 RequestedHeight = 1080;
+    bool bMaximizeWindowBeforeCapture = true;
 
     FString AssetPath;
+    FString ExpectedWindowToken;
     if (Params.IsValid())
     {
         double WidthValue = static_cast<double>(RequestedWidth);
@@ -3851,6 +3855,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeEditorScreenshot
         Params->TryGetNumberField(TEXT("height"), HeightValue);
         RequestedWidth = static_cast<int32>(WidthValue);
         RequestedHeight = static_cast<int32>(HeightValue);
+        Params->TryGetBoolField(TEXT("maximize_window"), bMaximizeWindowBeforeCapture);
 
         if (!Params->TryGetStringField(TEXT("asset_path"), AssetPath))
         {
@@ -3887,10 +3892,52 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeEditorScreenshot
         UObject* AssetToOpen = UEditorAssetLibrary::LoadAsset(BuildObjectPathIfNeeded(AssetPath));
         if (AssetToOpen && GEditor)
         {
+            ExpectedWindowToken = AssetToOpen->GetName();
             if (UAssetEditorSubsystem* AssetEditorSubsystem = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
             {
                 AssetEditorSubsystem->OpenEditorForAsset(AssetToOpen);
             }
+        }
+    }
+
+    if (!ExpectedWindowToken.IsEmpty() && FSlateApplication::IsInitialized())
+    {
+        bool bWindowSettled = false;
+        for (int32 Attempt = 0; Attempt < 80; ++Attempt)
+        {
+            FSlateApplication::Get().PumpMessages();
+            FSlateApplication::Get().Tick();
+
+            const TSharedPtr<SWindow> ActiveWindow = FSlateApplication::Get().GetActiveTopLevelWindow();
+            if (ActiveWindow.IsValid())
+            {
+                const FString ActiveTitle = ActiveWindow->GetTitle().ToString();
+                if (ActiveTitle.Contains(ExpectedWindowToken, ESearchCase::IgnoreCase))
+                {
+                    if (bMaximizeWindowBeforeCapture)
+                    {
+                        ActiveWindow->BringToFront(true);
+                        ActiveWindow->Maximize();
+                    }
+                    bWindowSettled = true;
+                    break;
+                }
+            }
+
+            FPlatformProcess::Sleep(0.05f);
+        }
+
+        if (!bWindowSettled)
+        {
+            // Keep going with best effort capture even if title match is not observed.
+            FPlatformProcess::Sleep(0.2f);
+        }
+        else
+        {
+            // Give Slate a brief moment to redraw after maximize.
+            FSlateApplication::Get().PumpMessages();
+            FSlateApplication::Get().Tick();
+            FPlatformProcess::Sleep(0.12f);
         }
     }
 
@@ -3919,57 +3966,84 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeEditorScreenshot
 
     FString OutputFilePath = FPaths::Combine(OutputDirectory, FileName);
 
-    if (!GEditor)
-    {
-        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Editor context is unavailable"));
-    }
+    const int32 CaptureWidth = FMath::Clamp(RequestedWidth, 16, 16384);
+    const int32 CaptureHeight = FMath::Clamp(RequestedHeight, 16, 16384);
+    TArray<FColor> SourcePixels;
+    int32 SourceWidth = 0;
+    int32 SourceHeight = 0;
+    FString CaptureMode = TEXT("none");
 
-    FViewport* TargetViewport = GEditor->GetActiveViewport();
-    if (!TargetViewport)
+    if (FSlateApplication::IsInitialized())
     {
-        const TArray<FEditorViewportClient*>& ViewportClients = GEditor->GetAllViewportClients();
-        for (FEditorViewportClient* ViewportClient : ViewportClients)
+        TSharedPtr<SWindow> CaptureWindow = FSlateApplication::Get().GetActiveTopLevelWindow();
+        if (CaptureWindow.IsValid())
         {
-            if (ViewportClient && ViewportClient->Viewport)
+            CaptureWindow->BringToFront(true);
+            FIntVector WindowImageSize(0, 0, 0);
+            if (FSlateApplication::Get().TakeScreenshot(CaptureWindow.ToSharedRef(), SourcePixels, WindowImageSize))
             {
-                TargetViewport = ViewportClient->Viewport;
-                break;
+                SourceWidth = WindowImageSize.X;
+                SourceHeight = WindowImageSize.Y;
+                CaptureMode = TEXT("active_window");
             }
         }
     }
 
-    if (!TargetViewport)
+    if (SourceWidth <= 0 || SourceHeight <= 0 || SourcePixels.Num() <= 0)
     {
-        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No active editor viewport available for screenshot capture"));
-    }
+        if (!GEditor)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Editor context is unavailable"));
+        }
 
-    const int32 CaptureWidth = FMath::Clamp(RequestedWidth, 16, 16384);
-    const int32 CaptureHeight = FMath::Clamp(RequestedHeight, 16, 16384);
+        FViewport* TargetViewport = GEditor->GetActiveViewport();
+        if (!TargetViewport)
+        {
+            const TArray<FEditorViewportClient*>& ViewportClients = GEditor->GetAllViewportClients();
+            for (FEditorViewportClient* ViewportClient : ViewportClients)
+            {
+                if (ViewportClient && ViewportClient->Viewport)
+                {
+                    TargetViewport = ViewportClient->Viewport;
+                    break;
+                }
+            }
+        }
 
-    const FIntPoint SourceSize = TargetViewport->GetSizeXY();
-    if (SourceSize.X <= 0 || SourceSize.Y <= 0)
-    {
-        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Active editor viewport has invalid size"));
-    }
+        if (!TargetViewport)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No active editor window or viewport available for screenshot capture"));
+        }
 
-    TArray<FColor> SourcePixels;
-    SourcePixels.Reserve(SourceSize.X * SourceSize.Y);
-    if (!TargetViewport->ReadPixels(SourcePixels))
-    {
-        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to read pixels from active viewport"));
+        const FIntPoint SourceSize = TargetViewport->GetSizeXY();
+        if (SourceSize.X <= 0 || SourceSize.Y <= 0)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Active editor viewport has invalid size"));
+        }
+
+        SourcePixels.Reset();
+        SourcePixels.Reserve(SourceSize.X * SourceSize.Y);
+        if (!TargetViewport->ReadPixels(SourcePixels))
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to read pixels from active viewport"));
+        }
+
+        SourceWidth = SourceSize.X;
+        SourceHeight = SourceSize.Y;
+        CaptureMode = TEXT("active_viewport_fallback");
     }
 
     TArray<FColor> OutputPixels;
     const TArray<FColor>* PixelsToWrite = &SourcePixels;
-    int32 FinalWidth = SourceSize.X;
-    int32 FinalHeight = SourceSize.Y;
+    int32 FinalWidth = SourceWidth;
+    int32 FinalHeight = SourceHeight;
 
-    if (CaptureWidth != SourceSize.X || CaptureHeight != SourceSize.Y)
+    if (CaptureWidth != SourceWidth || CaptureHeight != SourceHeight)
     {
         OutputPixels.Reserve(CaptureWidth * CaptureHeight);
         FImageUtils::ImageResize(
-            SourceSize.X,
-            SourceSize.Y,
+            SourceWidth,
+            SourceHeight,
             SourcePixels,
             CaptureWidth,
             CaptureHeight,
@@ -4002,6 +4076,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeEditorScreenshot
     ResultObj->SetStringField(TEXT("file_name"), FileName);
     ResultObj->SetNumberField(TEXT("width"), FinalWidth);
     ResultObj->SetNumberField(TEXT("height"), FinalHeight);
+    ResultObj->SetStringField(TEXT("capture_mode"), CaptureMode);
     if (!AssetPath.IsEmpty())
     {
         ResultObj->SetStringField(TEXT("opened_asset"), AssetPath);

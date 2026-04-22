@@ -456,7 +456,7 @@ def _import_blueprint_object_with_details(
     enable_py_post_save = _env_flag_enabled("EXPORTBPY_ENABLE_PY_POST_SAVE", default=False)
     enable_py_import_validation = _env_flag_enabled(
         "EXPORTBPY_ENABLE_PY_IMPORT_VALIDATION",
-        default=False,
+        default=True,
     )
     run_legacy_post_import_repairs = (
         not disable_py_post_repair
@@ -1403,6 +1403,8 @@ def _collect_expected_import_stats(payload: Dict[str, Any]) -> Dict[str, Any]:
         "expected_delegate_node_counts": {name: 0 for name in delegate_node_classes},
         "expected_delegate_nodes": [],
         "expected_delegate_connections": [],
+        "expected_state_enter_bindings": [],
+        "expected_linked_layer_contracts": [],
         "warnings": [],
     }
 
@@ -1458,6 +1460,39 @@ def _collect_expected_import_stats(payload: Dict[str, Any]) -> Dict[str, Any]:
             node_props = node.get("node_props", {})
             if not isinstance(node_props, dict):
                 node_props = {}
+
+            if node_class == "AnimStateNode":
+                state_entered_text = str(node_props.get("StateEntered", "") or "").strip()
+                notify_names = re.findall(r'NotifyName="([^"]+)"', state_entered_text)
+                summary["expected_state_enter_bindings"].append(
+                    {
+                        "graph_name": graph_name,
+                        "uid": node_uid,
+                        "node_guid": node_guid,
+                        "readable_name": node_readable_name,
+                        "state_entered": state_entered_text,
+                        "notify_names": notify_names,
+                    }
+                )
+
+            if node_class == "AnimGraphNode_LinkedAnimLayer":
+                node_text = str(node_props.get("Node", "") or "")
+                interface_match = re.search(r'Interface=([^,\)]*)', node_text)
+                layer_match = re.search(r'Layer="([^"]+)"', node_text)
+                interface_value = interface_match.group(1).strip() if interface_match else ""
+                if interface_value.lower() == "none":
+                    interface_value = ""
+                summary["expected_linked_layer_contracts"].append(
+                    {
+                        "graph_name": graph_name,
+                        "uid": node_uid,
+                        "node_guid": node_guid,
+                        "readable_name": node_readable_name,
+                        "layer": layer_match.group(1).strip() if layer_match else "",
+                        "interface": interface_value,
+                        "node_text": node_text,
+                    }
+                )
 
             selected_function = _normalize_function_name_text(node_props.get("SelectedFunctionName"))
             delegate_reference = str(node_props.get("DelegateReference", "") or "").strip()
@@ -1676,6 +1711,8 @@ def _validate_imported_blueprint(
         "delegate_node_count_mismatches": [],
         "delegate_decl_mismatches": [],
         "delegate_connection_mismatches": [],
+        "state_enter_mismatches": [],
+        "linked_layer_contract_mismatches": [],
         "missing_components": [],
         "component_parent_mismatches": [],
         "component_socket_mismatches": [],
@@ -2017,6 +2054,139 @@ def _validate_imported_blueprint(
             }
         )
 
+    expected_state_bindings = expected_stats.get("expected_state_enter_bindings", [])
+    live_state_bindings = live_stats.get("expected_state_enter_bindings", [])
+    if not isinstance(expected_state_bindings, list):
+        expected_state_bindings = []
+    if not isinstance(live_state_bindings, list):
+        live_state_bindings = []
+
+    live_state_by_guid: Dict[str, Dict[str, Any]] = {}
+    live_state_by_fallback: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for live_binding in live_state_bindings:
+        if not isinstance(live_binding, dict):
+            continue
+        live_guid = str(live_binding.get("node_guid", "") or "").strip()
+        live_graph = str(live_binding.get("graph_name", "") or "").strip()
+        live_name = str(live_binding.get("readable_name", "") or "").strip().lower()
+        if live_guid:
+            live_state_by_guid[live_guid] = live_binding
+        live_state_by_fallback.setdefault((live_graph, live_name), []).append(live_binding)
+
+    for expected_binding in expected_state_bindings:
+        if not isinstance(expected_binding, dict):
+            continue
+        expected_graph = str(expected_binding.get("graph_name", "") or "").strip()
+        expected_guid = str(expected_binding.get("node_guid", "") or "").strip()
+        expected_name = str(expected_binding.get("readable_name", "") or "").strip()
+        expected_notify_names = [
+            str(name or "").strip()
+            for name in (expected_binding.get("notify_names", []) or [])
+            if str(name or "").strip()
+        ]
+
+        live_binding = None
+        if expected_guid:
+            live_binding = live_state_by_guid.get(expected_guid)
+        if live_binding is None:
+            fallback_key = (expected_graph, expected_name.lower())
+            candidates = live_state_by_fallback.get(fallback_key, [])
+            if candidates:
+                live_binding = candidates[0]
+
+        if live_binding is None:
+            summary["state_enter_mismatches"].append(
+                {
+                    "graph": expected_graph,
+                    "node": expected_name or "<AnimStateNode>",
+                    "reason": "missing state node",
+                    "expected_notify_names": expected_notify_names,
+                    "actual_notify_names": [],
+                }
+            )
+            continue
+
+        actual_notify_names = [
+            str(name or "").strip()
+            for name in (live_binding.get("notify_names", []) or [])
+            if str(name or "").strip()
+        ]
+        if expected_notify_names != actual_notify_names:
+            summary["state_enter_mismatches"].append(
+                {
+                    "graph": expected_graph,
+                    "node": expected_name or "<AnimStateNode>",
+                    "reason": "StateEntered notify list mismatch",
+                    "expected_notify_names": expected_notify_names,
+                    "actual_notify_names": actual_notify_names,
+                }
+            )
+
+    expected_linked_layers = expected_stats.get("expected_linked_layer_contracts", [])
+    live_linked_layers = live_stats.get("expected_linked_layer_contracts", [])
+    if not isinstance(expected_linked_layers, list):
+        expected_linked_layers = []
+    if not isinstance(live_linked_layers, list):
+        live_linked_layers = []
+
+    live_layer_by_guid: Dict[str, Dict[str, Any]] = {}
+    live_layer_by_fallback: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for live_layer in live_linked_layers:
+        if not isinstance(live_layer, dict):
+            continue
+        live_guid = str(live_layer.get("node_guid", "") or "").strip()
+        live_graph = str(live_layer.get("graph_name", "") or "").strip()
+        live_layer_name = str(live_layer.get("layer", "") or "").strip().lower()
+        if live_guid:
+            live_layer_by_guid[live_guid] = live_layer
+        live_layer_by_fallback.setdefault((live_graph, live_layer_name), []).append(live_layer)
+
+    for expected_layer in expected_linked_layers:
+        if not isinstance(expected_layer, dict):
+            continue
+        expected_graph = str(expected_layer.get("graph_name", "") or "").strip()
+        expected_guid = str(expected_layer.get("node_guid", "") or "").strip()
+        expected_readable = str(expected_layer.get("readable_name", "") or "").strip()
+        expected_layer_name = str(expected_layer.get("layer", "") or "").strip()
+        expected_interface = str(expected_layer.get("interface", "") or "").strip()
+
+        live_layer = None
+        if expected_guid:
+            live_layer = live_layer_by_guid.get(expected_guid)
+        if live_layer is None:
+            fallback_key = (expected_graph, expected_layer_name.lower())
+            candidates = live_layer_by_fallback.get(fallback_key, [])
+            if candidates:
+                live_layer = candidates[0]
+
+        if live_layer is None:
+            summary["linked_layer_contract_mismatches"].append(
+                {
+                    "graph": expected_graph,
+                    "node": expected_readable or expected_layer_name or "<LinkedAnimLayer>",
+                    "reason": "missing linked layer node",
+                    "expected_interface": expected_interface,
+                    "actual_interface": "",
+                    "layer": expected_layer_name,
+                }
+            )
+            continue
+
+        actual_interface = str(live_layer.get("interface", "") or "").strip()
+        if actual_interface.lower() == "none":
+            actual_interface = ""
+        if expected_interface != actual_interface:
+            summary["linked_layer_contract_mismatches"].append(
+                {
+                    "graph": expected_graph,
+                    "node": expected_readable or expected_layer_name or "<LinkedAnimLayer>",
+                    "reason": "linked layer interface mismatch",
+                    "expected_interface": expected_interface,
+                    "actual_interface": actual_interface,
+                    "layer": expected_layer_name,
+                }
+            )
+
     components = payload.get("components", [])
     component_validation_available = bool(_iter_actor_components(cdo)) or bool(
         _iter_blueprint_component_nodes(blueprint)
@@ -2136,6 +2306,8 @@ def _validate_imported_blueprint(
             "delegate_node_count_mismatches",
             "delegate_decl_mismatches",
             "delegate_connection_mismatches",
+            "state_enter_mismatches",
+            "linked_layer_contract_mismatches",
             "missing_components",
             "component_parent_mismatches",
             "component_socket_mismatches",

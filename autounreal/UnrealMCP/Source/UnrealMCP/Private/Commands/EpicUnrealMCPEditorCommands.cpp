@@ -48,11 +48,15 @@
 #include "Internationalization/Regex.h"
 #include "Misc/ScopeExit.h"
 #include "Misc/PackageName.h"
+#include "Misc/Paths.h"
+#include "Misc/DateTime.h"
 #include "EdGraphSchema_K2.h"
 #include "Commands/EpicUnrealMCPBlueprintCommands.h"
 #include "UObject/StructOnScope.h"
 #include "UObject/UObjectIterator.h"
 #include "PoseSearch/PoseSearchDatabase.h"
+#include "HAL/FileManager.h"
+#include "Subsystems/AssetEditorSubsystem.h"
 
 namespace
 {
@@ -2228,6 +2232,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     {
         return HandleSaveProject(Params);
     }
+    else if (CommandType == TEXT("take_editor_screenshot"))
+    {
+        return HandleTakeEditorScreenshot(Params);
+    }
     // Blueprint actor spawning
     else if (CommandType == TEXT("spawn_blueprint_actor"))
     {
@@ -3822,6 +3830,161 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleSaveProject(const TS
     ResultObj->SetBoolField(TEXT("success"), true);
     ResultObj->SetBoolField(TEXT("nothing_to_save"), false);
     ResultObj->SetStringField(TEXT("message"), TEXT("Save All completed"));
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeEditorScreenshot(const TSharedPtr<FJsonObject>& Params)
+{
+    FString FileName;
+    FString RelativeFolder = TEXT("Saved/UnrealMCP/Screenshots");
+    int32 RequestedWidth = 1920;
+    int32 RequestedHeight = 1080;
+
+    FString AssetPath;
+    if (Params.IsValid())
+    {
+        double WidthValue = static_cast<double>(RequestedWidth);
+        double HeightValue = static_cast<double>(RequestedHeight);
+        Params->TryGetStringField(TEXT("file_name"), FileName);
+        Params->TryGetStringField(TEXT("relative_folder"), RelativeFolder);
+        Params->TryGetNumberField(TEXT("width"), WidthValue);
+        Params->TryGetNumberField(TEXT("height"), HeightValue);
+        RequestedWidth = static_cast<int32>(WidthValue);
+        RequestedHeight = static_cast<int32>(HeightValue);
+
+        if (!Params->TryGetStringField(TEXT("asset_path"), AssetPath))
+        {
+            if (!Params->TryGetStringField(TEXT("blueprint_path"), AssetPath))
+            {
+                Params->TryGetStringField(TEXT("target"), AssetPath);
+            }
+        }
+    }
+
+    AssetPath.TrimStartAndEndInline();
+    if (!AssetPath.IsEmpty())
+    {
+        auto BuildObjectPathIfNeeded = [](const FString& InPath) -> FString
+        {
+            FString Normalized = InPath;
+            Normalized.TrimStartAndEndInline();
+            Normalized.ReplaceInline(TEXT("\\"), TEXT("/"));
+            if (Normalized.IsEmpty() || Normalized.Contains(TEXT(".")))
+            {
+                return Normalized;
+            }
+
+            FString AssetName;
+            Normalized.Split(TEXT("/"), nullptr, &AssetName, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+            if (AssetName.IsEmpty())
+            {
+                return Normalized;
+            }
+
+            return Normalized + TEXT(".") + AssetName;
+        };
+
+        UObject* AssetToOpen = UEditorAssetLibrary::LoadAsset(BuildObjectPathIfNeeded(AssetPath));
+        if (AssetToOpen && GEditor)
+        {
+            if (UAssetEditorSubsystem* AssetEditorSubsystem = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+            {
+                AssetEditorSubsystem->OpenEditorForAsset(AssetToOpen);
+            }
+        }
+    }
+
+    FString EffectiveFolder = RelativeFolder;
+    EffectiveFolder.TrimStartAndEndInline();
+    EffectiveFolder.ReplaceInline(TEXT("\\"), TEXT("/"));
+    if (EffectiveFolder.IsEmpty())
+    {
+        EffectiveFolder = TEXT("Saved/UnrealMCP/Screenshots");
+    }
+
+    FString OutputDirectory = FPaths::IsRelative(EffectiveFolder)
+        ? FPaths::ConvertRelativePathToFull(FPaths::ProjectDir() / EffectiveFolder)
+        : FPaths::ConvertRelativePathToFull(EffectiveFolder);
+    IFileManager::Get().MakeDirectory(*OutputDirectory, true);
+
+    FileName = FPaths::GetCleanFilename(FileName.TrimStartAndEnd());
+    if (FileName.IsEmpty())
+    {
+        FileName = FString::Printf(TEXT("mcp_screenshot_%s.png"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
+    }
+    else if (!FileName.EndsWith(TEXT(".png"), ESearchCase::IgnoreCase))
+    {
+        FileName += TEXT(".png");
+    }
+
+    FString OutputFilePath = FPaths::Combine(OutputDirectory, FileName);
+
+    if (!GEditor)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Editor context is unavailable"));
+    }
+
+    FViewport* TargetViewport = GEditor->GetActiveViewport();
+    if (!TargetViewport)
+    {
+        const TArray<FEditorViewportClient*>& ViewportClients = GEditor->GetAllViewportClients();
+        for (FEditorViewportClient* ViewportClient : ViewportClients)
+        {
+            if (ViewportClient && ViewportClient->Viewport)
+            {
+                TargetViewport = ViewportClient->Viewport;
+                break;
+            }
+        }
+    }
+
+    if (!TargetViewport)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No active editor viewport available for screenshot capture"));
+    }
+
+    const int32 CaptureWidth = FMath::Clamp(RequestedWidth, 16, 16384);
+    const int32 CaptureHeight = FMath::Clamp(RequestedHeight, 16, 16384);
+
+    FHighResScreenshotConfig& HighResScreenshotConfig = GetHighResScreenshotConfig();
+    HighResScreenshotConfig.SetResolution(CaptureWidth, CaptureHeight, 1.0f);
+
+    FScreenshotRequest::RequestScreenshot(OutputFilePath, false, false);
+    const bool bCaptureRequested = TargetViewport->TakeHighResScreenShot();
+    if (!bCaptureRequested)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to request screenshot from active viewport"));
+    }
+
+    bool bFileWritten = false;
+    for (int32 Attempt = 0; Attempt < 50; ++Attempt)
+    {
+        if (IFileManager::Get().FileExists(*OutputFilePath))
+        {
+            bFileWritten = true;
+            break;
+        }
+        FPlatformProcess::Sleep(0.02f);
+    }
+
+    if (!bFileWritten)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Screenshot request completed but file was not found: %s"), *OutputFilePath));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("command"), TEXT("take_editor_screenshot"));
+    ResultObj->SetStringField(TEXT("file_path"), OutputFilePath);
+    ResultObj->SetStringField(TEXT("relative_folder"), EffectiveFolder);
+    ResultObj->SetStringField(TEXT("file_name"), FileName);
+    ResultObj->SetNumberField(TEXT("width"), CaptureWidth);
+    ResultObj->SetNumberField(TEXT("height"), CaptureHeight);
+    if (!AssetPath.IsEmpty())
+    {
+        ResultObj->SetStringField(TEXT("opened_asset"), AssetPath);
+    }
     return ResultObj;
 }
 

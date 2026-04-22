@@ -10642,21 +10642,8 @@ bool ApplyNodeProps_ImportBpy(
 		{
 			bool bResolvedInterface = false;
 			UClass* ExpectedInterfaceClass = nullptr;
-			const bool bSourceForcesNoInterface =
-				ExpectedInterfaceClassPath.IsEmpty() ||
-				ExpectedInterfaceClassPath.Equals(TEXT("None"), ESearchCase::IgnoreCase);
-			const bool bHasExplicitExpectedInterface =
-				!ExpectedInterfaceClassPath.IsEmpty() && !bSourceForcesNoInterface;
-
-			if (bSourceForcesNoInterface)
-			{
-				// Respect source self-layer contract when Interface=None is serialized.
-				LinkedLayerNode->Node.Interface = nullptr;
-				LinkedLayerNode->InterfaceGuid.Invalidate();
-				bResolvedInterface = true;
-			}
-
-			if (bHasExplicitExpectedInterface)
+			if (!ExpectedInterfaceClassPath.IsEmpty() &&
+				!ExpectedInterfaceClassPath.Equals(TEXT("None"), ESearchCase::IgnoreCase))
 			{
 				ExpectedInterfaceClass = ResolveInterfaceClassFromPath_ImportBpy(ExpectedInterfaceClassPath);
 			}
@@ -10710,7 +10697,8 @@ bool ApplyNodeProps_ImportBpy(
 				const FName LayerName = LinkedLayerNode->Node.Layer;
 				UFunction* InterfaceFunction = nullptr;
 				if (!bResolvedInterface &&
-					bHasExplicitExpectedInterface)
+					!ExpectedInterfaceClassPath.IsEmpty() &&
+					!ExpectedInterfaceClassPath.Equals(TEXT("None"), ESearchCase::IgnoreCase))
 				{
 					for (FBPInterfaceDescription& InterfaceDesc : CurrentBlueprint->ImplementedInterfaces)
 					{
@@ -10787,8 +10775,7 @@ bool ApplyNodeProps_ImportBpy(
 				}
 			}
 
-			if (!bSourceForcesNoInterface &&
-				(!bResolvedInterface || LinkedLayerNode->Node.Interface.Get() == nullptr))
+			if (!bResolvedInterface || LinkedLayerNode->Node.Interface.Get() == nullptr)
 			{
 				if (UAnimBlueprint* CurrentBlueprint = Cast<UAnimBlueprint>(LinkedLayerNode->GetBlueprint()))
 				{
@@ -10814,8 +10801,7 @@ bool ApplyNodeProps_ImportBpy(
 				}
 			}
 
-			if (!bSourceForcesNoInterface &&
-				(!bResolvedInterface || LinkedLayerNode->Node.Interface.Get() == nullptr))
+			if (!bResolvedInterface || LinkedLayerNode->Node.Interface.Get() == nullptr)
 			{
 				TArray<FString> ImplementedInterfaces;
 				if (UAnimBlueprint* CurrentBlueprint = Cast<UAnimBlueprint>(LinkedLayerNode->GetBlueprint()))
@@ -18612,22 +18598,6 @@ void CollectLinkedAnimLayerContractMismatches_ImportBpy(
 		const bool bExpectedRequiresInterface =
 			Expected.bHasInterfaceField &&
 			!Expected.bInterfaceIsNone;
-		const bool bExpectedShouldBeNone =
-			!Expected.bHasInterfaceField ||
-			Expected.bInterfaceIsNone;
-		if (bExpectedShouldBeNone)
-		{
-			if (Actual->bHasInterfaceField && !Actual->bInterfaceIsNone)
-			{
-				OutMismatches.Add(FString::Printf(
-					TEXT("linked_anim_layer_interface_should_be_none guid=%s graph=%s layer=%s expected=None actual=%s"),
-					*NodeGuid,
-					*Actual->GraphName,
-					*Actual->LayerName.ToString(),
-					*Actual->InterfaceValue));
-			}
-			continue;
-		}
 		if (!bExpectedRequiresInterface)
 		{
 			continue;

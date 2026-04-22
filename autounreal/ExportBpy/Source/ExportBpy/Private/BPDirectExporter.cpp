@@ -17,6 +17,7 @@
 #include "AnimGraphNode_StateResult.h"
 #include "AnimGraphNode_SaveCachedPose.h"
 #include "AnimGraphNode_UseCachedPose.h"
+#include "AnimGraphNode_LinkedAnimLayer.h"
 #include "AnimStateNode.h"
 #include "AnimStateTransitionNode.h"
 #include "AnimStateAliasNode.h"
@@ -3712,6 +3713,21 @@ FString TranslateInputPinRef_ExportBpy(UK2Node* Node, const FString& NodeVar, UE
 	return BuildPinRefAttribute_ExportBpy(NodeVar, PinName, false);
 }
 
+UClass* ResolveLinkedAnimLayerInterfaceClass_ExportBpy(const UAnimGraphNode_LinkedAnimLayer* LinkedLayerNode)
+{
+	if (!LinkedLayerNode)
+	{
+		return nullptr;
+	}
+
+	if (UClass* ExplicitClass = LinkedLayerNode->Node.Interface.Get())
+	{
+		return ExplicitClass->GetAuthoritativeClass();
+	}
+
+	return nullptr;
+}
+
 FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 {
 	FNodeInfo Info;
@@ -3954,10 +3970,6 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		{
 			Info.NodeProps.Add(TEXT("CacheName"), SaveCachedPoseNode->CacheName);
 		}
-		if (!SaveCachedPoseNode->Node.CachePoseName.IsNone())
-		{
-			Info.NodeProps.Add(TEXT("CachePoseName"), SaveCachedPoseNode->Node.CachePoseName.ToString());
-		}
 	}
 	else if (const UAnimGraphNode_UseCachedPose* UseCachedPoseNode = Cast<UAnimGraphNode_UseCachedPose>(Node))
 	{
@@ -3979,7 +3991,6 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		if (!CachePoseName.IsEmpty())
 		{
 			Info.NodeProps.Add(TEXT("CacheName"), CachePoseName);
-			Info.NodeProps.Add(TEXT("CachePoseName"), CachePoseName);
 		}
 	}
 	else if (const UK2Node_SwitchEnum* SwitchEnumNode = Cast<UK2Node_SwitchEnum>(Node))
@@ -4270,6 +4281,18 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("BecomeRelevantFunction"));
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("UpdateFunction"));
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("OnMotionMatchingStateUpdatedFunction"));
+		if (const UAnimGraphNode_LinkedAnimLayer* LinkedLayerNode = Cast<UAnimGraphNode_LinkedAnimLayer>(Node))
+		{
+			Info.NodeProps.Add(TEXT("LinkedAnimLayerLayer"), LinkedLayerNode->Node.Layer.ToString());
+			if (UClass* InterfaceClass = ResolveLinkedAnimLayerInterfaceClass_ExportBpy(LinkedLayerNode))
+			{
+				Info.NodeProps.Add(TEXT("LinkedAnimLayerInterfaceClass"), InterfaceClass->GetPathName());
+			}
+			else
+			{
+				Info.NodeProps.Add(TEXT("LinkedAnimLayerInterfaceClass"), TEXT("None"));
+			}
+		}
 
 		// Strip bound fields from the serialized `Node=(...)` struct so that
 		// re-import doesn't overwrite the PropertyBindings-driven values with
@@ -4478,6 +4501,240 @@ void AppendNestedMapSection_ExportBpy(
 		InOut += TEXT("\n");
 	}
 }
+
+bool TryParseJsonObjectString_ExportBpy(const FString& JsonText, TSharedPtr<FJsonObject>& OutObject)
+{
+	OutObject.Reset();
+	if (JsonText.IsEmpty())
+	{
+		return false;
+	}
+
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+	if (!FJsonSerializer::Deserialize(Reader, OutObject) || !OutObject.IsValid())
+	{
+		return false;
+	}
+
+	return true;
+}
+
+void CollectAnimExportContractViolationsFromGraph_ExportBpy(
+	const TSharedPtr<FJsonObject>& GraphObj,
+	const FString& GraphPath,
+	TArray<FString>& OutViolations)
+{
+	if (!GraphObj.IsValid())
+	{
+		return;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+	if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+	{
+		return;
+	}
+
+	static const TCHAR* NestedGraphFields[] = {
+		TEXT("BoundGraphJson"),
+		TEXT("StateMachineGraphJson"),
+		TEXT("BlendStackGraphJson"),
+		TEXT("CustomTransitionGraphJson")
+	};
+
+	for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+	{
+		const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+		if (!NodeObj.IsValid())
+		{
+			continue;
+		}
+
+		FString NodeClass;
+		NodeObj->TryGetStringField(TEXT("node_class"), NodeClass);
+
+		FString NodeGuid;
+		NodeObj->TryGetStringField(TEXT("uid"), NodeGuid);
+		if (NodeGuid.IsEmpty())
+		{
+			NodeObj->TryGetStringField(TEXT("node_guid"), NodeGuid);
+		}
+
+		const TSharedPtr<FJsonObject>* NodePropsObj = nullptr;
+		const bool bHasNodeProps =
+			NodeObj->TryGetObjectField(TEXT("node_props"), NodePropsObj) &&
+			NodePropsObj &&
+			NodePropsObj->IsValid();
+
+		if (NodeClass.Equals(TEXT("AnimGraphNode_LinkedAnimLayer"), ESearchCase::CaseSensitive) && bHasNodeProps)
+		{
+			FString LayerName;
+			(*NodePropsObj)->TryGetStringField(TEXT("LinkedAnimLayerLayer"), LayerName);
+
+			FString InterfaceClassPath;
+			(*NodePropsObj)->TryGetStringField(TEXT("LinkedAnimLayerInterfaceClass"), InterfaceClassPath);
+			FString NodeStructText;
+			(*NodePropsObj)->TryGetStringField(TEXT("Node"), NodeStructText);
+			const bool bNodeStructHasExplicitInterface =
+				NodeStructText.Contains(TEXT("Interface="), ESearchCase::CaseSensitive);
+
+			if (!LayerName.IsEmpty() &&
+				bNodeStructHasExplicitInterface &&
+				(InterfaceClassPath.IsEmpty() || InterfaceClassPath.Equals(TEXT("None"), ESearchCase::IgnoreCase)))
+			{
+				OutViolations.Add(FString::Printf(
+					TEXT("linked_layer_interface_missing graph=%s node=%s layer=%s"),
+					*GraphPath,
+					*NodeGuid,
+					*LayerName));
+			}
+		}
+
+		if (NodeClass.Equals(TEXT("AnimStateNode"), ESearchCase::CaseSensitive) && bHasNodeProps)
+		{
+			FString StateEnteredText;
+			(*NodePropsObj)->TryGetStringField(TEXT("StateEntered"), StateEnteredText);
+			const FString ActualNotifyName =
+				ExtractStateNotifyNameFromStateEnteredText_ExportBpy(StateEnteredText);
+
+			FString BoundGraphJson;
+			(*NodePropsObj)->TryGetStringField(TEXT("BoundGraphJson"), BoundGraphJson);
+			TSharedPtr<FJsonObject> BoundGraphObj;
+			if (TryParseJsonObjectString_ExportBpy(BoundGraphJson, BoundGraphObj))
+			{
+				FString ExpectedNotifyName;
+				const TArray<TSharedPtr<FJsonValue>>* BoundNodesArr = nullptr;
+				if (BoundGraphObj->TryGetArrayField(TEXT("nodes"), BoundNodesArr) && BoundNodesArr)
+				{
+					for (const TSharedPtr<FJsonValue>& BoundNodeValue : *BoundNodesArr)
+					{
+						const TSharedPtr<FJsonObject> BoundNodeObj =
+							BoundNodeValue.IsValid() ? BoundNodeValue->AsObject() : nullptr;
+						if (!BoundNodeObj.IsValid())
+						{
+							continue;
+						}
+
+						FString BoundNodeClass;
+						BoundNodeObj->TryGetStringField(TEXT("node_class"), BoundNodeClass);
+						if (!BoundNodeClass.Equals(TEXT("AnimGraphNode_StateResult"), ESearchCase::CaseSensitive))
+						{
+							continue;
+						}
+
+						const TSharedPtr<FJsonObject>* BoundNodePropsObj = nullptr;
+						if (!BoundNodeObj->TryGetObjectField(TEXT("node_props"), BoundNodePropsObj) ||
+							!BoundNodePropsObj ||
+							!BoundNodePropsObj->IsValid())
+						{
+							continue;
+						}
+
+						FString StateResultNodeText;
+						(*BoundNodePropsObj)->TryGetStringField(TEXT("Node"), StateResultNodeText);
+						ExpectedNotifyName = ExtractStateResultHookFunctionName_ExportBpy(
+							StateResultNodeText,
+							TEXT("StateEntryFunction"));
+						if (!ExpectedNotifyName.IsEmpty())
+						{
+							break;
+						}
+					}
+				}
+
+				if (!ExpectedNotifyName.IsEmpty() && ActualNotifyName.IsEmpty())
+				{
+					OutViolations.Add(FString::Printf(
+						TEXT("state_entry_binding_missing graph=%s node=%s expected=%s actual=%s"),
+						*GraphPath,
+						*NodeGuid,
+						*ExpectedNotifyName,
+						*ActualNotifyName));
+				}
+			}
+		}
+
+		if (bHasNodeProps)
+		{
+			for (const TCHAR* NestedField : NestedGraphFields)
+			{
+				FString NestedJson;
+				if (!(*NodePropsObj)->TryGetStringField(NestedField, NestedJson) || NestedJson.IsEmpty())
+				{
+					continue;
+				}
+
+				TSharedPtr<FJsonObject> NestedGraphObj;
+				if (!TryParseJsonObjectString_ExportBpy(NestedJson, NestedGraphObj))
+				{
+					OutViolations.Add(FString::Printf(
+						TEXT("nested_graph_json_parse_failed graph=%s node=%s field=%s"),
+						*GraphPath,
+						*NodeGuid,
+						NestedField));
+					continue;
+				}
+
+				CollectAnimExportContractViolationsFromGraph_ExportBpy(
+					NestedGraphObj,
+					GraphPath + TEXT("::") + NodeGuid + TEXT(".") + NestedField,
+					OutViolations);
+			}
+		}
+	}
+}
+
+bool ValidatePostExportContracts_ExportBpy(UBlueprint* BP, FString& OutError)
+{
+	OutError.Reset();
+	if (!BP || !BP->IsA<UAnimBlueprint>())
+	{
+		return true;
+	}
+
+	const TSharedPtr<FJsonObject> Root = UBPDirectExporter::SerializeBlueprintToJson(BP);
+	if (!Root.IsValid())
+	{
+		OutError = TEXT("Post-export validation failed: cannot serialize blueprint to JSON");
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
+	if (!Root->TryGetArrayField(TEXT("graphs"), GraphsArr) || !GraphsArr)
+	{
+		OutError = TEXT("Post-export validation failed: missing graphs array");
+		return false;
+	}
+
+	TArray<FString> Violations;
+	for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
+	{
+		const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
+		if (!GraphObj.IsValid())
+		{
+			continue;
+		}
+
+		FString GraphName;
+		GraphObj->TryGetStringField(TEXT("name"), GraphName);
+		if (GraphName.IsEmpty())
+		{
+			GraphName = TEXT("<unnamed_graph>");
+		}
+
+		CollectAnimExportContractViolationsFromGraph_ExportBpy(GraphObj, GraphName, Violations);
+	}
+
+	if (Violations.Num() > 0)
+	{
+		OutError = FString::Printf(
+			TEXT("Post-export contract validation failed: %s"),
+			*FString::Join(Violations, TEXT("; ")));
+		return false;
+	}
+
+	return true;
+}
 }
 
 // ─── public entry point ───────────────────────────────────────────────────────
@@ -4495,6 +4752,11 @@ bool UBPDirectExporter::ExportBlueprintToPy(
 	if (!BP)
 	{
 		OutError = FString::Printf(TEXT("Cannot load blueprint: %s"), *BlueprintPath);
+		return false;
+	}
+
+	if (!ValidatePostExportContracts_ExportBpy(BP, OutError))
+	{
 		return false;
 	}
 
@@ -4669,6 +4931,11 @@ bool UBPDirectExporter::ReadBlueprintToBpyText(
 
 	UBlueprint* BP = LoadBlueprintAsset_ExportBpy(BlueprintPath, OutError);
 	if (!BP)
+	{
+		return false;
+	}
+
+	if (!ValidatePostExportContracts_ExportBpy(BP, OutError))
 	{
 		return false;
 	}
@@ -6474,6 +6741,97 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeBlueprintToJson(UBlueprint* 
 	}
 	Root->SetArrayField(TEXT("variables"), Vars);
 
+	// Class defaults (used by strict importer roundtrip hash validation).
+	TArray<TSharedPtr<FJsonValue>> ClassDefaults;
+	if (BP->GeneratedClass)
+	{
+		UObject* BPCDO = BP->GeneratedClass->GetDefaultObject(false);
+		UClass* SuperClass = BP->GeneratedClass->GetSuperClass();
+		UObject* ParentCDO = (SuperClass && SuperClass->GetDefaultObject(false))
+			? SuperClass->GetDefaultObject(false)
+			: nullptr;
+
+		if (BPCDO && ParentCDO)
+		{
+			for (TFieldIterator<FProperty> It(BP->GeneratedClass, EFieldIteratorFlags::IncludeSuper); It; ++It)
+			{
+				const FProperty* Prop = *It;
+				if (!Prop)
+				{
+					continue;
+				}
+
+				if (!Prop->HasAnyPropertyFlags(CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintReadOnly))
+				{
+					continue;
+				}
+				if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_EditorOnly | CPF_Deprecated))
+				{
+					continue;
+				}
+				if (CastField<FArrayProperty>(Prop) || CastField<FSetProperty>(Prop) || CastField<FMapProperty>(Prop))
+				{
+					continue;
+				}
+
+				const void* BPPtr = Prop->ContainerPtrToValuePtr<void>(BPCDO);
+				const UClass* PropOwnerClass = Prop->GetOwnerClass();
+				const void* ParentPtr = (PropOwnerClass && ParentCDO->GetClass()->IsChildOf(PropOwnerClass))
+					? Prop->ContainerPtrToValuePtr<void>(ParentCDO)
+					: nullptr;
+				if (!BPPtr || !ParentPtr)
+				{
+					continue;
+				}
+				if (Prop->Identical(BPPtr, ParentPtr))
+				{
+					continue;
+				}
+
+				FString ValueText;
+				Prop->ExportTextItem_Direct(ValueText, BPPtr, ParentPtr, BPCDO, PPF_None);
+				if (ValueText.IsEmpty())
+				{
+					continue;
+				}
+
+				TSharedPtr<FJsonObject> DefaultObj = MakeShared<FJsonObject>();
+				DefaultObj->SetStringField(TEXT("name"), Prop->GetName());
+				DefaultObj->SetStringField(TEXT("value"), ValueText);
+				ClassDefaults.Add(MakeShared<FJsonValueObject>(DefaultObj));
+			}
+		}
+
+		if (const UAnimBlueprint* AnimBP = Cast<UAnimBlueprint>(BP))
+		{
+			if (AnimBP->TargetSkeleton)
+			{
+				TSharedPtr<FJsonObject> DefaultObj = MakeShared<FJsonObject>();
+				DefaultObj->SetStringField(TEXT("name"), TEXT("TargetSkeleton"));
+				DefaultObj->SetStringField(TEXT("value"), AnimBP->TargetSkeleton->GetPathName());
+				ClassDefaults.Add(MakeShared<FJsonValueObject>(DefaultObj));
+			}
+
+			USkeletalMesh* PreviewMesh = nullptr;
+			if (UAnimBlueprint* MutableAnimBP = const_cast<UAnimBlueprint*>(AnimBP))
+			{
+				PreviewMesh = MutableAnimBP->GetPreviewMesh(false);
+			}
+			if (!PreviewMesh && AnimBP->TargetSkeleton)
+			{
+				PreviewMesh = AnimBP->TargetSkeleton->GetPreviewMesh(true);
+			}
+			if (PreviewMesh)
+			{
+				TSharedPtr<FJsonObject> DefaultObj = MakeShared<FJsonObject>();
+				DefaultObj->SetStringField(TEXT("name"), TEXT("PreviewSkeletalMesh"));
+				DefaultObj->SetStringField(TEXT("value"), PreviewMesh->GetPathName());
+				ClassDefaults.Add(MakeShared<FJsonValueObject>(DefaultObj));
+			}
+		}
+	}
+	Root->SetArrayField(TEXT("class_defaults"), ClassDefaults);
+
 	// Dispatchers (MC delegates)
 	TArray<TSharedPtr<FJsonValue>> Dispatchers;
 	for (const FBPVariableDescription& Var : BP->NewVariables)
@@ -7088,6 +7446,21 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeGenericNode(UEdGraphNode* No
 		if (AliasedStateUids.Num() > 0)
 		{
 			NodeProps->SetStringField(TEXT("AliasedStateUids"), FString::Join(AliasedStateUids, TEXT("|")));
+		}
+	}
+
+	if (const UAnimGraphNode_LinkedAnimLayer* LinkedLayerNode = Cast<UAnimGraphNode_LinkedAnimLayer>(Node))
+	{
+		NodeProps->SetStringField(TEXT("LinkedAnimLayerLayer"), LinkedLayerNode->Node.Layer.ToString());
+		UClass* InterfaceClass = ResolveLinkedAnimLayerInterfaceClass_ExportBpy(LinkedLayerNode);
+
+		if (InterfaceClass)
+		{
+			NodeProps->SetStringField(TEXT("LinkedAnimLayerInterfaceClass"), InterfaceClass->GetPathName());
+		}
+		else
+		{
+			NodeProps->SetStringField(TEXT("LinkedAnimLayerInterfaceClass"), TEXT("None"));
 		}
 	}
 

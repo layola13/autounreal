@@ -12,6 +12,8 @@ import math
 import struct
 import time
 import threading
+import os
+import subprocess
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, Optional, List
 from mcp.server.fastmcp import FastMCP
@@ -70,6 +72,10 @@ logger = logging.getLogger("UnrealMCP_Advanced")
 # Configuration
 UNREAL_HOST = "127.0.0.1"
 UNREAL_PORT = 55557
+
+# Keep a lightweight hint so screenshot capture can open the last imported
+# Blueprint editor without requiring ad-hoc run_python calls each time.
+_LAST_BLUEPRINT_ASSET_HINT: str = ""
 
 class UnrealConnection:
     """
@@ -491,6 +497,41 @@ def _forward_unreal_command(command: str, params: Optional[Dict[str, Any]] = Non
     except Exception as e:
         logger.error(f"{command} error: {e}")
         return {"success": False, "message": str(e)}
+
+
+def _normalize_asset_path_for_editor_load(path: str) -> str:
+    """Normalize blueprint object paths to package paths for unreal.load_asset."""
+    candidate = (path or "").strip()
+    if not candidate:
+        return ""
+    if "." in candidate:
+        last_slash = candidate.rfind("/")
+        last_dot = candidate.rfind(".")
+        if last_dot > last_slash:
+            candidate = candidate[:last_dot]
+    return candidate
+
+
+def _remember_blueprint_asset_hint(
+    target: str = "",
+    asset_path: str = "",
+    blueprint_path: str = "",
+    soft_path_from_project_root: str = "",
+    blueprint: str = ""
+) -> str:
+    """Remember a best-effort blueprint asset path for follow-up screenshots."""
+    global _LAST_BLUEPRINT_ASSET_HINT
+    resolved = _resolve_blueprint_asset_path(
+        target=target,
+        asset_path=asset_path,
+        blueprint_path=blueprint_path,
+        soft_path_from_project_root=soft_path_from_project_root,
+        blueprint=blueprint
+    )
+    normalized = _normalize_asset_path_for_editor_load(resolved)
+    if normalized.startswith("/"):
+        _LAST_BLUEPRINT_ASSET_HINT = normalized
+    return _LAST_BLUEPRINT_ASSET_HINT
 
 
 def _unwrap_forwarded_result(response: Dict[str, Any]) -> Dict[str, Any]:
@@ -1176,10 +1217,79 @@ def shutdown_headless() -> Dict[str, Any]:
 
 @mcp.tool()
 def launch_unreal_project(project_path: str = "") -> Dict[str, Any]:
-    """Launch the Unreal project in headless mode."""
+    """Launch the Unreal project. Falls back to local UnrealEditor.exe when bridge is offline."""
+    normalized_project = (project_path or "").strip().strip('"')
     params: Dict[str, Any] = {}
-    _maybe_add_param(params, "project_path", project_path)
-    return _forward_unreal_command("launch_unreal_project", params)
+    _maybe_add_param(params, "project_path", normalized_project)
+
+    # First try the bridge path (works when Unreal command endpoint is already reachable).
+    response = _forward_unreal_command("launch_unreal_project", params)
+    unwrapped = _unwrap_forwarded_result(response)
+    if unwrapped.get("success"):
+        return response
+
+    # Bridge launch failed (typically because UE is down): fallback to local process launch.
+    if not normalized_project:
+        return {
+            "success": False,
+            "message": "launch_unreal_project fallback requires project_path when bridge is offline"
+        }
+    if not os.path.isfile(normalized_project):
+        return {
+            "success": False,
+            "message": f"Invalid project_path: {normalized_project}"
+        }
+
+    editor_candidates = [
+        os.environ.get("UNREAL_EDITOR_PATH", "").strip(),
+        r"E:\unreal_engine\UE_5.7\Engine\Binaries\Win64\UnrealEditor.exe",
+        r"E:\unreal_engine\UE_5.6\Engine\Binaries\Win64\UnrealEditor.exe",
+        r"C:\Program Files\Epic Games\UE_5.7\Engine\Binaries\Win64\UnrealEditor.exe",
+        r"C:\Program Files\Epic Games\UE_5.6\Engine\Binaries\Win64\UnrealEditor.exe",
+        r"C:\Program Files\Epic Games\UE_5.5\Engine\Binaries\Win64\UnrealEditor.exe",
+    ]
+    editor_exe = next((p for p in editor_candidates if p and os.path.isfile(p)), "")
+    if not editor_exe:
+        return {
+            "success": False,
+            "message": "Unable to find UnrealEditor.exe. Set UNREAL_EDITOR_PATH or install UE."
+        }
+
+    try:
+        subprocess.Popen([editor_exe, normalized_project], close_fds=True)
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to launch UnrealEditor.exe: {e}"
+        }
+
+    # Wait for bridge to become reachable.
+    unreal = get_unreal_connection()
+    last_error = ""
+    for _ in range(120):  # up to ~120s
+        time.sleep(1.0)
+        try:
+            ping = unreal.send_command("get_unreal_context", {})
+            ping_unwrapped = _unwrap_forwarded_result(ping or {})
+            if ping_unwrapped.get("success", False) or ping.get("status") == "success":
+                return {
+                    "success": True,
+                    "launched_via": "local_process_fallback",
+                    "editor_exe": editor_exe,
+                    "project_path": normalized_project,
+                    "bridge_ready": True
+                }
+        except Exception as e:
+            last_error = str(e)
+
+    return {
+        "success": False,
+        "launched_via": "local_process_fallback",
+        "editor_exe": editor_exe,
+        "project_path": normalized_project,
+        "bridge_ready": False,
+        "message": f"Editor launched but bridge not ready in time. Last error: {last_error}"
+    }
 
 
 @mcp.tool()
@@ -1194,6 +1304,136 @@ def get_unreal_context(only_get_drag_dropped_objects: Optional[bool] = None) -> 
 def get_recent_generated_images() -> Dict[str, Any]:
     """Get recently generated or edited image file paths inside the project."""
     return _forward_unreal_command("get_recent_generated_images")
+
+
+@mcp.tool()
+def take_editor_screenshot(
+    file_name: str = "",
+    width: int = 1920,
+    height: int = 1080,
+    relative_folder: str = "Saved/UnrealMCP/Screenshots",
+    timeout_seconds: int = 180
+) -> Dict[str, Any]:
+    """
+    Capture an editor screenshot without manually writing Python each time.
+
+    Args:
+        file_name: Optional output filename ('.png' appended when omitted)
+        width: Screenshot width in pixels
+        height: Screenshot height in pixels
+        relative_folder: Project-relative output folder
+    """
+    unreal = get_unreal_connection()
+    if not unreal:
+        return {"success": False, "message": "Failed to connect to Unreal Engine"}
+
+    safe_file_name = (file_name or "").strip()
+    if safe_file_name and not safe_file_name.lower().endswith(".png"):
+        safe_file_name += ".png"
+
+    safe_folder = (relative_folder or "Saved/UnrealMCP/Screenshots").strip().replace("\\", "/")
+    if not safe_folder:
+        safe_folder = "Saved/UnrealMCP/Screenshots"
+
+    open_asset_path = _normalize_asset_path_for_editor_load(_LAST_BLUEPRINT_ASSET_HINT)
+
+    native_params: Dict[str, Any] = {
+        "file_name": safe_file_name,
+        "width": int(width),
+        "height": int(height),
+        "relative_folder": safe_folder,
+    }
+    if open_asset_path:
+        native_params["asset_path"] = open_asset_path
+
+    native_response = _forward_unreal_command("take_editor_screenshot", native_params)
+    native_unwrapped = _unwrap_forwarded_result(native_response if isinstance(native_response, dict) else {})
+    if native_unwrapped.get("success", False):
+        native_unwrapped.setdefault("invoked_via", "native_unreal_command")
+        return native_unwrapped
+
+    native_error_code = str(native_unwrapped.get("error_code", "")).strip().lower()
+    native_error_text = str(native_unwrapped.get("error", native_unwrapped.get("message", ""))).strip().lower()
+    unsupported_tokens = (
+        "not supported",
+        "not_supported_yet",
+        "unknown command",
+        "command not supported yet"
+    )
+    b_native_unsupported = native_error_code == "not_supported_yet" or any(token in native_error_text for token in unsupported_tokens)
+    if not b_native_unsupported:
+        return native_unwrapped if native_unwrapped else {"success": False, "message": "take_editor_screenshot failed"}
+
+    # Keep this self-contained so callers don't need to run ad-hoc python.
+    screenshot_py = f"""
+import os
+import time
+import unreal
+
+asset_to_open = r\"{open_asset_path}\"
+if asset_to_open:
+    try:
+        asset = unreal.load_asset(asset_to_open)
+        if asset:
+            editor_subsystem = unreal.get_editor_subsystem(unreal.AssetEditorSubsystem)
+            if editor_subsystem:
+                editor_subsystem.open_editor_for_assets([asset])
+                # Let Slate update active tab before taking the screenshot.
+                time.sleep(0.75)
+    except Exception as e:
+        print(\"[UnrealMCP][Screenshot][OpenAssetError] \" + str(e))
+
+folder_rel = r\"{safe_folder}\"
+project_dir = unreal.Paths.project_dir()
+out_dir = os.path.normpath(os.path.join(project_dir, folder_rel))
+os.makedirs(out_dir, exist_ok=True)
+
+name = r\"{safe_file_name}\"
+if not name:
+    name = \"mcp_screenshot_\" + time.strftime(\"%Y%m%d_%H%M%S\") + \".png\"
+elif not name.lower().endswith(\".png\"):
+    name += \".png\"
+
+full_path = os.path.normpath(os.path.join(out_dir, name))
+target_path = full_path.replace(\"\\\\\", \"/\")
+
+unreal.AutomationLibrary.take_high_res_screenshot({int(width)}, {int(height)}, target_path)
+
+# Give async writer a brief moment to flush.
+for _ in range(20):
+    if os.path.exists(full_path):
+        break
+    time.sleep(0.1)
+
+print(\"[UnrealMCP][Screenshot] \" + target_path)
+"""
+
+    try:
+        response = unreal.send_command("execute_unreal_python", {
+            "python_script_or_patch": screenshot_py,
+            "short_description": "take_editor_screenshot",
+            "timeout_seconds": max(30, int(timeout_seconds))
+        })
+        if not response:
+            return {"success": False, "message": "No response from Unreal"}
+
+        # Return a predictable location even if editor logging is delayed.
+        expected_name = safe_file_name if safe_file_name else "mcp_screenshot_<timestamp>.png"
+        expected_full_path = os.path.normpath(os.path.join(os.path.normpath(os.path.join(os.getcwd(), safe_folder)), expected_name))
+        return {
+            "success": True,
+            "command": "take_editor_screenshot",
+            "opened_asset_hint": open_asset_path,
+            "requested_file_name": safe_file_name,
+            "requested_folder": safe_folder,
+            "width": int(width),
+            "height": int(height),
+            "expected_full_path": expected_full_path,
+            "message": "Screenshot command dispatched. Use get_recent_generated_images to fetch actual file path."
+        }
+    except Exception as e:
+        logger.error(f"take_editor_screenshot error: {e}")
+        return {"success": False, "message": str(e)}
 
 
 @mcp.tool()
@@ -1956,25 +2196,33 @@ def import_asset_py(
     compile_blueprint: Optional[bool] = None
 ) -> Dict[str, Any]:
     """Import a Blueprint from Python export content using the asset alias."""
-    return _forward_unreal_command(
-        "import_asset_py",
-        _build_import_blueprint_py_params(
-            spec=spec,
-            spec_json=spec_json,
-            python_text=python_text,
-            script_text=script_text,
-            input_path=input_path,
-            script_path=script_path,
+    params = _build_import_blueprint_py_params(
+        spec=spec,
+        spec_json=spec_json,
+        python_text=python_text,
+        script_text=script_text,
+        input_path=input_path,
+        script_path=script_path,
+        target=target,
+        asset_path=asset_path,
+        blueprint_path=blueprint_path,
+        soft_path_from_project_root=soft_path_from_project_root,
+        blueprint_name=blueprint_name,
+        blueprint=blueprint,
+        overwrite=overwrite,
+        compile_blueprint=compile_blueprint
+    )
+    response = _forward_unreal_command("import_asset_py", params)
+    payload = _unwrap_forwarded_result(response)
+    if payload.get("success"):
+        _remember_blueprint_asset_hint(
             target=target,
             asset_path=asset_path,
             blueprint_path=blueprint_path,
             soft_path_from_project_root=soft_path_from_project_root,
-            blueprint_name=blueprint_name,
-            blueprint=blueprint,
-            overwrite=overwrite,
-            compile_blueprint=compile_blueprint
+            blueprint=blueprint
         )
-    )
+    return response
 
 
 @mcp.tool()
@@ -1995,25 +2243,33 @@ def import_blueprint_py(
     compile_blueprint: Optional[bool] = None
 ) -> Dict[str, Any]:
     """Import a Blueprint from Python export content."""
-    return _forward_unreal_command(
-        "import_blueprint_py",
-        _build_import_blueprint_py_params(
-            spec=spec,
-            spec_json=spec_json,
-            python_text=python_text,
-            script_text=script_text,
-            input_path=input_path,
-            script_path=script_path,
+    params = _build_import_blueprint_py_params(
+        spec=spec,
+        spec_json=spec_json,
+        python_text=python_text,
+        script_text=script_text,
+        input_path=input_path,
+        script_path=script_path,
+        target=target,
+        asset_path=asset_path,
+        blueprint_path=blueprint_path,
+        soft_path_from_project_root=soft_path_from_project_root,
+        blueprint_name=blueprint_name,
+        blueprint=blueprint,
+        overwrite=overwrite,
+        compile_blueprint=compile_blueprint
+    )
+    response = _forward_unreal_command("import_blueprint_py", params)
+    payload = _unwrap_forwarded_result(response)
+    if payload.get("success"):
+        _remember_blueprint_asset_hint(
             target=target,
             asset_path=asset_path,
             blueprint_path=blueprint_path,
             soft_path_from_project_root=soft_path_from_project_root,
-            blueprint_name=blueprint_name,
-            blueprint=blueprint,
-            overwrite=overwrite,
-            compile_blueprint=compile_blueprint
+            blueprint=blueprint
         )
-    )
+    return response
 
 
 @mcp.tool()
@@ -2036,25 +2292,33 @@ def import_blueprint_from_bpy(
 ) -> Dict[str, Any]:
     """Import an ExportBpy DSL file/directory or inline bpy data into a target Blueprint."""
     inline_text = script_text or python_text or bpydata
-    return _forward_unreal_command(
-        "import_blueprint_from_bpy",
-        _build_import_blueprint_py_params(
-            spec=spec,
-            spec_json=spec_json,
-            python_text=python_text,
-            script_text=inline_text,
-            input_path=input_path,
-            script_path=script_path,
+    params = _build_import_blueprint_py_params(
+        spec=spec,
+        spec_json=spec_json,
+        python_text=python_text,
+        script_text=inline_text,
+        input_path=input_path,
+        script_path=script_path,
+        target=target,
+        asset_path=asset_path,
+        blueprint_path=blueprint_path,
+        soft_path_from_project_root=soft_path_from_project_root,
+        blueprint_name=blueprint_name,
+        blueprint=blueprint,
+        overwrite=overwrite,
+        compile_blueprint=compile_blueprint
+    )
+    response = _forward_unreal_command("import_blueprint_from_bpy", params)
+    payload = _unwrap_forwarded_result(response)
+    if payload.get("success"):
+        _remember_blueprint_asset_hint(
             target=target,
             asset_path=asset_path,
             blueprint_path=blueprint_path,
             soft_path_from_project_root=soft_path_from_project_root,
-            blueprint_name=blueprint_name,
-            blueprint=blueprint,
-            overwrite=overwrite,
-            compile_blueprint=compile_blueprint
+            blueprint=blueprint
         )
-    )
+    return response
 
 
 @mcp.tool()
@@ -2121,6 +2385,14 @@ def import_blueprint_from_bpy_verified(
 
     if not import_payload.get("success"):
         return response
+
+    _remember_blueprint_asset_hint(
+        target=resolved_asset_path or target,
+        asset_path=asset_path,
+        blueprint_path=blueprint_path,
+        soft_path_from_project_root=soft_path_from_project_root,
+        blueprint=blueprint
+    )
 
     if resolved_asset_path:
         parts = post_import_parts or ["PropertyDeclarations", "Components", "Events", "Functions"]

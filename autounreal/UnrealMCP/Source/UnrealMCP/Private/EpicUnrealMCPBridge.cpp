@@ -123,6 +123,7 @@ EMCPCommandGroup GetCommandGroup(const FString& CanonicalCommand)
         TEXT("add_fab_asset_to_project"),
         TEXT("save_project"),
         TEXT("save_all"),
+        TEXT("take_editor_screenshot"),
         TEXT("spawn_blueprint_actor"),
         TEXT("add_animations_to_pose_search_database")
     };
@@ -268,7 +269,6 @@ EMCPCommandGroup GetCommandGroup(const FString& CanonicalCommand)
         TEXT("rig_model_from_mesh"),
         TEXT("generate_cpp_file"),
         TEXT("edit_cpp_file"),
-        TEXT("take_editor_screenshot"),
         TEXT("fetch_material_best_practices"),
         TEXT("fetch_audio_skill"),
         TEXT("search_unreal_python_api"),

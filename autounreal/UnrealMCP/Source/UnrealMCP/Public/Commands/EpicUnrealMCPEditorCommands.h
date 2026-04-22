@@ -41,6 +41,7 @@ private:
     TSharedPtr<FJsonObject> HandleGetAssetsByNameFromFab(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAddFabAssetToProject(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSaveProject(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleTakeEditorScreenshot(const TSharedPtr<FJsonObject>& Params);
 
     // Blueprint actor spawning
     TSharedPtr<FJsonObject> HandleSpawnBlueprintActor(const TSharedPtr<FJsonObject>& Params);

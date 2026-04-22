@@ -3946,31 +3946,52 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeEditorScreenshot
     const int32 CaptureWidth = FMath::Clamp(RequestedWidth, 16, 16384);
     const int32 CaptureHeight = FMath::Clamp(RequestedHeight, 16, 16384);
 
-    FHighResScreenshotConfig& HighResScreenshotConfig = GetHighResScreenshotConfig();
-    HighResScreenshotConfig.SetResolution(CaptureWidth, CaptureHeight, 1.0f);
-
-    FScreenshotRequest::RequestScreenshot(OutputFilePath, false, false);
-    const bool bCaptureRequested = TargetViewport->TakeHighResScreenShot();
-    if (!bCaptureRequested)
+    const FIntPoint SourceSize = TargetViewport->GetSizeXY();
+    if (SourceSize.X <= 0 || SourceSize.Y <= 0)
     {
-        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to request screenshot from active viewport"));
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Active editor viewport has invalid size"));
     }
 
-    bool bFileWritten = false;
-    for (int32 Attempt = 0; Attempt < 50; ++Attempt)
+    TArray<FColor> SourcePixels;
+    SourcePixels.Reserve(SourceSize.X * SourceSize.Y);
+    if (!TargetViewport->ReadPixels(SourcePixels))
     {
-        if (IFileManager::Get().FileExists(*OutputFilePath))
-        {
-            bFileWritten = true;
-            break;
-        }
-        FPlatformProcess::Sleep(0.02f);
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to read pixels from active viewport"));
     }
 
-    if (!bFileWritten)
+    TArray<FColor> OutputPixels;
+    const TArray<FColor>* PixelsToWrite = &SourcePixels;
+    int32 FinalWidth = SourceSize.X;
+    int32 FinalHeight = SourceSize.Y;
+
+    if (CaptureWidth != SourceSize.X || CaptureHeight != SourceSize.Y)
+    {
+        OutputPixels.Reserve(CaptureWidth * CaptureHeight);
+        FImageUtils::ImageResize(
+            SourceSize.X,
+            SourceSize.Y,
+            SourcePixels,
+            CaptureWidth,
+            CaptureHeight,
+            OutputPixels,
+            true);
+
+        PixelsToWrite = &OutputPixels;
+        FinalWidth = CaptureWidth;
+        FinalHeight = CaptureHeight;
+    }
+
+    TArray<uint8> CompressedPng;
+    FImageUtils::CompressImageArray(FinalWidth, FinalHeight, *PixelsToWrite, CompressedPng);
+    if (CompressedPng.Num() <= 0)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to compress screenshot image"));
+    }
+
+    if (!FFileHelper::SaveArrayToFile(CompressedPng, *OutputFilePath))
     {
         return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
-            FString::Printf(TEXT("Screenshot request completed but file was not found: %s"), *OutputFilePath));
+            FString::Printf(TEXT("Failed to save screenshot to %s"), *OutputFilePath));
     }
 
     TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
@@ -3979,8 +4000,8 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeEditorScreenshot
     ResultObj->SetStringField(TEXT("file_path"), OutputFilePath);
     ResultObj->SetStringField(TEXT("relative_folder"), EffectiveFolder);
     ResultObj->SetStringField(TEXT("file_name"), FileName);
-    ResultObj->SetNumberField(TEXT("width"), CaptureWidth);
-    ResultObj->SetNumberField(TEXT("height"), CaptureHeight);
+    ResultObj->SetNumberField(TEXT("width"), FinalWidth);
+    ResultObj->SetNumberField(TEXT("height"), FinalHeight);
     if (!AssetPath.IsEmpty())
     {
         ResultObj->SetStringField(TEXT("opened_asset"), AssetPath);

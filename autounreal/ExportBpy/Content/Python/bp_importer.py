@@ -27,7 +27,16 @@ except ImportError:
     _HAS_UNREAL = False
 
 
-GRAPH_PREFIXES = ("evt_", "fn_", "macro_", "tl_")
+GRAPH_PREFIXES = (
+    "evt_",
+    "fn_",
+    "macro_",
+    "tl_",
+    "other_evt_",
+    "other_fn_",
+    "other_macro_",
+    "other_tl_",
+)
 MAIN_BP_FILE = "__bp__.bp.py"
 
 
@@ -97,6 +106,44 @@ def _is_graph_dsl_file(file_name: str) -> bool:
     if not file_name.endswith(".bp.py"):
         return False
     return any(file_name.startswith(prefix) for prefix in GRAPH_PREFIXES)
+
+
+def _normalize_include_file_set(include_files: Optional[List[str]]) -> Set[str]:
+    if not include_files:
+        return set()
+
+    normalized: Set[str] = set()
+    for raw in include_files:
+        token = str(raw or "").strip().replace("\\", "/")
+        if not token:
+            continue
+        base = os.path.basename(token)
+        if not base:
+            continue
+        lowered = base.lower()
+        normalized.add(lowered)
+
+        if lowered.endswith("_meta.py"):
+            stem = lowered[:-8]
+            normalized.add(stem + ".bp.py")
+            continue
+
+        if not lowered.endswith(".bp.py"):
+            normalized.add(lowered + ".bp.py")
+    return normalized
+
+
+def _is_top_level_graph_file(file_name: str) -> bool:
+    return (
+        file_name.startswith("evt_")
+        or file_name.startswith("fn_")
+        or file_name.startswith("macro_")
+        or file_name.startswith("tl_")
+    )
+
+
+def _graph_identity_key(graph_type: str, graph_name: str) -> str:
+    return f"{graph_type}:{graph_name}".lower()
 
 
 def _graph_meta_path(dir_path: str, file_name: str) -> str:
@@ -270,9 +317,17 @@ def import_directory(
     dir_path: str,
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "full",
+    strict_mode: str = "strict",
 ) -> Tuple[bool, str]:
     details = import_directory_with_details(
-        dir_path, target_path=target_path, compile_blueprint=compile_blueprint
+        dir_path,
+        target_path=target_path,
+        compile_blueprint=compile_blueprint,
+        include_files=include_files,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
     return bool(details.get("success")), str(details.get("error", ""))
 
@@ -281,6 +336,9 @@ def import_directory_with_details(
     dir_path: str,
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "full",
+    strict_mode: str = "strict",
 ) -> Dict[str, Any]:
     """
     从 DSL 目录导入蓝图或 standalone asset package。
@@ -289,7 +347,7 @@ def import_directory_with_details(
         return _error_details(f"目录不存在: {dir_path}")
 
     try:
-        bp_obj = _exec_directory_dsl(dir_path)
+        bp_obj = _exec_directory_dsl(dir_path, include_files=include_files, partial_mode=partial_mode)
     except Exception as exc:
         return _error_details(f"执行 DSL 目录失败: {exc}")
 
@@ -299,7 +357,11 @@ def import_directory_with_details(
         )
 
     return _import_blueprint_object_with_details(
-        bp_obj, target_path, compile_blueprint=compile_blueprint
+        bp_obj,
+        target_path,
+        compile_blueprint=compile_blueprint,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
 
 
@@ -307,9 +369,17 @@ def import_file(
     py_path: str,
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "full",
+    strict_mode: str = "strict",
 ) -> Tuple[bool, str]:
     details = import_file_with_details(
-        py_path, target_path=target_path, compile_blueprint=compile_blueprint
+        py_path,
+        target_path=target_path,
+        compile_blueprint=compile_blueprint,
+        include_files=include_files,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
     return bool(details.get("success")), str(details.get("error", ""))
 
@@ -318,6 +388,9 @@ def import_file_with_details(
     py_path: str,
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "full",
+    strict_mode: str = "strict",
 ) -> Dict[str, Any]:
     """
     兼容旧单文件导入。
@@ -330,6 +403,9 @@ def import_file_with_details(
             os.path.dirname(py_path),
             target_path=target_path,
             compile_blueprint=compile_blueprint,
+            include_files=include_files,
+            partial_mode=partial_mode,
+            strict_mode=strict_mode,
         )
     if not py_path.endswith(".bp.py"):
         return _error_details(f"仅支持导入 .bp.py 文件: {py_path}")
@@ -340,7 +416,11 @@ def import_file_with_details(
         return _error_details(f"执行 DSL 脚本失败: {exc}")
 
     return _import_blueprint_object_with_details(
-        bp_obj, target_path, compile_blueprint=compile_blueprint
+        bp_obj,
+        target_path,
+        compile_blueprint=compile_blueprint,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
 
 
@@ -348,9 +428,17 @@ def import_path(
     path: str,
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "full",
+    strict_mode: str = "strict",
 ) -> Tuple[bool, str]:
     details = import_path_with_details(
-        path, target_path=target_path, compile_blueprint=compile_blueprint
+        path,
+        target_path=target_path,
+        compile_blueprint=compile_blueprint,
+        include_files=include_files,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
     return bool(details.get("success")), str(details.get("error", ""))
 
@@ -359,13 +447,26 @@ def import_path_with_details(
     path: str,
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "full",
+    strict_mode: str = "strict",
 ) -> Dict[str, Any]:
     if os.path.isdir(path):
         return import_directory_with_details(
-            path, target_path=target_path, compile_blueprint=compile_blueprint
+            path,
+            target_path=target_path,
+            compile_blueprint=compile_blueprint,
+            include_files=include_files,
+            partial_mode=partial_mode,
+            strict_mode=strict_mode,
         )
     return import_file_with_details(
-        path, target_path=target_path, compile_blueprint=compile_blueprint
+        path,
+        target_path=target_path,
+        compile_blueprint=compile_blueprint,
+        include_files=include_files,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
 
 
@@ -384,12 +485,18 @@ def import_blueprint_object(
     bp_obj: Any,
     target_path: Optional[str] = None,
     compile_blueprint: bool = True,
+    partial_mode: str = "full",
+    strict_mode: str = "strict",
 ) -> Tuple[bool, str]:
     """
     导入一个已经构建完成的 Blueprint 对象。
     """
     details = _import_blueprint_object_with_details(
-        bp_obj, target_path, compile_blueprint=compile_blueprint
+        bp_obj,
+        target_path,
+        compile_blueprint=compile_blueprint,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
     return bool(details.get("success")), str(details.get("error", ""))
 
@@ -398,9 +505,15 @@ def _import_blueprint_object(
     bp_obj: Any,
     target_path: Optional[str],
     compile_blueprint: bool = True,
+    partial_mode: str = "full",
+    strict_mode: str = "strict",
 ) -> Tuple[bool, str]:
     details = _import_blueprint_object_with_details(
-        bp_obj, target_path, compile_blueprint=compile_blueprint
+        bp_obj,
+        target_path,
+        compile_blueprint=compile_blueprint,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
     return bool(details.get("success")), str(details.get("error", ""))
 
@@ -409,13 +522,22 @@ def _import_blueprint_object_with_details(
     bp_obj: Any,
     target_path: Optional[str],
     compile_blueprint: bool = True,
+    partial_mode: str = "full",
+    strict_mode: str = "strict",
 ) -> Dict[str, Any]:
     asset_path = target_path or bp_obj._path
     if not asset_path:
         return _error_details("未指定目标资产路径，且脚本中 Blueprint(path=...) 未设置")
 
     try:
+        normalized_partial_mode = str(partial_mode or "full").strip().lower()
+        resolved_strict_mode = str(
+            strict_mode or ("normal" if normalized_partial_mode != "full" else "strict")
+        ).strip()
+        is_strict_mode = resolved_strict_mode.lower() not in {"normal", "general", "一般"}
         payload = bp_obj.to_dict()
+        payload["partial_mode"] = str(partial_mode or "full")
+        payload["strict_mode"] = resolved_strict_mode or "strict"
         _augment_explicit_variable_type_metadata(payload)
         _sanitize_problematic_default_strings(payload)
         preflight_stats = _collect_expected_import_stats(payload)
@@ -563,7 +685,7 @@ def _import_blueprint_object_with_details(
         and delegate_restore_ok
         and delegate_recompile_ok
         and delegate_final_restore_ok
-        and validation_ok
+        and (validation_ok if is_strict_mode else True)
     )
     error_parts = [
         part
@@ -576,7 +698,7 @@ def _import_blueprint_object_with_details(
         )
         if part
     ]
-    if ok and not validation_ok:
+    if ok and not validation_ok and is_strict_mode:
         error_parts.append("strict import validation failed")
     return {
         "success": success,
@@ -590,7 +712,11 @@ def _import_blueprint_object_with_details(
     }
 
 
-def _exec_directory_dsl(dir_path: str):
+def _exec_directory_dsl(
+    dir_path: str,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "full",
+):
     main_path = os.path.join(dir_path, MAIN_BP_FILE)
     if not os.path.isfile(main_path):
         raise FileNotFoundError(f"目录缺少 {MAIN_BP_FILE}: {dir_path}")
@@ -621,15 +747,55 @@ def _exec_directory_dsl(dir_path: str):
         if not isinstance(bp, Blueprint):
             raise TypeError(f"'bp' 类型错误: 期望 Blueprint，得到 {type(bp)}")
 
+        include_set = _normalize_include_file_set(include_files)
+        selected_graph_keys: Set[str] = set()
         used_graph_indexes: Set[int] = set()
         for fname in sorted(os.listdir(dir_path)):
             if not _is_graph_dsl_file(fname):
                 continue
+            if include_set and fname.lower() not in include_set:
+                continue
 
-            graph_meta = _load_meta_dict(_graph_meta_path(dir_path, fname))
+            meta_path = _graph_meta_path(dir_path, fname)
+            graph_meta = _load_meta_dict(meta_path)
+            if _is_top_level_graph_file(fname):
+                if graph_meta is None:
+                    raise ValueError(
+                        f"Graph meta missing or invalid for '{fname}': {meta_path}"
+                    )
+
+                required_meta_keys = ("node_guid", "node_props", "pin_id")
+                missing_meta_keys = [
+                    key for key in required_meta_keys if key not in graph_meta
+                ]
+                if missing_meta_keys:
+                    raise ValueError(
+                        f"Graph meta incomplete for '{fname}': missing keys {missing_meta_keys}"
+                    )
+
             graph_infos = _parse_graph_source_info(os.path.join(dir_path, fname))
             for info in graph_infos:
                 _apply_graph_source_info(bp, info, graph_meta, used_graph_indexes)
+                selected_graph_keys.add(
+                    _graph_identity_key(str(info.get("graph_type", "")), str(info.get("graph_name", "")))
+                )
+
+        if include_set:
+            bp._graphs = [
+                graph
+                for graph in getattr(bp, "_graphs", [])
+                if _graph_identity_key(str(getattr(graph, "graph_type", "")), str(getattr(graph, "name", "")))
+                in selected_graph_keys
+            ]
+
+        if str(partial_mode or "").strip().lower() == "graphs_only":
+            bp._variables = []
+            bp._components = []
+            bp._class_defaults = []
+            bp._inherited_components = []
+            bp._interfaces = []
+            bp._dispatchers = []
+            bp._timelines = []
 
         _augment_legacy_animgraph_node_props(bp, dir_path)
         return bp
@@ -794,19 +960,14 @@ def _parse_graph_source_info(py_path: str) -> List[Dict[str, Any]]:
     tree = ast.parse(source, filename=py_path)
     infos: List[Dict[str, Any]] = []
 
-    bodies: List[List[ast.stmt]] = [tree.body]
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "register":
-            bodies.append(node.body)
-
-    for body in bodies:
-        for stmt in body:
-            if not isinstance(stmt, ast.With):
-                continue
-
-            info = _parse_with_graph_info(stmt)
-            if info is not None:
-                infos.append(info)
+    # Parse graph declarations no matter where they are defined:
+    # top-level, register(), or helper builders like _build_graph().
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        info = _parse_with_graph_info(node)
+        if info is not None:
+            infos.append(info)
 
     return infos
 

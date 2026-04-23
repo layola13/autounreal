@@ -26,6 +26,7 @@ private:
     TSharedPtr<FJsonObject> HandleSetStaticMeshProperties(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetSkeletalMeshProperties(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCopyValue(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleDuplicateBlueprintAsset(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleFindAndReplace(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleRunPython(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleExecuteUnrealPython(const TSharedPtr<FJsonObject>& Params);

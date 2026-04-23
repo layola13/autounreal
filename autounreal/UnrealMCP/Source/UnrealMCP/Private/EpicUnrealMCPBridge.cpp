@@ -96,6 +96,13 @@ FString CanonicalizeCommand(const FString& CommandType)
 
 EMCPCommandGroup GetCommandGroup(const FString& CanonicalCommand)
 {
+    // Live Coding can keep stale instances of function-local static routing sets.
+    // Route newly added high-priority commands explicitly to avoid stale set misses.
+    if (CanonicalCommand == TEXT("duplicate_blueprint_asset"))
+    {
+        return EMCPCommandGroup::Blueprint;
+    }
+
     static const TSet<FString> EditorCommands = {
         TEXT("get_actors_in_level"),
         TEXT("find_actors_by_name"),
@@ -140,6 +147,7 @@ EMCPCommandGroup GetCommandGroup(const FString& CanonicalCommand)
         TEXT("set_static_mesh_properties"),
         TEXT("set_skeletal_mesh_properties"),
         TEXT("copy_value"),
+        TEXT("duplicate_blueprint_asset"),
         TEXT("find_and_replace"),
         TEXT("run_python"),
         TEXT("exportblueprint"),
@@ -274,6 +282,18 @@ EMCPCommandGroup GetCommandGroup(const FString& CanonicalCommand)
         TEXT("search_unreal_python_api"),
         TEXT("inspect_current_level_legacy_unimplemented")
     };
+
+    if (CanonicalCommand == TEXT("duplicate_blueprint_asset"))
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("[UnrealMCP] RouteProbe duplicate_blueprint_asset: in_editor=%d in_blueprint=%d in_graph=%d in_inspector=%d"),
+            EditorCommands.Contains(CanonicalCommand) ? 1 : 0,
+            BlueprintCommands.Contains(CanonicalCommand) ? 1 : 0,
+            BlueprintGraphCommands.Contains(CanonicalCommand) ? 1 : 0,
+            InspectorCommands.Contains(CanonicalCommand) ? 1 : 0);
+    }
 
     if (EditorCommands.Contains(CanonicalCommand))
     {

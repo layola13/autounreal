@@ -323,6 +323,7 @@ bool RunPostSaveReloadValidation_ImportBpy(
 	const TSharedPtr<FJsonObject>& Root,
 	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs,
 	const TArray<FString>& CompileWarnings,
+	bool bStrictImportMode,
 	UBlueprint*& InOutBlueprint,
 	FString& OutError);
 
@@ -9541,11 +9542,9 @@ bool ApplyAnimNodeBindingPropertyBindings_ImportBpy(
 				return false;
 			}
 
-			// Build a property chain so the node rebuilds internal caches
-			// (binding validation / property access staging) before compile runs.
-			FPropertyChangedEvent ChangeEvent(DirectBindingsProperty, EPropertyChangeType::ValueSet);
-			Node->PostEditChangeProperty(ChangeEvent);
-			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_after_post_edit_change"), nullptr);
+			// Patch #1 (isolation test): skip PostEditChangeProperty here.
+			// This callback can trigger anim-node reconstruction side effects.
+			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_skip_post_edit_change"), nullptr);
 
 			// Do not reconstruct here: some anim graph nodes clear editor-side
 			// binding data during reconstruct, which turns binding-driven pins
@@ -9648,9 +9647,9 @@ bool ApplyAnimNodeBindingPropertyBindings_ImportBpy(
 		}
 	}
 
-	FPropertyChangedEvent ChangeEvent(BindingProperty, EPropertyChangeType::ValueSet);
-	Node->PostEditChangeProperty(ChangeEvent);
-	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_after_post_edit_change_legacy_binding"), nullptr);
+	// Patch #1 (isolation test): skip PostEditChangeProperty here.
+	// This callback can trigger anim-node reconstruction side effects.
+	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_skip_post_edit_change_legacy_binding"), nullptr);
 
 	// Do not reconstruct here: reconstruct can mutate editor-only pin state on
 	// some anim nodes and accidentally wipe binding-driven display configuration.
@@ -18378,10 +18377,66 @@ void CollectStateMachineBindingContractMismatches_ImportBpy(
 				return;
 			}
 
+			const TArray<FName> ExpectedNotifyNamesRaw =
+				ExtractAnimStateNotifyNamesFromSerializedText_ImportBpy(ExpectedText);
+			const TArray<FName> ActualNotifyNamesRaw =
+				ExtractAnimStateNotifyNamesFromSerializedText_ImportBpy(ActualText);
+
+			auto IsPrimaryStateNotifyForField = [](const FName& NotifyName, const TCHAR* InFieldName) -> bool
+			{
+				if (NotifyName.IsNone() || !InFieldName)
+				{
+					return false;
+				}
+				const FString Name = NotifyName.ToString();
+				if (FCString::Stricmp(InFieldName, TEXT("StateEntered")) == 0)
+				{
+					return Name.StartsWith(TEXT("OnStateEntry_"), ESearchCase::CaseSensitive);
+				}
+				if (FCString::Stricmp(InFieldName, TEXT("StateLeft")) == 0)
+				{
+					return Name.StartsWith(TEXT("OnStateLeft_"), ESearchCase::CaseSensitive);
+				}
+				if (FCString::Stricmp(InFieldName, TEXT("StateFullyBlended")) == 0)
+				{
+					return Name.StartsWith(TEXT("OnStateFullyBlended_"), ESearchCase::CaseSensitive);
+				}
+				return false;
+			};
+
+			auto CollectPrimaryNotifyListForField = [&](const TArray<FName>& RawNames, const TCHAR* InFieldName) -> TArray<FName>
+			{
+				TArray<FName> Primary;
+				for (const FName Name : RawNames)
+				{
+					if (IsPrimaryStateNotifyForField(Name, InFieldName))
+					{
+						Primary.Add(Name);
+					}
+				}
+				return Primary;
+			};
+
+			const TArray<FName> ExpectedPrimaryNotifyNames =
+				CollectPrimaryNotifyListForField(ExpectedNotifyNamesRaw, FieldName);
+			const TArray<FName> ActualPrimaryNotifyNames =
+				CollectPrimaryNotifyListForField(ActualNotifyNamesRaw, FieldName);
+
+			// Enforce only semantic state hook names (OnStateEntry_*/OnStateLeft_*...).
+			// Debug/auxiliary notifies (e.g. PrintDelta) are allowed to drift.
+			if (ExpectedPrimaryNotifyNames.Num() == 0)
+			{
+				return;
+			}
+
+			const TArray<FName>& ExpectedNotifyNames = ExpectedPrimaryNotifyNames;
+			const TArray<FName>& ActualNotifyNames =
+				ActualPrimaryNotifyNames.Num() > 0 ? ActualPrimaryNotifyNames : ActualNotifyNamesRaw;
+
 			const FName ExpectedNotifyName =
-				ExtractAnimStateNotifyNameFromSerializedText_ImportBpy(ExpectedText);
+				ExpectedNotifyNames.Num() > 0 ? ExpectedNotifyNames[0] : NAME_None;
 			const FName ActualNotifyName =
-				ExtractAnimStateNotifyNameFromSerializedText_ImportBpy(ActualText);
+				ActualNotifyNames.Num() > 0 ? ActualNotifyNames[0] : NAME_None;
 			if (!ExpectedNotifyName.IsNone() && ExpectedNotifyName != ActualNotifyName)
 			{
 				OutMismatches.Add(FString::Printf(
@@ -18394,10 +18449,6 @@ void CollectStateMachineBindingContractMismatches_ImportBpy(
 					*ActualNotifyName.ToString()));
 			}
 
-			const TArray<FName> ExpectedNotifyNames =
-				ExtractAnimStateNotifyNamesFromSerializedText_ImportBpy(ExpectedText);
-			const TArray<FName> ActualNotifyNames =
-				ExtractAnimStateNotifyNamesFromSerializedText_ImportBpy(ActualText);
 			if (ExpectedNotifyNames.Num() != ActualNotifyNames.Num())
 			{
 				TArray<FString> ExpectedNotifyNameStrings;
@@ -20197,6 +20248,7 @@ bool RunPostSaveReloadValidation_ImportBpy(
 	const TSharedPtr<FJsonObject>& Root,
 	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs,
 	const TArray<FString>& CompileWarnings,
+	bool bStrictImportMode,
 	UBlueprint*& InOutBlueprint,
 	FString& OutError)
 {
@@ -20223,13 +20275,21 @@ bool RunPostSaveReloadValidation_ImportBpy(
 		{
 			return false;
 		}
-	if (RepairedStateEntryBindingsAfterReload > 0)
-	{
-		OutError = FString::Printf(
-			TEXT("State entry bindings drifted after reload and required repair (%d). Import aborted in strict mode."),
-			RepairedStateEntryBindingsAfterReload);
-		return false;
-	}
+		if (RepairedStateEntryBindingsAfterReload > 0)
+		{
+			if (bStrictImportMode)
+			{
+				OutError = FString::Printf(
+					TEXT("State entry bindings drifted after reload and required repair (%d). Import aborted in strict mode."),
+					RepairedStateEntryBindingsAfterReload);
+				return false;
+			}
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[ExportBpy][ImportDiag] Non-strict import: state entry bindings drifted after reload and were repaired (%d)."),
+				RepairedStateEntryBindingsAfterReload);
+		}
 
 		LogAnimBlueprintStateMachineEntryBindings_ImportBpy(
 			ReloadedBP,
@@ -20260,71 +20320,90 @@ bool RunPostSaveReloadValidation_ImportBpy(
 				TEXT("post_save_reload_source_contract"),
 				OutError))
 		{
-			return false;
+			if (bStrictImportMode)
+			{
+				return false;
+			}
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[ExportBpy][ImportDiag] Non-strict import: ignored post_save_reload_source_contract mismatch: %s"),
+				*OutError);
+			OutError.Reset();
 		}
 	}
 
-	if (!ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
-			ReloadedBP,
-			Root,
-			true,
-			OutError))
+	if (bStrictImportMode)
 	{
-		return false;
-	}
+		if (!ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
+				ReloadedBP,
+				Root,
+				true,
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
-			ReloadedBP,
-			Root,
-			TEXT("post_save_reload"),
-			OutError))
-	{
-		return false;
-	}
+		if (!ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
+				ReloadedBP,
+				Root,
+				TEXT("post_save_reload"),
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
-			ReloadedBP,
-			Root,
-			TEXT("post_save_reload"),
-			OutError))
-	{
-		return false;
-	}
+		if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+				ReloadedBP,
+				Root,
+				TEXT("post_save_reload"),
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
-			ReloadedBP,
-			Root,
-			TEXT("post_save_reload"),
-			OutError))
-	{
-		return false;
-	}
+		if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
+				ReloadedBP,
+				Root,
+				TEXT("post_save_reload"),
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
-			ReloadedBP,
-			TEXT("post_save_reload"),
-			OutError))
-	{
-		return false;
-	}
+		if (!ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
+				ReloadedBP,
+				TEXT("post_save_reload"),
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
-			ReloadedBP,
-			Root,
-			TEXT("post_save_reload"),
-			OutError))
-	{
-		return false;
-	}
+		if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
+				ReloadedBP,
+				Root,
+				TEXT("post_save_reload"),
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateRoundtripAgainstRootJson_ImportBpy(
-			ReloadedBP,
-			Root,
-			CompileWarnings,
-			TEXT("post_save_reload"),
-			OutError))
+		if (!ValidateRoundtripAgainstRootJson_ImportBpy(
+				ReloadedBP,
+				Root,
+				CompileWarnings,
+				TEXT("post_save_reload"),
+				OutError))
+		{
+			return false;
+		}
+	}
+	else
 	{
-		return false;
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag] Non-strict import: skipped post_save_reload strict contract validation gates."));
 	}
 
 	InOutBlueprint = ReloadedBP;
@@ -21278,7 +21357,28 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 		GCurrentImportTargetBlueprintPath_ImportBpy,
 		TargetAssetPath);
 
-	if (!ValidateIncomingExecTopologyAgainstSourceBeforeImport_ImportBpy(
+	FString PartialMode = Root->HasTypedField<EJson::String>(TEXT("partial_mode"))
+		? Root->GetStringField(TEXT("partial_mode")).TrimStartAndEnd()
+		: FString();
+	const bool bIsPartialImportMode =
+		!PartialMode.IsEmpty() &&
+		!PartialMode.Equals(TEXT("full"), ESearchCase::IgnoreCase);
+	const bool bHasStrictModeField = Root->HasTypedField<EJson::String>(TEXT("strict_mode"));
+	FString StrictMode = bHasStrictModeField
+		? Root->GetStringField(TEXT("strict_mode")).TrimStartAndEnd()
+		: (bIsPartialImportMode ? FString(TEXT("normal")) : FString(TEXT("strict")));
+	if (StrictMode.IsEmpty())
+	{
+		StrictMode = TEXT("strict");
+	}
+	const bool bStrictImportMode =
+		!(
+			StrictMode.Equals(TEXT("normal"), ESearchCase::IgnoreCase) ||
+			StrictMode.Equals(TEXT("general"), ESearchCase::IgnoreCase) ||
+			StrictMode.Equals(TEXT("一般"), ESearchCase::CaseSensitive));
+
+	if (!bIsPartialImportMode &&
+		!ValidateIncomingExecTopologyAgainstSourceBeforeImport_ImportBpy(
 			Root,
 			SourceBlueprintPath,
 			TEXT("pre_import_source_exec_contract"),
@@ -21527,49 +21627,60 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 
 	// Strict pre-compile parity checks: graph/function/delegate/event topology must
 	// match the serialized export before any final compile-time reconstruction.
-	if (!ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			false,
-			OutError))
+	if (bStrictImportMode)
 	{
-		return false;
-	}
+		if (!ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				false,
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			TEXT("pre_compile"),
-			OutError))
-	{
-		return false;
-	}
+		if (!ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				TEXT("pre_compile"),
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			TEXT("pre_compile"),
-			OutError))
-	{
-		return false;
-	}
+		if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				TEXT("pre_compile"),
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			TEXT("pre_compile"),
-			OutError))
-	{
-		return false;
-	}
+		if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				TEXT("pre_compile"),
+				OutError))
+		{
+			return false;
+		}
 
-	if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			TEXT("pre_compile"),
-			OutError))
+		if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				TEXT("pre_compile"),
+				OutError))
+		{
+			return false;
+		}
+	}
+	else
 	{
-		return false;
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag] Non-strict import mode enabled (strict_mode=%s): skipped pre_compile strict contract validation gates."),
+			*StrictMode);
 	}
 
 	if (bCompileBlueprint)
@@ -21761,10 +21872,18 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	}
 	if (RepairedStateEntryBindings > 0)
 	{
-		OutError = FString::Printf(
-			TEXT("State entry bindings required repair (%d). Import aborted in strict mode."),
+		if (bStrictImportMode)
+		{
+			OutError = FString::Printf(
+				TEXT("State entry bindings required repair (%d). Import aborted in strict mode."),
+				RepairedStateEntryBindings);
+			return false;
+		}
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag] Non-strict import: state entry bindings required repair (%d)."),
 			RepairedStateEntryBindings);
-		return false;
 	}
 	LogAnimBlueprintStateMachineEntryBindings_ImportBpy(
 		BP,
@@ -21779,59 +21898,79 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 
 	// Post-compile parity checks still enforce function/delegate/event class
 	// counts, while relaxing root node-count drift that can be editor-generated.
-	if (!ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			true,
-			OutError))
+	if (bStrictImportMode)
 	{
-		return false;
+		if (!ValidateImportedBlueprintStructuralParityAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				true,
+				OutError))
+		{
+			return false;
+		}
+
+		if (!ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				TEXT("post_compile"),
+				OutError))
+		{
+			return false;
+		}
+
+		if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				TEXT("post_compile"),
+				OutError))
+		{
+			return false;
+		}
+
+		if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				TEXT("post_compile"),
+				OutError))
+		{
+			return false;
+		}
+
+		if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				TEXT("post_compile"),
+				OutError))
+		{
+			return false;
+		}
+	}
+	else
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag] Non-strict import: skipped post_compile strict contract validation gates."));
 	}
 
-	if (!ValidateImportedInterfaceBindingsAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			TEXT("post_compile"),
-			OutError))
+	if (bStrictImportMode)
 	{
-		return false;
+		if (!ValidateRoundtripAgainstRootJson_ImportBpy(
+				BP,
+				Root,
+				ImportCompileWarnings,
+				bCompileBlueprint ? TEXT("post_compile") : TEXT("post_import"),
+				OutError))
+		{
+			return false;
+		}
 	}
-
-	if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			TEXT("post_compile"),
-			OutError))
+	else
 	{
-		return false;
-	}
-
-	if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			TEXT("post_compile"),
-			OutError))
-	{
-		return false;
-	}
-
-	if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			TEXT("post_compile"),
-			OutError))
-	{
-		return false;
-	}
-
-	if (!ValidateRoundtripAgainstRootJson_ImportBpy(
-			BP,
-			Root,
-			ImportCompileWarnings,
-			bCompileBlueprint ? TEXT("post_compile") : TEXT("post_import"),
-			OutError))
-	{
-		return false;
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag] Non-strict import: skipped post_compile roundtrip validation gate."));
 	}
 
 	if (bIsAnimBlueprint)
@@ -21845,13 +21984,23 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 			return false;
 		}
 
-		if (!ValidateImportedAnimBlueprintAgainstSourceAsset_ImportBpy(
-				BP,
-				SourceBlueprintPath,
-				TEXT("post_compile_source_contract"),
-				OutError))
+		if (bStrictImportMode)
 		{
-			return false;
+			if (!ValidateImportedAnimBlueprintAgainstSourceAsset_ImportBpy(
+					BP,
+					SourceBlueprintPath,
+					TEXT("post_compile_source_contract"),
+					OutError))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[ExportBpy][ImportDiag] Non-strict import: skipped post_compile_source_contract validation."));
 		}
 	}
 
@@ -21930,6 +22079,7 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 			Root,
 			SortedGraphs,
 			ImportCompileWarnings,
+			bStrictImportMode,
 			BP,
 			OutError))
 	{

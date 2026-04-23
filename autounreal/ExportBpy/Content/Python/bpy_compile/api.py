@@ -137,6 +137,9 @@ def import_bpy_package(
     debug_output_dir: Optional[str] = None,
     asset_meta_dir: Optional[str] = None,
     use_upper_compiler: Optional[bool] = None,
+    include_files: Optional[list[str]] = None,
+    partial_mode: Optional[str] = None,
+    strict_mode: Optional[str] = None,
 ) -> Dict[str, object]:
     """
     Unified import entry for both __upper__.py packages and normal .bp.py packages.
@@ -170,6 +173,9 @@ def import_bpy_package(
         normalized_source,
         target_path=normalized_target,
         compile_blueprint=compile_asset,
+        include_files=include_files,
+        partial_mode=(partial_mode or "full"),
+        strict_mode=strict_mode,
     )
 
 

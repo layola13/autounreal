@@ -77,6 +77,8 @@
 #include "ExportBlueprintToTxtLibrary.h"
 #include "BPDirectExporter.h"
 #include "BPDirectImporter.h"
+#include "Editor.h"
+#include "Subsystems/AssetEditorSubsystem.h"
 
 #if PLATFORM_WINDOWS
 #include "ILiveCodingModule.h"
@@ -6344,6 +6346,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleCommand(const FSt
     {
         return HandleCopyValue(Params);
     }
+    else if (CommandType == TEXT("duplicate_blueprint_asset"))
+    {
+        return HandleDuplicateBlueprintAsset(Params);
+    }
     else if (CommandType == TEXT("find_and_replace"))
     {
         return HandleFindAndReplace(Params);
@@ -8235,6 +8241,80 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleGetBlueprintMeta(
     return ResultObj;
 }
 
+TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleDuplicateBlueprintAsset(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SourcePath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("source"), SourcePath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'source' parameter"));
+    }
+
+    FString TargetPath;
+    if (!Params->TryGetStringField(TEXT("target"), TargetPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'target' parameter"));
+    }
+
+    bool bOverwrite = true;
+    Params->TryGetBoolField(TEXT("overwrite"), bOverwrite);
+
+    SourcePath = SourcePath.TrimStartAndEnd();
+    TargetPath = TargetPath.TrimStartAndEnd();
+    if (SourcePath.IsEmpty() || TargetPath.IsEmpty())
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Source/target must not be empty"));
+    }
+
+    if (!UEditorAssetLibrary::DoesAssetExist(SourcePath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Source blueprint does not exist: %s"), *SourcePath));
+    }
+
+    const bool bTargetExists = UEditorAssetLibrary::DoesAssetExist(TargetPath);
+    if (bTargetExists)
+    {
+        // Close editors and force a GC cycle so overwrite doesn't hang on stale asset handles.
+        if (GEditor)
+        {
+            if (UObject* ExistingTargetAsset = UEditorAssetLibrary::LoadAsset(TargetPath))
+            {
+                if (UAssetEditorSubsystem* AssetEditorSubsystem = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+                {
+                    AssetEditorSubsystem->CloseAllEditorsForAsset(ExistingTargetAsset);
+                }
+            }
+        }
+
+        if (!bOverwrite)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("Target blueprint already exists: %s"), *TargetPath));
+        }
+
+        if (!UEditorAssetLibrary::DeleteAsset(TargetPath))
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("Failed to delete existing target blueprint: %s"), *TargetPath));
+        }
+
+    }
+
+    if (!UEditorAssetLibrary::DuplicateAsset(SourcePath, TargetPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("DuplicateAsset failed: %s -> %s"), *SourcePath, *TargetPath));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("source"), SourcePath);
+    ResultObj->SetStringField(TEXT("target"), TargetPath);
+    ResultObj->SetBoolField(TEXT("overwrite"), bOverwrite);
+    ResultObj->SetBoolField(TEXT("target_exists_before"), bTargetExists);
+    return ResultObj;
+}
+
 TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleExportBlueprintMeta(const TSharedPtr<FJsonObject>& Params)
 {
     FString BlueprintRef;
@@ -9051,6 +9131,49 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleImportBlueprintPy
             const FString WrapperPath = FPaths::Combine(CacheRoot, TEXT("import_bpy_wrapper.py"));
             bool bCompileBlueprint = true;
             Params->TryGetBoolField(TEXT("compile_blueprint"), bCompileBlueprint);
+            FString PartialMode;
+            Params->TryGetStringField(TEXT("partial_mode"), PartialMode);
+            PartialMode = PartialMode.TrimStartAndEnd();
+            FString StrictMode;
+            Params->TryGetStringField(TEXT("strict_mode"), StrictMode);
+            StrictMode = StrictMode.TrimStartAndEnd();
+
+            auto EscapePythonSingleQuoted_BP = [](const FString& InValue) -> FString
+            {
+                FString Escaped = InValue;
+                Escaped.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+                Escaped.ReplaceInline(TEXT("'"), TEXT("\\'"));
+                return Escaped;
+            };
+
+            FString IncludeFilesPythonLiteral = TEXT("[]");
+            const TArray<TSharedPtr<FJsonValue>>* IncludeFilesArray = nullptr;
+            if (Params->TryGetArrayField(TEXT("include_files"), IncludeFilesArray) &&
+                IncludeFilesArray != nullptr &&
+                IncludeFilesArray->Num() > 0)
+            {
+                TArray<FString> IncludeEntries;
+                IncludeEntries.Reserve(IncludeFilesArray->Num());
+                for (const TSharedPtr<FJsonValue>& EntryValue : *IncludeFilesArray)
+                {
+                    if (!EntryValue.IsValid())
+                    {
+                        continue;
+                    }
+                    FString EntryString;
+                    if (!EntryValue->TryGetString(EntryString))
+                    {
+                        continue;
+                    }
+                    EntryString = EntryString.TrimStartAndEnd();
+                    if (EntryString.IsEmpty())
+                    {
+                        continue;
+                    }
+                    IncludeEntries.Add(FString::Printf(TEXT("'%s'"), *EscapePythonSingleQuoted_BP(EntryString)));
+                }
+                IncludeFilesPythonLiteral = FString::Printf(TEXT("[%s]"), *FString::Join(IncludeEntries, TEXT(", ")));
+            }
 
             const FString WrapperScript = FString::Printf(
                 TEXT("import json\n")
@@ -9062,6 +9185,9 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleImportBlueprintPy
                 TEXT("result_path = r'''%s'''\n")
                 TEXT("compile_blueprint = %s\n")
                 TEXT("use_upper_compiler = %s\n")
+                TEXT("include_files = %s\n")
+                TEXT("partial_mode = r'''%s'''\n")
+                TEXT("strict_mode = r'''%s'''\n")
                 TEXT("if plugin_py not in sys.path:\n")
                 TEXT("    sys.path.insert(0, plugin_py)\n")
                 TEXT("import importlib\n")
@@ -9077,6 +9203,9 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleImportBlueprintPy
                 TEXT("    target_path=target_path or None,\n")
                 TEXT("    compile_asset=compile_blueprint,\n")
                 TEXT("    use_upper_compiler=use_upper_compiler,\n")
+                TEXT("    include_files=(include_files or None),\n")
+                TEXT("    partial_mode=(partial_mode or None),\n")
+                TEXT("    strict_mode=(strict_mode or None),\n")
                 TEXT(")\n")
                 TEXT("ok = bool(details.get('success', False))\n")
                 TEXT("err = details.get('error', '')\n")
@@ -9100,7 +9229,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleImportBlueprintPy
                 *TargetAssetRef,
                 *ResultPathLiteral,
                 bCompileBlueprint ? TEXT("True") : TEXT("False"),
-                bIsUpperPackagePath ? TEXT("True") : TEXT("False"));
+                bIsUpperPackagePath ? TEXT("True") : TEXT("False"),
+                *IncludeFilesPythonLiteral,
+                *EscapePythonSingleQuoted_BP(PartialMode),
+                *EscapePythonSingleQuoted_BP(StrictMode));
 
             if (!FFileHelper::SaveStringToFile(WrapperScript, *WrapperPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
             {

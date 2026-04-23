@@ -1062,13 +1062,46 @@ def spawn_blueprint_actor(
 
 
 @mcp.tool()
+def duplicate_blueprint_asset(
+    source: str,
+    target: str,
+    overwrite: bool = True
+) -> Dict[str, Any]:
+    """Duplicate a Blueprint asset from source to target path."""
+    params: Dict[str, Any] = {
+        "source": source,
+        "target": target,
+        "overwrite": overwrite,
+    }
+    return _forward_unreal_command("duplicate_blueprint_asset", params)
+
+
+@mcp.tool()
 def execute_unreal_python(
     python_script_or_patch: str,
     request_text: str = "",
     short_description: str = "",
     timeout_seconds: float = 60.0
 ) -> Dict[str, Any]:
-    """Execute Python through the Unreal bridge wrapper."""
+    """DEPRECATED/disabled by default: Execute Python through Unreal bridge wrapper.
+
+    This path commonly times out and is intentionally disabled to avoid wasting time.
+    Set UNREAL_MCP_ENABLE_DEPRECATED_EXECUTE_UNREAL_PYTHON=1 to force-enable.
+    """
+    legacy_execute_enabled = str(
+        os.environ.get("UNREAL_MCP_ENABLE_DEPRECATED_EXECUTE_UNREAL_PYTHON", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not legacy_execute_enabled:
+        return {
+            "success": False,
+            "error_code": "deprecated_disabled",
+            "error": (
+                "execute_unreal_python is deprecated and disabled by default. "
+                "Use native UnrealMCP commands instead."
+            ),
+            "deprecated": True,
+        }
+
     params: Dict[str, Any] = {
         "python_script_or_patch": python_script_or_patch,
         "timeout_seconds": timeout_seconds
@@ -1364,76 +1397,16 @@ def take_editor_screenshot(
     if not b_native_unsupported:
         return native_unwrapped if native_unwrapped else {"success": False, "message": "take_editor_screenshot failed"}
 
-    # Keep this self-contained so callers don't need to run ad-hoc python.
-    screenshot_py = f"""
-import os
-import time
-import unreal
-
-asset_to_open = r\"{open_asset_path}\"
-if asset_to_open:
-    try:
-        asset = unreal.load_asset(asset_to_open)
-        if asset:
-            editor_subsystem = unreal.get_editor_subsystem(unreal.AssetEditorSubsystem)
-            if editor_subsystem:
-                editor_subsystem.open_editor_for_assets([asset])
-                # Let Slate update active tab before taking the screenshot.
-                time.sleep(0.75)
-    except Exception as e:
-        print(\"[UnrealMCP][Screenshot][OpenAssetError] \" + str(e))
-
-folder_rel = r\"{safe_folder}\"
-project_dir = unreal.Paths.project_dir()
-out_dir = os.path.normpath(os.path.join(project_dir, folder_rel))
-os.makedirs(out_dir, exist_ok=True)
-
-name = r\"{safe_file_name}\"
-if not name:
-    name = \"mcp_screenshot_\" + time.strftime(\"%Y%m%d_%H%M%S\") + \".png\"
-elif not name.lower().endswith(\".png\"):
-    name += \".png\"
-
-full_path = os.path.normpath(os.path.join(out_dir, name))
-target_path = full_path.replace(\"\\\\\", \"/\")
-
-unreal.AutomationLibrary.take_high_res_screenshot({int(width)}, {int(height)}, target_path)
-
-# Give async writer a brief moment to flush.
-for _ in range(20):
-    if os.path.exists(full_path):
-        break
-    time.sleep(0.1)
-
-print(\"[UnrealMCP][Screenshot] \" + target_path)
-"""
-
-    try:
-        response = unreal.send_command("execute_unreal_python", {
-            "python_script_or_patch": screenshot_py,
-            "short_description": "take_editor_screenshot",
-            "timeout_seconds": max(30, int(timeout_seconds))
-        })
-        if not response:
-            return {"success": False, "message": "No response from Unreal"}
-
-        # Return a predictable location even if editor logging is delayed.
-        expected_name = safe_file_name if safe_file_name else "mcp_screenshot_<timestamp>.png"
-        expected_full_path = os.path.normpath(os.path.join(os.path.normpath(os.path.join(os.getcwd(), safe_folder)), expected_name))
-        return {
-            "success": True,
-            "command": "take_editor_screenshot",
-            "opened_asset_hint": open_asset_path,
-            "requested_file_name": safe_file_name,
-            "requested_folder": safe_folder,
-            "width": int(width),
-            "height": int(height),
-            "expected_full_path": expected_full_path,
-            "message": "Screenshot command dispatched. Use get_recent_generated_images to fetch actual file path."
-        }
-    except Exception as e:
-        logger.error(f"take_editor_screenshot error: {e}")
-        return {"success": False, "message": str(e)}
+    # Python fallback intentionally removed because execute_unreal_python is deprecated.
+    return {
+        "success": False,
+        "error_code": "native_not_supported",
+        "message": (
+            "take_editor_screenshot native command unavailable, and Python fallback "
+            "is disabled (execute_unreal_python deprecated)."
+        ),
+        "invoked_via": "native_only",
+    }
 
 
 @mcp.tool()
@@ -1809,7 +1782,17 @@ def get_blueprint_class_info(
         blueprint_name=blueprint_name,
         blueprint=blueprint
     )
-    return _forward_unreal_command("get_blueprint_class_info", params)
+    response = _forward_unreal_command("get_blueprint_class_info", params)
+    payload = _unwrap_forwarded_result(response)
+    if payload.get("success"):
+        _remember_blueprint_asset_hint(
+            target=target,
+            asset_path=asset_path,
+            blueprint_path=blueprint_path,
+            soft_path_from_project_root=soft_path_from_project_root,
+            blueprint=blueprint
+        )
+    return response
 
 
 @mcp.tool()
@@ -2141,7 +2124,10 @@ def _build_import_blueprint_py_params(
     blueprint_name: str = "",
     blueprint: str = "",
     overwrite: Optional[bool] = None,
-    compile_blueprint: Optional[bool] = None
+    compile_blueprint: Optional[bool] = None,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "",
+    strict_mode: str = "",
 ) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
     _maybe_add_param(params, "spec", spec)
@@ -2161,6 +2147,9 @@ def _build_import_blueprint_py_params(
     )
     _maybe_add_param(params, "overwrite", overwrite)
     _maybe_add_param(params, "compile_blueprint", compile_blueprint)
+    _maybe_add_param(params, "include_files", include_files)
+    _maybe_add_param(params, "partial_mode", partial_mode)
+    _maybe_add_param(params, "strict_mode", strict_mode)
     return params
 
 
@@ -2193,7 +2182,10 @@ def import_asset_py(
     blueprint_name: str = "",
     blueprint: str = "",
     overwrite: Optional[bool] = None,
-    compile_blueprint: Optional[bool] = None
+    compile_blueprint: Optional[bool] = None,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "",
+    strict_mode: str = "",
 ) -> Dict[str, Any]:
     """Import a Blueprint from Python export content using the asset alias."""
     params = _build_import_blueprint_py_params(
@@ -2210,7 +2202,10 @@ def import_asset_py(
         blueprint_name=blueprint_name,
         blueprint=blueprint,
         overwrite=overwrite,
-        compile_blueprint=compile_blueprint
+        compile_blueprint=compile_blueprint,
+        include_files=include_files,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
     response = _forward_unreal_command("import_asset_py", params)
     payload = _unwrap_forwarded_result(response)
@@ -2240,7 +2235,10 @@ def import_blueprint_py(
     blueprint_name: str = "",
     blueprint: str = "",
     overwrite: Optional[bool] = None,
-    compile_blueprint: Optional[bool] = None
+    compile_blueprint: Optional[bool] = None,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "",
+    strict_mode: str = "",
 ) -> Dict[str, Any]:
     """Import a Blueprint from Python export content."""
     params = _build_import_blueprint_py_params(
@@ -2257,7 +2255,10 @@ def import_blueprint_py(
         blueprint_name=blueprint_name,
         blueprint=blueprint,
         overwrite=overwrite,
-        compile_blueprint=compile_blueprint
+        compile_blueprint=compile_blueprint,
+        include_files=include_files,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
     response = _forward_unreal_command("import_blueprint_py", params)
     payload = _unwrap_forwarded_result(response)
@@ -2288,7 +2289,10 @@ def import_blueprint_from_bpy(
     blueprint_name: str = "",
     blueprint: str = "",
     overwrite: Optional[bool] = None,
-    compile_blueprint: Optional[bool] = None
+    compile_blueprint: Optional[bool] = None,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "",
+    strict_mode: str = "",
 ) -> Dict[str, Any]:
     """Import an ExportBpy DSL file/directory or inline bpy data into a target Blueprint."""
     inline_text = script_text or python_text or bpydata
@@ -2306,7 +2310,10 @@ def import_blueprint_from_bpy(
         blueprint_name=blueprint_name,
         blueprint=blueprint,
         overwrite=overwrite,
-        compile_blueprint=compile_blueprint
+        compile_blueprint=compile_blueprint,
+        include_files=include_files,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
     response = _forward_unreal_command("import_blueprint_from_bpy", params)
     payload = _unwrap_forwarded_result(response)
@@ -2338,7 +2345,10 @@ def import_blueprint_from_bpy_verified(
     blueprint: str = "",
     overwrite: Optional[bool] = True,
     compile_blueprint: Optional[bool] = True,
-    post_import_parts: Optional[List[str]] = None
+    post_import_parts: Optional[List[str]] = None,
+    include_files: Optional[List[str]] = None,
+    partial_mode: str = "",
+    strict_mode: str = "",
 ) -> Dict[str, Any]:
     """
     Import ExportBpy DSL into a Blueprint, then return post-import metadata.
@@ -2363,7 +2373,10 @@ def import_blueprint_from_bpy_verified(
         blueprint_name=blueprint_name,
         blueprint=blueprint,
         overwrite=overwrite,
-        compile_blueprint=compile_blueprint
+        compile_blueprint=compile_blueprint,
+        include_files=include_files,
+        partial_mode=partial_mode,
+        strict_mode=strict_mode,
     )
     import_result = _forward_unreal_command("import_blueprint_from_bpy", import_params)
     import_payload = _unwrap_forwarded_result(import_result)

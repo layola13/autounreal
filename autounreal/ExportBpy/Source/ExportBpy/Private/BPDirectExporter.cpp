@@ -186,7 +186,26 @@ FString GetOriginalChooserAssetPathForExport_ExportBpy(const UObject* Object)
 
 	FMetaData& MetaData = Package->GetMetaData();
 	const FString SourcePath = MetaData.GetValue(Object, TEXT("ExportBpy.SourceChooserAssetPath"));
-	return SourcePath.StartsWith(TEXT("/")) ? SourcePath : FString();
+	if (!SourcePath.StartsWith(TEXT("/")))
+	{
+		return FString();
+	}
+
+	if (SourcePath.Contains(TEXT("'")))
+	{
+		return SourcePath;
+	}
+
+	const FString AssetName = FPackageName::GetLongPackageAssetName(SourcePath);
+	if (AssetName.IsEmpty())
+	{
+		return SourcePath;
+	}
+
+	return FString::Printf(
+		TEXT("/Script/Chooser.ChooserTable'%s.%s'"),
+		*SourcePath,
+		*AssetName);
 }
 
 void AddNodeObjectPropertyTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info, const TCHAR* PropertyName)
@@ -4387,7 +4406,14 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 
 	if (Info.NodeType.StartsWith(TEXT("AnimGraphNode_")))
 	{
-		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
+		if (Info.NodeType == TEXT("AnimGraphNode_TwoWayBlend"))
+		{
+			AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
+		}
+		else
+		{
+			AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
+		}
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("ShowPinForProperties"));
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("CustomPinProperties"));
 		AddAnimNodeBindingPropertyBindingsIfPresent_ExportBpy(Node, Info);

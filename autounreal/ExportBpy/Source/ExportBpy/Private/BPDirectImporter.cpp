@@ -22399,9 +22399,9 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	// Retargeting to duplicated chooser tables introduced runtime divergence in
 	// cloned AnimBlueprint imports.
 	constexpr bool bEnableChooserRetargeting_ImportBpy = true;
+	bool bRetargetedChooserTables = false;
 	if (bEnableChooserRetargeting_ImportBpy)
 	{
-		bool bRetargetedChooserTables = false;
 		if (!RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(BP, bRetargetedChooserTables, OutError))
 		{
 			return false;
@@ -22413,6 +22413,24 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	}
 
 	RepairEvaluateChooserSourceClassPinsForCurrentImport_ImportBpy(BP);
+
+	if (bRetargetedChooserTables)
+	{
+		bool bReplayedChooserConnections = false;
+		if (!ReplayTopLevelGraphSerializedConnectionsAfterCompile_ImportBpy(
+				BP,
+				SortedGraphs,
+				true,
+				bReplayedChooserConnections,
+				OutError))
+		{
+			return false;
+		}
+		if (bReplayedChooserConnections)
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+		}
+	}
 
 	// Strict pre-compile parity checks: graph/function/delegate/event topology must
 	// match the serialized export before any final compile-time reconstruction.

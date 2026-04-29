@@ -212,6 +212,9 @@ bool RestoreAnimReferenceNodesAfterCreation_ImportBpy(
 bool HasEvaluateChooserMetadata_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson, FString& OutMissingProperties);
 bool HasEvaluateChooserAssetBound_ImportBpy(const UEdGraphNode* Node);
 bool IsEvaluateChooserNode_ImportBpy(const UEdGraphNode* Node);
+
+UEdGraphPin* FindEvaluateChooserContextPinForCurrentImport_ImportBpy(UEdGraphNode* Node, const FString& RequestedPinName, EEdGraphPinDirection Direction);
+void RepairEvaluateChooserSourceClassPinsForCurrentImport_ImportBpy(UBlueprint* BP);
 bool RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(
 	UBlueprint* BP,
 	bool& bOutAnyRetargeted,
@@ -1808,19 +1811,6 @@ void RemapSourceGeneratedClassPinsToCurrentBlueprint_ImportBpy(UEdGraphNode* Nod
 		return;
 	}
 
-	// EvaluateChooser pins are derived from the bound ChooserTable schema.
-	// Rewriting their class-typed pins here creates a mixed state where the pin
-	// display name still reflects the source ABP class, but the type is mutated
-	// to the target ABP class. That exact mismatch breaks cloned ABP imports.
-	if (Node->GetClass())
-	{
-		const FString NodeClassName = Node->GetClass()->GetName();
-		if (NodeClassName == TEXT("K2Node_EvaluateChooser") ||
-			NodeClassName == TEXT("K2Node_EvaluateChooser2"))
-		{
-			return;
-		}
-	}
 
 	for (UEdGraphPin* Pin : Node->Pins)
 	{
@@ -4409,6 +4399,89 @@ FString BuildRetargetedChooserAssetPathForBlueprint_ImportBpy(
 		*TargetBlueprintAssetName);
 }
 
+
+void RepairEvaluateChooserSourceClassPinsForCurrentImport_ImportBpy(UBlueprint* BP)
+{
+	if (!BP || GCurrentImportSourceBlueprintPath_ImportBpy.IsEmpty() || GCurrentImportTargetBlueprintPath_ImportBpy.IsEmpty())
+	{
+		return;
+	}
+
+	const FString SourceClassPath = BuildGeneratedClassObjectPathFromBlueprintPath_ImportBpy(GCurrentImportSourceBlueprintPath_ImportBpy);
+	const FString SourceClassName = BuildGeneratedClassObjectNameFromBlueprintPath_ImportBpy(GCurrentImportSourceBlueprintPath_ImportBpy);
+	if (SourceClassPath.IsEmpty() || SourceClassName.IsEmpty())
+	{
+		return;
+	}
+
+	TArray<UEdGraph*> RootGraphs;
+	BP->GetAllGraphs(RootGraphs);
+	TSet<UEdGraph*> VisitedGraphs;
+	TArray<UEdGraph*> AllGraphs;
+	for (UEdGraph* RootGraph : RootGraphs)
+	{
+		GatherReachableGraphs_ImportBpy(RootGraph, VisitedGraphs, AllGraphs);
+	}
+
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		if (!Graph)
+		{
+			continue;
+		}
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!IsEvaluateChooserNode_ImportBpy(Node))
+			{
+				continue;
+			}
+
+			UEdGraphPin* TargetPin = FindEvaluateChooserContextPinForCurrentImport_ImportBpy(Node, SourceClassName, EGPD_Input);
+			for (int32 PinIndex = Node->Pins.Num() - 1; PinIndex >= 0; --PinIndex)
+			{
+				UEdGraphPin* Pin = Node->Pins[PinIndex];
+				if (!Pin || Pin->Direction != EGPD_Input)
+				{
+					continue;
+				}
+
+				const UClass* PinClass = Cast<UClass>(Pin->PinType.PinSubCategoryObject.Get());
+				const FString PinNameNoGuid = StripGuidSuffix_ImportBpy(Pin->PinName.ToString());
+				const bool bIsSourceClassPin =
+					(PinClass && PinClass->GetPathName().Equals(SourceClassPath, ESearchCase::CaseSensitive)) ||
+					PinNameNoGuid.Equals(SourceClassName, ESearchCase::IgnoreCase) ||
+					PinNameNoGuid.Equals(FString(TEXT("S_")) + SourceClassName, ESearchCase::IgnoreCase);
+				if (!bIsSourceClassPin)
+				{
+					continue;
+				}
+
+				if (TargetPin && TargetPin != Pin)
+				{
+					TArray<UEdGraphPin*> LinkedPins = Pin->LinkedTo;
+					for (UEdGraphPin* LinkedPin : LinkedPins)
+					{
+						if (LinkedPin)
+						{
+							Pin->BreakLinkTo(LinkedPin);
+							LinkedPin->MakeLinkTo(TargetPin);
+						}
+					}
+				}
+
+				Pin->BreakAllPinLinks();
+				if (Pin->bOrphanedPin || Pin->LinkedTo.Num() == 0)
+				{
+					Node->RemovePin(Pin);
+				}
+			}
+
+			Node->NodeConnectionListChanged();
+			Graph->NotifyGraphChanged();
+		}
+	}
+}
 bool RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(
 	UBlueprint* BP,
 	bool& bOutAnyRetargeted,
@@ -7082,6 +7155,62 @@ void EnsureDynamicPinsForRequest_ImportBpy(UEdGraphNode* Node, const FString& Re
 	}
 }
 
+
+UEdGraphPin* FindEvaluateChooserContextPinForCurrentImport_ImportBpy(
+	UEdGraphNode* Node,
+	const FString& RequestedPinName,
+	EEdGraphPinDirection Direction)
+{
+	if (!IsEvaluateChooserNode_ImportBpy(Node) || Direction != EGPD_Input)
+	{
+		return nullptr;
+	}
+
+	const FString SourceClassName = BuildGeneratedClassObjectNameFromBlueprintPath_ImportBpy(
+		GCurrentImportSourceBlueprintPath_ImportBpy);
+	const FString TargetClassName = BuildGeneratedClassObjectNameFromBlueprintPath_ImportBpy(
+		GCurrentImportTargetBlueprintPath_ImportBpy);
+	if (SourceClassName.IsEmpty() || TargetClassName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	const FString RequestedNoGuid = StripGuidSuffix_ImportBpy(RequestedPinName);
+	if (!RequestedNoGuid.Equals(SourceClassName, ESearchCase::IgnoreCase) &&
+		!RequestedNoGuid.Equals(FString(TEXT("S_")) + SourceClassName, ESearchCase::IgnoreCase))
+	{
+		return nullptr;
+	}
+
+	for (UEdGraphPin* Pin : Node->Pins)
+	{
+		if (!Pin || Pin->Direction != EGPD_Input)
+		{
+			continue;
+		}
+
+		const FString PinNameNoGuid = StripGuidSuffix_ImportBpy(Pin->PinName.ToString());
+		const FString FriendlyName = Pin->PinFriendlyName.ToString();
+		const bool bNameMatchesTarget =
+			PinNameNoGuid.Equals(TargetClassName, ESearchCase::IgnoreCase) ||
+			PinNameNoGuid.Equals(FString(TEXT("S_")) + TargetClassName, ESearchCase::IgnoreCase) ||
+			FriendlyName.Equals(TargetClassName, ESearchCase::IgnoreCase) ||
+			FriendlyName.Equals(FString(TEXT("S_")) + TargetClassName, ESearchCase::IgnoreCase);
+		const UClass* PinClass = Cast<UClass>(Pin->PinType.PinSubCategoryObject.Get());
+		const bool bTypeMatchesTarget =
+			PinClass &&
+			!GCurrentImportTargetBlueprintPath_ImportBpy.IsEmpty() &&
+			PinClass->GetPathName().Equals(
+				BuildGeneratedClassObjectPathFromBlueprintPath_ImportBpy(GCurrentImportTargetBlueprintPath_ImportBpy),
+				ESearchCase::CaseSensitive);
+		if (bNameMatchesTarget || bTypeMatchesTarget)
+		{
+			return Pin;
+		}
+	}
+
+	return nullptr;
+}
 UEdGraphPin* FindExistingPinFlexible_ImportBpy(UEdGraphNode* Node, const FString& RequestedPinName, EEdGraphPinDirection Direction)
 {
 	if (!Node)
@@ -7090,6 +7219,11 @@ UEdGraphPin* FindExistingPinFlexible_ImportBpy(UEdGraphNode* Node, const FString
 	}
 
 	const FString NormalizedRequested = NormalizeRequestedPinName_ImportBpy(Node, RequestedPinName);
+	if (UEdGraphPin* RetargetedChooserPin = FindEvaluateChooserContextPinForCurrentImport_ImportBpy(Node, NormalizedRequested, Direction))
+	{
+		return RetargetedChooserPin;
+	}
+
 	TArray<FString> CandidateNames;
 	CandidateNames.Add(NormalizedRequested);
 	if (Node->IsA<UK2Node_MacroInstance>())
@@ -9454,6 +9588,183 @@ static void LogBlendStackGraphBindingsAndDuplicates_ImportBpy(
 	}
 }
 
+// Binding import must refresh both serialized maps and editor node state, otherwise
+// AnimGraph compilation can silently keep stale literal defaults.
+int32 CountSerializedBindingTrueFlags_ImportBpy(const FString& SerializedBindings)
+{
+	int32 Count = 0;
+	const TCHAR* Tokens[] = { TEXT("bIsBound=True"), TEXT("bIsBound=true") };
+	for (const TCHAR* Token : Tokens)
+	{
+		int32 SearchFrom = 0;
+		while (SearchFrom < SerializedBindings.Len())
+		{
+			const int32 Hit = SerializedBindings.Find(
+				Token,
+				ESearchCase::CaseSensitive,
+				ESearchDir::FromStart,
+				SearchFrom);
+			if (Hit == INDEX_NONE)
+			{
+				break;
+			}
+
+			++Count;
+			SearchFrom = Hit + FCString::Strlen(Token);
+		}
+	}
+
+	return Count;
+}
+
+void ExtractBindingPropertyNamesForPins_ImportBpy(
+	const FString& SerializedBindings,
+	TSet<FName>& OutPropertyNames)
+{
+	OutPropertyNames.Reset();
+	static const FString PropertyNameToken = TEXT("PropertyName=\"");
+	int32 SearchFrom = 0;
+	while (SearchFrom < SerializedBindings.Len())
+	{
+		const int32 Hit = SerializedBindings.Find(
+			PropertyNameToken,
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart,
+			SearchFrom);
+		if (Hit == INDEX_NONE)
+		{
+			break;
+		}
+
+		const int32 NameStart = Hit + PropertyNameToken.Len();
+		const int32 NameEnd = SerializedBindings.Find(
+			TEXT("\""),
+			ESearchCase::CaseSensitive,
+			ESearchDir::FromStart,
+			NameStart);
+		if (NameEnd == INDEX_NONE || NameEnd <= NameStart)
+		{
+			break;
+		}
+
+		const FString NameText =
+			SerializedBindings.Mid(NameStart, NameEnd - NameStart).TrimStartAndEnd();
+		if (!NameText.IsEmpty())
+		{
+			FName PropertyName(*NameText);
+			PropertyName.SetNumber(0);
+			OutPropertyNames.Add(PropertyName);
+		}
+
+		SearchFrom = NameEnd + 1;
+	}
+}
+
+int32 EnsureAnimNodeBindingDrivenPinsVisible_ImportBpy(
+	UEdGraphNode* Node,
+	const FString& SerializedBindings)
+{
+	UAnimGraphNode_Base* const AnimNode = Cast<UAnimGraphNode_Base>(Node);
+	if (!AnimNode || SerializedBindings.IsEmpty() ||
+		SerializedBindings.Equals(TEXT("()"), ESearchCase::CaseSensitive))
+	{
+		return 0;
+	}
+
+	TSet<FName> BindingPropertyNames;
+	ExtractBindingPropertyNamesForPins_ImportBpy(SerializedBindings, BindingPropertyNames);
+	if (BindingPropertyNames.Num() == 0)
+	{
+		return 0;
+	}
+
+	int32 ChangedCount = 0;
+	for (FOptionalPinFromProperty& OptionalPin : AnimNode->ShowPinForProperties)
+	{
+		FName OptionalName = OptionalPin.PropertyName;
+		OptionalName.SetNumber(0);
+		if (BindingPropertyNames.Contains(OptionalName) && !OptionalPin.bShowPin)
+		{
+			OptionalPin.bShowPin = true;
+			++ChangedCount;
+		}
+	}
+
+	if (ChangedCount > 0)
+	{
+		UE_LOG(
+			LogTemp,
+			Display,
+			TEXT("[ExportBpy][ImportDiag][AnimBinding] exposed %d binding-driven pins on %s"),
+			ChangedCount,
+			*DescribeNode_ImportBpy(Node));
+	}
+
+	return ChangedCount;
+}
+
+bool ValidateAnimNodeBindingImportText_ImportBpy(
+	FProperty* BindingsProperty,
+	void* ValuePtr,
+	UObject* OwnerObject,
+	UEdGraphNode* Node,
+	const FString& SourceBindings,
+	int32 ExpectedKeyCount,
+	int32 ExpectedBoundFlagCount,
+	const TCHAR* Phase,
+	FString& OutError)
+{
+	if (!BindingsProperty || !ValuePtr || !OwnerObject)
+	{
+		OutError = FString::Printf(
+			TEXT("Cannot validate anim node bindings on %s during %s: invalid storage"),
+			*DescribeNode_ImportBpy(Node),
+			Phase ? Phase : TEXT("unknown"));
+		return false;
+	}
+
+	const bool bHasNonEmptyBindingEntries =
+		!SourceBindings.IsEmpty() && !SourceBindings.Equals(TEXT("()"), ESearchCase::CaseSensitive);
+
+	if (const FMapProperty* MapProperty = CastField<FMapProperty>(BindingsProperty))
+	{
+		FScriptMapHelper MapHelper(MapProperty, ValuePtr);
+		const int32 ImportedKeyCount = MapHelper.Num();
+		if (bHasNonEmptyBindingEntries && ImportedKeyCount < ExpectedKeyCount)
+		{
+			OutError = FString::Printf(
+				TEXT("Anim node binding partial import on %s during %s: expected_keys=%d imported_keys=%d"),
+				*DescribeNode_ImportBpy(Node),
+				Phase ? Phase : TEXT("unknown"),
+				ExpectedKeyCount,
+				ImportedKeyCount);
+			return false;
+		}
+	}
+
+	FString ExportedBindings;
+	BindingsProperty->ExportTextItem_Direct(
+		ExportedBindings,
+		ValuePtr,
+		nullptr,
+		OwnerObject,
+		PPF_None);
+	const int32 ImportedBoundFlagCount =
+		CountSerializedBindingTrueFlags_ImportBpy(ExportedBindings);
+	if (bHasNonEmptyBindingEntries && ImportedBoundFlagCount < ExpectedBoundFlagCount)
+	{
+		OutError = FString::Printf(
+			TEXT("Anim node binding bIsBound flag loss on %s during %s: expected_bound=%d imported_bound=%d"),
+			*DescribeNode_ImportBpy(Node),
+			Phase ? Phase : TEXT("unknown"),
+			ExpectedBoundFlagCount,
+			ImportedBoundFlagCount);
+		return false;
+	}
+
+	return true;
+}
+
 bool ApplyAnimNodeBindingPropertyBindings_ImportBpy(
 	UEdGraphNode* Node,
 	const FString& SerializedBindings,
@@ -9495,6 +9806,8 @@ bool ApplyAnimNodeBindingPropertyBindings_ImportBpy(
 
 	FObjectPropertyBase* BindingProperty =
 		FindFProperty<FObjectPropertyBase>(Node->GetClass(), TEXT("Binding"));
+	const int32 ExpectedBoundFlagCount =
+		CountSerializedBindingTrueFlags_ImportBpy(RemappedBindings);
 
 	// Prefer the Binding subobject path when available (UE5.7+), because
 	// node-level PropertyBindings can resolve to deprecated storage.
@@ -9527,28 +9840,85 @@ bool ApplyAnimNodeBindingPropertyBindings_ImportBpy(
 				return false;
 			}
 			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("A_after_import_text"), &RemappedBindings);
+			EnsureAnimNodeBindingDrivenPinsVisible_ImportBpy(Node, RemappedBindings);
 
-			// Verify ImportText didn't silently drop entries (FText localisation
-			// sub-fields and Transient flags can cause partial apply).
-			FScriptMapHelper MapHelper(DirectBindingsProperty, ValuePtr);
-			const int32 ImportedKeyCount = MapHelper.Num();
-			if (bHasNonEmptyBindingEntries && ImportedKeyCount < ExpectedKeyCount)
-			{
-				OutError = FString::Printf(
-					TEXT("PropertyBindings partial import on %s: expected=%d imported=%d"),
-					*DescribeNode_ImportBpy(Node),
+			if (!ValidateAnimNodeBindingImportText_ImportBpy(
+					DirectBindingsProperty,
+					ValuePtr,
+					Node,
+					Node,
+					RemappedBindings,
 					ExpectedKeyCount,
-					ImportedKeyCount);
+					ExpectedBoundFlagCount,
+					TEXT("after_import_text"),
+					OutError))
+			{
 				return false;
 			}
 
-			// Patch #1 (isolation test): skip PostEditChangeProperty here.
-			// This callback can trigger anim-node reconstruction side effects.
-			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_skip_post_edit_change"), nullptr);
+			{
+				FPropertyChangedEvent ChangeEvent(DirectBindingsProperty, EPropertyChangeType::ValueSet);
+				Node->PostEditChangeProperty(ChangeEvent);
+			}
+			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_after_post_edit_change"), nullptr);
 
-			// Do not reconstruct here: some anim graph nodes clear editor-side
-			// binding data during reconstruct, which turns binding-driven pins
-			// back into literal defaults on export.
+			// Re-apply bindings after editor lifecycle hooks to preserve mapping if
+			// node post-edit refresh mutates/rebuilds binding containers.
+			if (!DirectBindingsProperty->ImportText_Direct(*RemappedBindings, ValuePtr, Node, PPF_None))
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to re-import PropertyBindings on node %s after PostEditChangeProperty"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("C_after_reimport_post_edit"), &RemappedBindings);
+			if (!ValidateAnimNodeBindingImportText_ImportBpy(
+					DirectBindingsProperty,
+					ValuePtr,
+					Node,
+					Node,
+					RemappedBindings,
+					ExpectedKeyCount,
+					ExpectedBoundFlagCount,
+					TEXT("after_reimport_post_edit"),
+					OutError))
+			{
+				return false;
+			}
+
+			Node->ReconstructNode();
+			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("D_after_reconstruct"), nullptr);
+
+			ValuePtr = DirectBindingsProperty->ContainerPtrToValuePtr<void>(Node);
+			if (!ValuePtr)
+			{
+				OutError = FString::Printf(
+					TEXT("Cannot access PropertyBindings map on node %s after ReconstructNode"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+			EnsureAnimNodeBindingDrivenPinsVisible_ImportBpy(Node, RemappedBindings);
+			if (!DirectBindingsProperty->ImportText_Direct(*RemappedBindings, ValuePtr, Node, PPF_None))
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to re-import PropertyBindings on node %s after ReconstructNode"),
+					*DescribeNode_ImportBpy(Node));
+				return false;
+			}
+			LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("E_after_reimport_reconstruct"), &RemappedBindings);
+			if (!ValidateAnimNodeBindingImportText_ImportBpy(
+					DirectBindingsProperty,
+					ValuePtr,
+					Node,
+					Node,
+					RemappedBindings,
+					ExpectedKeyCount,
+					ExpectedBoundFlagCount,
+					TEXT("after_reimport_reconstruct"),
+					OutError))
+			{
+				return false;
+			}
 
 			// Mark the owning blueprint structurally modified so the upcoming full
 			// compile does NOT take the "skeleton-only" shortcut which skips
@@ -9631,28 +10001,107 @@ bool ApplyAnimNodeBindingPropertyBindings_ImportBpy(
 		return false;
 	}
 	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("A_after_import_text_legacy_binding"), &RemappedBindings);
+	EnsureAnimNodeBindingDrivenPinsVisible_ImportBpy(Node, RemappedBindings);
 
-	if (const FMapProperty* MapProperty = CastField<FMapProperty>(PropertyBindingsProperty))
+	if (!ValidateAnimNodeBindingImportText_ImportBpy(
+			PropertyBindingsProperty,
+			ValuePtr,
+			BindingObject,
+			Node,
+			RemappedBindings,
+			ExpectedKeyCount,
+			ExpectedBoundFlagCount,
+			TEXT("after_import_text_legacy_binding"),
+			OutError))
 	{
-		FScriptMapHelper MapHelper(MapProperty, ValuePtr);
-		const int32 ImportedKeyCount = MapHelper.Num();
-		if (bHasNonEmptyBindingEntries && ImportedKeyCount < ExpectedKeyCount)
-		{
-			OutError = FString::Printf(
-				TEXT("Binding.PropertyBindings partial import on %s: expected=%d imported=%d"),
-				*DescribeNode_ImportBpy(Node),
-				ExpectedKeyCount,
-				ImportedKeyCount);
-			return false;
-		}
+		return false;
 	}
 
-	// Patch #1 (isolation test): skip PostEditChangeProperty here.
-	// This callback can trigger anim-node reconstruction side effects.
-	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_skip_post_edit_change_legacy_binding"), nullptr);
+	{
+		FPropertyChangedEvent ChangeEvent(BindingProperty, EPropertyChangeType::ValueSet);
+		Node->PostEditChangeProperty(ChangeEvent);
+	}
+	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("B_after_post_edit_change_legacy_binding"), nullptr);
 
-	// Do not reconstruct here: reconstruct can mutate editor-only pin state on
-	// some anim nodes and accidentally wipe binding-driven display configuration.
+	// Re-apply after post-edit refresh to survive node reconstruction hooks.
+	if (!PropertyBindingsProperty->ImportText_Direct(*RemappedBindings, ValuePtr, BindingObject, PPF_None))
+	{
+		OutError = FString::Printf(
+			TEXT("Failed to re-import BindingPropertyBindings on node %s after PostEditChangeProperty"),
+			*DescribeNode_ImportBpy(Node));
+		return false;
+	}
+	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("C_after_reimport_post_edit_legacy_binding"), &RemappedBindings);
+
+	if (!ValidateAnimNodeBindingImportText_ImportBpy(
+			PropertyBindingsProperty,
+			ValuePtr,
+			BindingObject,
+			Node,
+			RemappedBindings,
+			ExpectedKeyCount,
+			ExpectedBoundFlagCount,
+			TEXT("after_reimport_post_edit_legacy_binding"),
+			OutError))
+	{
+		return false;
+	}
+
+	Node->ReconstructNode();
+	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("D_after_reconstruct_legacy_binding"), nullptr);
+
+	BindingObject = BindingProperty->GetObjectPropertyValue_InContainer(Node);
+	if (!BindingObject)
+	{
+		OutError = FString::Printf(
+			TEXT("Node %s lost Binding object after ReconstructNode"),
+			*DescribeNode_ImportBpy(Node));
+		return false;
+	}
+
+	PropertyBindingsProperty =
+		BindingObject->GetClass()->FindPropertyByName(TEXT("PropertyBindings"));
+	if (!PropertyBindingsProperty)
+	{
+		OutError = FString::Printf(
+			TEXT("Binding object %s on node %s lost PropertyBindings after ReconstructNode"),
+			*GetPathNameSafe(BindingObject),
+			*DescribeNode_ImportBpy(Node));
+		return false;
+	}
+
+	ValuePtr = PropertyBindingsProperty->ContainerPtrToValuePtr<void>(BindingObject);
+	if (!ValuePtr)
+	{
+		OutError = FString::Printf(
+			TEXT("Cannot access Binding.PropertyBindings for node %s after ReconstructNode"),
+			*DescribeNode_ImportBpy(Node));
+		return false;
+	}
+
+	BindingObject->Modify();
+	EnsureAnimNodeBindingDrivenPinsVisible_ImportBpy(Node, RemappedBindings);
+	if (!PropertyBindingsProperty->ImportText_Direct(*RemappedBindings, ValuePtr, BindingObject, PPF_None))
+	{
+		OutError = FString::Printf(
+			TEXT("Failed to re-import BindingPropertyBindings on node %s after ReconstructNode"),
+			*DescribeNode_ImportBpy(Node));
+		return false;
+	}
+	LogMotionMatchingBindingMapSnapshot_ImportBpy(Node, TEXT("E_after_reimport_reconstruct_legacy_binding"), &RemappedBindings);
+	if (!ValidateAnimNodeBindingImportText_ImportBpy(
+			PropertyBindingsProperty,
+			ValuePtr,
+			BindingObject,
+			Node,
+			RemappedBindings,
+			ExpectedKeyCount,
+			ExpectedBoundFlagCount,
+			TEXT("after_reimport_reconstruct_legacy_binding"),
+			OutError))
+	{
+		return false;
+	}
 
 	if (UBlueprint* OwningBP = FBlueprintEditorUtils::FindBlueprintForNode(Node))
 	{
@@ -13252,6 +13701,197 @@ bool ReplayStateMachineAliasNodesFromGraphJsonText_ImportBpy(
 		AliasedRefCount);
 
 	return true;
+}
+
+bool ValidateStateMachineGraphReplayGate_ImportBpy(
+	UAnimGraphNode_StateMachineBase* StateMachineNode,
+	const TSharedPtr<FJsonObject>& GraphJson,
+	const TCHAR* StageTag,
+	FString& OutError)
+{
+	if (!StateMachineNode || !GraphJson.IsValid())
+	{
+		return true;
+	}
+
+	UEdGraph* const LiveGraph = StateMachineNode->EditorStateMachineGraph;
+	const TArray<TSharedPtr<FJsonValue>>* ExpectedNodes = nullptr;
+	const TArray<TSharedPtr<FJsonValue>>* ExpectedConnections = nullptr;
+	const int32 ExpectedNodeCount =
+		GraphJson->TryGetArrayField(TEXT("nodes"), ExpectedNodes) && ExpectedNodes
+			? ExpectedNodes->Num()
+			: 0;
+	const int32 ExpectedConnectionCount =
+		GraphJson->TryGetArrayField(TEXT("connections"), ExpectedConnections) && ExpectedConnections
+			? ExpectedConnections->Num()
+			: 0;
+
+	int32 ExpectedStateCount = 0;
+	int32 ExpectedTransitionCount = 0;
+	int32 ExpectedEntryCount = 0;
+	if (ExpectedNodes)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *ExpectedNodes)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			FString NodeClass;
+			NodeObj->TryGetStringField(TEXT("node_class"), NodeClass);
+			if (NodeClass == TEXT("K2Node_AnimStateEntryNode"))
+			{
+				++ExpectedEntryCount;
+			}
+			else if (NodeClass.Contains(TEXT("AnimStateTransitionNode")))
+			{
+				++ExpectedTransitionCount;
+			}
+			else if (NodeClass.Contains(TEXT("AnimStateNode")) || NodeClass.Contains(TEXT("AnimStateConduitNode")))
+			{
+				++ExpectedStateCount;
+			}
+		}
+	}
+
+	int32 LiveNodeCount = LiveGraph ? LiveGraph->Nodes.Num() : 0;
+	int32 LiveConnectionCount = 0;
+	int32 LiveStateCount = 0;
+	int32 LiveTransitionCount = 0;
+	int32 LiveEntryCount = 0;
+	if (LiveGraph)
+	{
+		for (UEdGraphNode* Node : LiveGraph->Nodes)
+		{
+			if (!Node)
+			{
+				continue;
+			}
+			if (Node->IsA<UAnimStateEntryNode>())
+			{
+				++LiveEntryCount;
+			}
+			else if (Node->IsA<UAnimStateTransitionNode>())
+			{
+				++LiveTransitionCount;
+			}
+			else if (Node->IsA<UAnimStateNodeBase>())
+			{
+				++LiveStateCount;
+			}
+
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (Pin && Pin->Direction == EGPD_Output)
+				{
+					LiveConnectionCount += Pin->LinkedTo.Num();
+				}
+			}
+		}
+	}
+
+	UE_LOG(
+		LogTemp,
+		Display,
+		TEXT("[ExportBpy][ImportDiag][StateMachineGate][%s] node=%s expected_nodes=%d live_nodes=%d expected_connections=%d live_connections=%d expected_entry=%d live_entry=%d expected_states=%d live_states=%d expected_transitions=%d live_transitions=%d graph=%s"),
+		StageTag ? StageTag : TEXT("unknown"),
+		*DescribeNode_ImportBpy(StateMachineNode),
+		ExpectedNodeCount,
+		LiveNodeCount,
+		ExpectedConnectionCount,
+		LiveConnectionCount,
+		ExpectedEntryCount,
+		LiveEntryCount,
+		ExpectedStateCount,
+		LiveStateCount,
+		ExpectedTransitionCount,
+		LiveTransitionCount,
+		*GetPathNameSafe(LiveGraph));
+
+	if (ExpectedNodeCount > 2 && (!LiveGraph || LiveNodeCount <= 2))
+	{
+		OutError = FString::Printf(
+			TEXT("State machine graph regression on %s (%s): expected_nodes=%d live_nodes=%d. Likely late reconstruct wiped EditorStateMachineGraph."),
+			*DescribeNode_ImportBpy(StateMachineNode),
+			StageTag ? StageTag : TEXT("unknown"),
+			ExpectedNodeCount,
+			LiveNodeCount);
+		return false;
+	}
+
+	if (ExpectedStateCount > 0 && LiveStateCount == 0)
+	{
+		OutError = FString::Printf(
+			TEXT("State machine graph regression on %s (%s): expected_states=%d live_states=0."),
+			*DescribeNode_ImportBpy(StateMachineNode),
+			StageTag ? StageTag : TEXT("unknown"),
+			ExpectedStateCount);
+		return false;
+	}
+
+	if (ExpectedConnectionCount > 0 && LiveConnectionCount == 0)
+	{
+		OutError = FString::Printf(
+			TEXT("State machine graph regression on %s (%s): expected_connections=%d live_connections=0."),
+			*DescribeNode_ImportBpy(StateMachineNode),
+			StageTag ? StageTag : TEXT("unknown"),
+			ExpectedConnectionCount);
+		return false;
+	}
+
+	return true;
+}
+
+bool ReplayStateMachineGraphFromJsonTextFinal_ImportBpy(
+	UBlueprint* BP,
+	UAnimGraphNode_StateMachineBase* StateMachineNode,
+	const FString& GraphJsonText,
+	const TCHAR* StageTag,
+	FString& OutError)
+{
+	if (!BP || !StateMachineNode || GraphJsonText.IsEmpty())
+	{
+		return true;
+	}
+
+	if (!StateMachineNode->EditorStateMachineGraph)
+	{
+		OutError = FString::Printf(
+			TEXT("State machine node %s is missing EditorStateMachineGraph during %s"),
+			*DescribeNode_ImportBpy(StateMachineNode),
+			StageTag ? StageTag : TEXT("state_machine_replay"));
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> GraphJson;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(GraphJsonText);
+	if (!FJsonSerializer::Deserialize(Reader, GraphJson) || !GraphJson.IsValid())
+	{
+		OutError = FString::Printf(
+			TEXT("Cannot parse StateMachineGraphJson for node %s during %s"),
+			*DescribeNode_ImportBpy(StateMachineNode),
+			StageTag ? StageTag : TEXT("state_machine_replay"));
+		return false;
+	}
+
+	if (!UBPDirectImporter::PopulateGraph(BP, StateMachineNode->EditorStateMachineGraph, GraphJson, false, OutError))
+	{
+		return false;
+	}
+
+	if (!ReplayStateMachineAliasNodesFromGraphJsonText_ImportBpy(
+			BP,
+			StateMachineNode->EditorStateMachineGraph,
+			GraphJsonText,
+			StageTag,
+			OutError))
+	{
+		return false;
+	}
+
+	return ValidateStateMachineGraphReplayGate_ImportBpy(StateMachineNode, GraphJson, StageTag, OutError);
 }
 }
 
@@ -21611,7 +22251,7 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	// Keep chooser references identical to the exported source asset.
 	// Retargeting to duplicated chooser tables introduced runtime divergence in
 	// cloned AnimBlueprint imports.
-	constexpr bool bEnableChooserRetargeting_ImportBpy = false;
+	constexpr bool bEnableChooserRetargeting_ImportBpy = true;
 	if (bEnableChooserRetargeting_ImportBpy)
 	{
 		bool bRetargetedChooserTables = false;
@@ -21624,6 +22264,8 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 			FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
 		}
 	}
+
+	RepairEvaluateChooserSourceClassPinsForCurrentImport_ImportBpy(BP);
 
 	// Strict pre-compile parity checks: graph/function/delegate/event topology must
 	// match the serialized export before any final compile-time reconstruction.
@@ -23692,6 +24334,43 @@ bool UBPDirectImporter::PopulateGraph(
 		return false;
 	}
 
+	if (NodesArr && Cast<UAnimBlueprint>(BP) && bIsAnimationGraph && bIsTopLevelBlueprintGraph)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			const FString Uid = NodeObj->GetStringField(TEXT("uid"));
+			UEdGraphNode* const* ExistingNode = NodeMap.Find(Uid);
+			UAnimGraphNode_StateMachineBase* const StateMachineNode =
+				(ExistingNode && *ExistingNode) ? Cast<UAnimGraphNode_StateMachineBase>(*ExistingNode) : nullptr;
+			if (!StateMachineNode)
+			{
+				continue;
+			}
+
+			const FString StateMachineGraphJsonText = GetSpecialNodePropString_ImportBpy(NodeObj, TEXT("StateMachineGraphJson"));
+			if (StateMachineGraphJsonText.IsEmpty())
+			{
+				continue;
+			}
+
+			if (!ReplayStateMachineGraphFromJsonTextFinal_ImportBpy(
+					BP,
+					StateMachineNode,
+					StateMachineGraphJsonText,
+					TEXT("after_final_connection_stabilize"),
+					OutError))
+			{
+				return false;
+			}
+		}
+	}
+
 	if (!ShouldSkipStrictDefaultValidation_ImportBpy())
 	{
 		LogTrackedPromotableNodesFromMap_ImportBpy(NodesArr, NodeMap, TEXT("before_strict_default_validation"));
@@ -24904,6 +25583,10 @@ bool UBPDirectImporter::ConnectPins(
 	if (DstPin && DstPin->Direction != EGPD_Input)
 	{
 		DstPin = nullptr;
+	}
+	if (UEdGraphPin* RetargetedChooserDstPin = FindEvaluateChooserContextPinForCurrentImport_ImportBpy(DstNode, RequestedDstPin, EGPD_Input))
+	{
+		DstPin = RetargetedChooserDstPin;
 	}
 	if (DstPin)
 	{

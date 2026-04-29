@@ -76,6 +76,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/UObjectIterator.h"
+#include "UObject/MetaData.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/PackageName.h"
@@ -170,6 +171,24 @@ void AddNodePropertyDeltaOrTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Inf
 	AddNodePropertyTextIfPresent_ExportBpy(Node, Info, PropertyName);
 }
 
+FString GetOriginalChooserAssetPathForExport_ExportBpy(const UObject* Object)
+{
+	if (!Object)
+	{
+		return FString();
+	}
+
+	UPackage* Package = Object->GetOutermost();
+	if (!Package)
+	{
+		return FString();
+	}
+
+	FMetaData& MetaData = Package->GetMetaData();
+	const FString SourcePath = MetaData.GetValue(Object, TEXT("ExportBpy.SourceChooserAssetPath"));
+	return SourcePath.StartsWith(TEXT("/")) ? SourcePath : FString();
+}
+
 void AddNodeObjectPropertyTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info, const TCHAR* PropertyName)
 {
 	if (!Node || !PropertyName)
@@ -187,6 +206,29 @@ void AddNodeObjectPropertyTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info
 	}
 }
 
+void AddChooserPropertyTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info)
+{
+	if (!Node)
+	{
+		return;
+	}
+
+	AddNodeObjectPropertyTextIfPresent_ExportBpy(Node, Info, TEXT("Chooser"));
+
+	const FObjectPropertyBase* ChooserProperty =
+		FindFProperty<FObjectPropertyBase>(Node->GetClass(), FName(TEXT("Chooser")));
+	if (!ChooserProperty)
+	{
+		return;
+	}
+
+	const UObject* ChooserObject = ChooserProperty->GetObjectPropertyValue_InContainer(Node);
+	const FString SourceChooserPath = GetOriginalChooserAssetPathForExport_ExportBpy(ChooserObject);
+	if (!SourceChooserPath.IsEmpty())
+	{
+		Info.NodeProps.Add(TEXT("Chooser"), SourceChooserPath);
+	}
+}
 bool ExportAnimNodeBindingPropertyBindingsText_ExportBpy(UK2Node* Node, FString& OutExportedValue)
 {
 	OutExportedValue.Reset();
@@ -553,97 +595,69 @@ static FString ExtractStateResultHookFunctionName_ExportBpy(
 	return StateResultNodeStructText.Mid(NameStart, NameEnd - NameStart);
 }
 
-static FString EnsureStateEnteredNotifyNameFromStateResult_ExportBpy(
-	const FString& ExistingStateEnteredText,
-	const FString& DesiredNotifyName)
+static FString BuildStateEnteredText_ExportBpy(
+	const FString& DesiredNotifyName,
+	const FGuid& DesiredNotifyGuid)
 {
 	if (DesiredNotifyName.IsEmpty())
 	{
-		if (ExistingStateEnteredText.IsEmpty())
-		{
-			return FString(TEXT("(NotifyName=\"None\")"));
-		}
-		// DesiredNotifyName is empty means no binding was found in BoundGraph.
-		// Strip Guid from existing text for deterministic export.
-		FString Cleaned = ExistingStateEnteredText;
-		const FString GuidToken = TEXT("Guid=");
-		int32 GuidPos = Cleaned.Find(GuidToken, ESearchCase::CaseSensitive);
-		while (GuidPos != INDEX_NONE)
-		{
-			int32 GuidStart = (GuidPos > 0 && Cleaned[GuidPos - 1] == TEXT(','))
-				? GuidPos - 1 : GuidPos;
-			int32 ValueStart = GuidPos + GuidToken.Len();
-			int32 ValueEnd = Cleaned.Find(TEXT(","), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValueStart);
-			int32 FieldEnd = (ValueEnd == INDEX_NONE) ? Cleaned.Len() : ValueEnd;
-			Cleaned.RemoveAt(GuidStart, FieldEnd - GuidStart, EAllowShrinking::No);
-			GuidPos = Cleaned.Find(GuidToken, ESearchCase::CaseSensitive);
-		}
-		return Cleaned;
+		return FString(TEXT("(NotifyName=\"None\")"));
 	}
+	return DesiredNotifyGuid.IsValid()
+		? FString::Printf(TEXT("(NotifyName=\"%s\",Guid=%s)"), *DesiredNotifyName, *DesiredNotifyGuid.ToString(EGuidFormats::Digits))
+		: FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
+}
 
-	if (ExistingStateEnteredText.IsEmpty() || ExistingStateEnteredText.Equals(TEXT("()"), ESearchCase::CaseSensitive))
+
+static FString ExtractMemberReferenceNameFromText_ExportBpy(const FString& MemberReferenceText)
+{
+	const FString Needle = TEXT("MemberName=\"");
+	const int32 Pos = MemberReferenceText.Find(Needle, ESearchCase::CaseSensitive);
+	if (Pos == INDEX_NONE)
 	{
-		return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
+		return FString();
 	}
-
-	// If the struct already references this notify, return a clean version
-	// with the same NotifyName but Guid stripped (Guid is runtime-generated,
-	// non-deterministic, and must not pollute roundtrip exports).
-	const FString ExistingToken = FString::Printf(TEXT("NotifyName=\"%s\""), *DesiredNotifyName);
-	if (ExistingStateEnteredText.Contains(ExistingToken, ESearchCase::CaseSensitive))
+	const int32 ValueStart = Pos + Needle.Len();
+	const int32 ValueEnd = MemberReferenceText.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValueStart);
+	if (ValueEnd == INDEX_NONE || ValueEnd <= ValueStart)
 	{
-		return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
+		return FString();
 	}
+	const FString Name = MemberReferenceText.Mid(ValueStart, ValueEnd - ValueStart).TrimStartAndEnd();
+	return Name.Equals(TEXT("None"), ESearchCase::IgnoreCase) ? FString() : Name;
+}
 
-	// Replace the first NotifyName value in-place while preserving other fields.
-	const FString Needle = TEXT("NotifyName=\"");
-	const int32 NeedlePos = ExistingStateEnteredText.Find(Needle, ESearchCase::CaseSensitive);
-	if (NeedlePos != INDEX_NONE)
+static void NormalizeStateResultRuntimeNodeTextFromEditorRefs_ExportBpy(FNodeInfo& Info)
+{
+	FString* NodeText = Info.NodeProps.Find(TEXT("Node"));
+	const FString* EditorStateEntryText = Info.NodeProps.Find(TEXT("StateEntryFunction"));
+	if (!NodeText || !EditorStateEntryText)
 	{
-		const int32 ValueStart = NeedlePos + Needle.Len();
-		const int32 ValueEnd = ExistingStateEnteredText.Find(
-			TEXT("\""),
-			ESearchCase::CaseSensitive,
-			ESearchDir::FromStart,
-			ValueStart);
-		if (ValueEnd != INDEX_NONE && ValueEnd >= ValueStart)
-		{
-			FString Rewritten = ExistingStateEnteredText;
-			Rewritten.RemoveAt(ValueStart, ValueEnd - ValueStart, EAllowShrinking::No);
-			Rewritten.InsertAt(ValueStart, DesiredNotifyName);
-			return Rewritten;
-		}
+		return;
 	}
 
-	// Fallback: keep existing struct fields (but strip Guid) and inject NotifyName at the front.
-	if (ExistingStateEnteredText.StartsWith(TEXT("(")) && ExistingStateEnteredText.EndsWith(TEXT(")")) &&
-		ExistingStateEnteredText.Len() >= 2)
+	const FString EditorStateEntryName = ExtractMemberReferenceNameFromText_ExportBpy(*EditorStateEntryText);
+	if (EditorStateEntryName.IsEmpty())
 	{
-		FString Inner = ExistingStateEnteredText.Mid(1, ExistingStateEnteredText.Len() - 2).TrimStartAndEnd();
-		// Strip Guid since it is runtime-generated and non-deterministic.
-		const FString GuidToken = TEXT("Guid=");
-		int32 GuidPos = Inner.Find(GuidToken, ESearchCase::CaseSensitive);
-		while (GuidPos != INDEX_NONE)
-		{
-			int32 GuidStart = (GuidPos > 0 && Inner[GuidPos - 1] == TEXT(','))
-				? GuidPos - 1 : GuidPos;
-			int32 ValueStart = GuidPos + GuidToken.Len();
-			int32 ValueEnd = Inner.Find(TEXT(","), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValueStart);
-			int32 FieldEnd = (ValueEnd == INDEX_NONE)
-				? Inner.Len()
-				: ValueEnd;
-			Inner.RemoveAt(GuidStart, FieldEnd - GuidStart, EAllowShrinking::No);
-			GuidPos = Inner.Find(GuidToken, ESearchCase::CaseSensitive);
-		}
-		Inner = Inner.TrimStartAndEnd();
-		if (Inner.IsEmpty())
-		{
-			return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
-		}
-		return FString::Printf(TEXT("(NotifyName=\"%s\",%s)"), *DesiredNotifyName, *Inner);
+		return;
 	}
 
-	return FString::Printf(TEXT("(NotifyName=\"%s\")"), *DesiredNotifyName);
+	const FString FunctionNeedle = TEXT("StateEntryFunction=(FunctionName=\"");
+	const int32 FunctionPos = NodeText->Find(FunctionNeedle, ESearchCase::CaseSensitive);
+	if (FunctionPos == INDEX_NONE)
+	{
+		return;
+	}
+
+	const int32 ValueStart = FunctionPos + FunctionNeedle.Len();
+	const int32 ValueEnd = NodeText->Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValueStart);
+	if (ValueEnd == INDEX_NONE || ValueEnd < ValueStart)
+	{
+		return;
+	}
+
+	NodeText->RemoveAt(ValueStart, ValueEnd - ValueStart, EAllowShrinking::No);
+	NodeText->InsertAt(ValueStart, EditorStateEntryName);
 }
 
 static FString ExtractStateNotifyNameFromStateEnteredText_ExportBpy(const FString& StateEnteredText)
@@ -4283,7 +4297,7 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 	{
 		// Chooser node dynamic pins are derived from Chooser/Mode at import time.
 		// Export a non-delta fallback to avoid silently dropping these properties.
-		AddNodeObjectPropertyTextIfPresent_ExportBpy(Node, Info, TEXT("Chooser"));
+		AddChooserPropertyTextIfPresent_ExportBpy(Node, Info);
 		AddNodePropertyDeltaOrTextIfPresent_ExportBpy(Node, Info, TEXT("Mode"));
 		AddNodePropertyDeltaOrTextIfPresent_ExportBpy(Node, Info, TEXT("bReturnSoftObjectReference"));
 	}
@@ -4381,6 +4395,22 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("BecomeRelevantFunction"));
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("UpdateFunction"));
 		AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("OnMotionMatchingStateUpdatedFunction"));
+		if (UAnimGraphNode_StateResult* StateResultNode = Cast<UAnimGraphNode_StateResult>(Node))
+		{
+			TSharedPtr<FJsonObject> StateResultProps = MakeShared<FJsonObject>();
+			AddGenericNodePropertyText_ExportBpy(StateResultNode, StateResultProps, TEXT("StateEntryFunction"), true);
+			AddGenericNodePropertyText_ExportBpy(StateResultNode, StateResultProps, TEXT("StateFullyBlendedInFunction"), true);
+			AddGenericNodePropertyText_ExportBpy(StateResultNode, StateResultProps, TEXT("StateExitFunction"), true);
+			AddGenericNodePropertyText_ExportBpy(StateResultNode, StateResultProps, TEXT("StateFullyBlendedOutFunction"), true);
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : StateResultProps->Values)
+			{
+				if (Entry.Value.IsValid() && Entry.Value->Type == EJson::String)
+				{
+					Info.NodeProps.Add(Entry.Key, Entry.Value->AsString());
+				}
+			}
+			NormalizeStateResultRuntimeNodeTextFromEditorRefs_ExportBpy(Info);
+		}
 		if (const UAnimGraphNode_LinkedAnimLayer* LinkedLayerNode = Cast<UAnimGraphNode_LinkedAnimLayer>(Node))
 		{
 			Info.NodeProps.Add(TEXT("LinkedAnimLayerLayer"), LinkedLayerNode->Node.Layer.ToString());
@@ -7402,7 +7432,8 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeGenericNode(UEdGraphNode* No
 			ExtractStateNotifyNameFromStateEnteredText_ExportBpy(ExistingStateEnteredText);
 
 		TSet<FName> BlueprintFunctionNames;
-		if (UBlueprint* OwnerBlueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node))
+		UBlueprint* OwnerBlueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
+		if (OwnerBlueprint)
 		{
 			for (UEdGraph* FunctionGraph : OwnerBlueprint->FunctionGraphs)
 			{
@@ -7520,34 +7551,32 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeGenericNode(UEdGraphNode* No
 			}
 		}
 
-		FString PatchedStateEnteredText = EnsureStateEnteredNotifyNameFromStateResult_ExportBpy(
-			ExistingStateEnteredText,
-			DesiredNotifyName);
-		// Rebuild cleanly: strip any Guid=... field and reconstruct as (NotifyName="...").
-		// This avoids subtle off-by-one bugs in the RemoveAt approach.
+		FGuid DesiredNotifyGuid;
+		if (!DesiredNotifyName.IsEmpty() && OwnerBlueprint)
 		{
-			FString NotifyNameOnly;
-			const FString Needle = TEXT("NotifyName=\"");
-			const int32 NeedlePos = PatchedStateEnteredText.Find(Needle, ESearchCase::CaseSensitive);
-			if (NeedlePos != INDEX_NONE)
+			if (const UClass* SkeletonClass = OwnerBlueprint->SkeletonGeneratedClass)
 			{
-				const int32 ValStart = NeedlePos + Needle.Len();
-				const int32 ValEnd = PatchedStateEnteredText.Find(
-					TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValStart);
-				if (ValEnd != INDEX_NONE && ValEnd > ValStart)
+				FBlueprintEditorUtils::GetFunctionGuidFromClassByFieldName(
+					SkeletonClass,
+					FName(*DesiredNotifyName),
+					DesiredNotifyGuid);
+			}
+			if (!DesiredNotifyGuid.IsValid())
+			{
+				for (UEdGraph* FunctionGraph : OwnerBlueprint->FunctionGraphs)
 				{
-					NotifyNameOnly = PatchedStateEnteredText.Mid(ValStart, ValEnd - ValStart);
+					if (FunctionGraph && FunctionGraph->GetName() == DesiredNotifyName)
+					{
+						DesiredNotifyGuid = FunctionGraph->GraphGuid;
+						break;
+					}
 				}
 			}
-			if (!NotifyNameOnly.IsEmpty())
-			{
-				PatchedStateEnteredText = FString::Printf(TEXT("(NotifyName=\"%s\")"), *NotifyNameOnly);
-			}
-			else
-			{
-				PatchedStateEnteredText.Empty();
-			}
 		}
+
+		FString PatchedStateEnteredText = BuildStateEnteredText_ExportBpy(
+			DesiredNotifyName,
+			DesiredNotifyGuid);
 		if (!PatchedStateEnteredText.IsEmpty())
 		{
 			NodeProps->SetStringField(TEXT("StateEntered"), PatchedStateEnteredText);

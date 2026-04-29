@@ -115,6 +115,7 @@
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectHash.h"
 #include "UObject/UObjectIterator.h"
+#include "UObject/MetaData.h"
 #include "StructUtils/InstancedStruct.h"
 #include "StructUtils/UserDefinedStruct.h"
 #include "Engine/UserDefinedEnum.h"
@@ -263,6 +264,50 @@ bool ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
 	const TSharedPtr<FJsonObject>& Root,
 	const TCHAR* StageName,
 	FString& OutError);
+
+FGuid ResolveBlueprintFunctionGuid_ImportBpy(UBlueprint* BP, const FName& FunctionName)
+{
+	FGuid FunctionGuid;
+	if (!BP || FunctionName.IsNone())
+	{
+		return FunctionGuid;
+	}
+
+	if (const UClass* const SkeletonClass = BP->SkeletonGeneratedClass)
+	{
+		FBlueprintEditorUtils::GetFunctionGuidFromClassByFieldName(
+			SkeletonClass,
+			FunctionName,
+			FunctionGuid);
+		if (FunctionGuid.IsValid())
+		{
+			return FunctionGuid;
+		}
+	}
+
+	if (const UClass* const GeneratedClass = BP->GeneratedClass)
+	{
+		FBlueprintEditorUtils::GetFunctionGuidFromClassByFieldName(
+			GeneratedClass,
+			FunctionName,
+			FunctionGuid);
+		if (FunctionGuid.IsValid())
+		{
+			return FunctionGuid;
+		}
+	}
+
+	for (UEdGraph* FunctionGraph : BP->FunctionGraphs)
+	{
+		if (FunctionGraph && FunctionGraph->GetFName() == FunctionName)
+		{
+			return FunctionGraph->GraphGuid;
+		}
+	}
+
+	return FunctionGuid;
+}
+
 bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 	UBlueprint* BP,
 	int32& OutRepairedCount,
@@ -4034,7 +4079,11 @@ bool IsAnimNodeFunctionRefFieldName_ImportBpy(const FString& PropertyName)
 	return PropertyName.Equals(TEXT("InitialUpdateFunction"), ESearchCase::CaseSensitive) ||
 		PropertyName.Equals(TEXT("BecomeRelevantFunction"), ESearchCase::CaseSensitive) ||
 		PropertyName.Equals(TEXT("UpdateFunction"), ESearchCase::CaseSensitive) ||
-		PropertyName.Equals(TEXT("OnMotionMatchingStateUpdatedFunction"), ESearchCase::CaseSensitive);
+		PropertyName.Equals(TEXT("OnMotionMatchingStateUpdatedFunction"), ESearchCase::CaseSensitive) ||
+		PropertyName.Equals(TEXT("StateEntryFunction"), ESearchCase::CaseSensitive) ||
+		PropertyName.Equals(TEXT("StateFullyBlendedInFunction"), ESearchCase::CaseSensitive) ||
+		PropertyName.Equals(TEXT("StateExitFunction"), ESearchCase::CaseSensitive) ||
+		PropertyName.Equals(TEXT("StateFullyBlendedOutFunction"), ESearchCase::CaseSensitive);
 }
 
 bool HasEvaluateChooserMetadata_ImportBpy(
@@ -4604,6 +4653,14 @@ bool RetargetEvaluateChooserTablesForCurrentBlueprint_ImportBpy(
 					return false;
 				}
 
+				if (UPackage* RetargetedPackage = RetargetedChooserAsset->GetOutermost())
+				{
+					FMetaData& MetaData = RetargetedPackage->GetMetaData();
+					MetaData.SetValue(
+						RetargetedChooserAsset,
+						TEXT("ExportBpy.SourceChooserAssetPath"),
+						*SourceChooserAssetPath);
+				}
 				bool bChooserAssetTextChanged = false;
 				if (!RemapObjectSerializedPropertyTextInPlace_ImportBpy(
 						RetargetedChooserAsset,
@@ -10111,6 +10168,32 @@ bool ApplyAnimNodeBindingPropertyBindings_ImportBpy(
 	return true;
 }
 
+
+void SyncStateResultFunctionRefsToRuntimeNode_ImportBpy(UAnimGraphNode_StateResult* StateResultNode)
+{
+	if (!StateResultNode)
+	{
+		return;
+	}
+
+	static const FName FunctionRefPropertyNames[] = {
+		GET_MEMBER_NAME_CHECKED(UAnimGraphNode_StateResult, StateEntryFunction),
+		GET_MEMBER_NAME_CHECKED(UAnimGraphNode_StateResult, StateFullyBlendedInFunction),
+		GET_MEMBER_NAME_CHECKED(UAnimGraphNode_StateResult, StateExitFunction),
+		GET_MEMBER_NAME_CHECKED(UAnimGraphNode_StateResult, StateFullyBlendedOutFunction)
+	};
+
+	StateResultNode->Modify();
+	for (const FName PropertyName : FunctionRefPropertyNames)
+	{
+		if (FProperty* Property = UAnimGraphNode_StateResult::StaticClass()->FindPropertyByName(PropertyName))
+		{
+			FPropertyChangedEvent ChangeEvent(Property, EPropertyChangeType::ValueSet);
+			StateResultNode->PostEditChangeProperty(ChangeEvent);
+		}
+	}
+}
+
 bool ApplyNodeProps_ImportBpy(
 	UEdGraphNode* Node,
 	const TSharedPtr<FJsonObject>& NodeJson,
@@ -11359,6 +11442,11 @@ bool ApplyNodeProps_ImportBpy(
 				}
 			}
 		}
+	}
+
+	if (UAnimGraphNode_StateResult* StateResultNode = Cast<UAnimGraphNode_StateResult>(Node))
+	{
+		SyncStateResultFunctionRefsToRuntimeNode_ImportBpy(StateResultNode);
 	}
 
 	RemoveUnlinkedOrphanPins_ImportBpy(Node);
@@ -16204,33 +16292,45 @@ bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 			}
 
 			const FName ExistingNotifyName = StateNode->StateEntered.NotifyName;
+			const FGuid DesiredNotifyGuid = ResolveBlueprintFunctionGuid_ImportBpy(BP, DesiredNotifyName);
 			const bool bExistingIsPlaceholder =
 				ExistingNotifyName == FName(TEXT("OnStateEntry")) ||
 				ExistingNotifyName == FName(TEXT("OnUpdate"));
 			const bool bExistingFunctionExists = BlueprintFunctionNames.Contains(ExistingNotifyName);
-			if (ExistingNotifyName == DesiredNotifyName ||
-				(!ExistingNotifyName.IsNone() && !bExistingIsPlaceholder && bExistingFunctionExists))
+			const bool bExistingNameIsAcceptable =
+				ExistingNotifyName == DesiredNotifyName ||
+				(!ExistingNotifyName.IsNone() && !bExistingIsPlaceholder && bExistingFunctionExists);
+			const bool bExistingGuidMatches =
+				DesiredNotifyGuid.IsValid() && StateNode->StateEntered.Guid == DesiredNotifyGuid;
+			if (bExistingNameIsAcceptable && (!DesiredNotifyGuid.IsValid() || bExistingGuidMatches))
 			{
 				continue;
 			}
 
 			const FName PreviousNotifyName = ExistingNotifyName;
+			const FGuid PreviousNotifyGuid = StateNode->StateEntered.Guid;
 			StateNode->Modify();
-			StateNode->StateEntered.NotifyName = DesiredNotifyName;
-			// Keep StateEntered name-driven and avoid hard GUID coupling; GUID drift can
-			// silently break entry dispatch after import/recompile.
-			StateNode->StateEntered.Guid.Invalidate();
+			if (ExistingNotifyName.IsNone() || bExistingIsPlaceholder || !bExistingFunctionExists)
+			{
+				StateNode->StateEntered.NotifyName = DesiredNotifyName;
+			}
+			if (DesiredNotifyGuid.IsValid())
+			{
+				StateNode->StateEntered.Guid = DesiredNotifyGuid;
+			}
 
 			++OutRepairedCount;
 			UE_LOG(
 				LogTemp,
 				Warning,
-				TEXT("[ExportBpy][ImportDiag][StateEntryRepair] graph=%s state=%s node=%s from=%s to=%s"),
+				TEXT("[ExportBpy][ImportDiag][StateEntryRepair] graph=%s state=%s node=%s from=%s/%s to=%s/%s"),
 				*Graph->GetName(),
 				*StateNode->GetName(),
 				*DescribeNode_ImportBpy(StateNode),
 				PreviousNotifyName.IsNone() ? TEXT("None") : *PreviousNotifyName.ToString(),
-				*DesiredNotifyName.ToString());
+				PreviousNotifyGuid.IsValid() ? *PreviousNotifyGuid.ToString(EGuidFormats::DigitsWithHyphens) : TEXT("None"),
+				*StateNode->StateEntered.NotifyName.ToString(),
+				StateNode->StateEntered.Guid.IsValid() ? *StateNode->StateEntered.Guid.ToString(EGuidFormats::DigitsWithHyphens) : TEXT("None"));
 		}
 	}
 
@@ -16473,6 +16573,20 @@ bool ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
 					*DescribeNode_ImportBpy(StateNode),
 					*StateEntryFunctionName.ToString(),
 					*ActualNotifyName.ToString()));
+			}
+
+			const FGuid ExpectedNotifyGuid = ResolveBlueprintFunctionGuid_ImportBpy(BP, StateEntryFunctionName);
+			if (ExpectedNotifyGuid.IsValid() && StateNode->StateEntered.Guid != ExpectedNotifyGuid)
+			{
+				MissingBindings.Add(FString::Printf(
+					TEXT("graph=%s state=%s node=%s notify_guid_mismatch expected=%s/%s actual=%s/%s"),
+					*Graph->GetName(),
+					*StateNode->GetName(),
+					*DescribeNode_ImportBpy(StateNode),
+					*StateEntryFunctionName.ToString(),
+					*ExpectedNotifyGuid.ToString(EGuidFormats::DigitsWithHyphens),
+					ActualNotifyName.IsNone() ? TEXT("None") : *ActualNotifyName.ToString(),
+					StateNode->StateEntered.Guid.IsValid() ? *StateNode->StateEntered.Guid.ToString(EGuidFormats::DigitsWithHyphens) : TEXT("None")));
 			}
 		}
 	}
@@ -18640,6 +18754,26 @@ FName ExtractStateResultHookFunctionNameFromStructText_ImportBpy(
 		return NAME_None;
 	}
 
+	if (!HookFieldName || !*HookFieldName)
+	{
+		const FString MemberNeedle = TEXT("MemberName=\"");
+		const int32 MemberPos = NodeStructText.Find(MemberNeedle, ESearchCase::CaseSensitive);
+		if (MemberPos != INDEX_NONE)
+		{
+			const int32 ValueStart = MemberPos + MemberNeedle.Len();
+			const int32 ValueEnd = NodeStructText.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, ValueStart);
+			if (ValueEnd != INDEX_NONE && ValueEnd > ValueStart)
+			{
+				const FString FunctionName = NodeStructText.Mid(ValueStart, ValueEnd - ValueStart).TrimStartAndEnd();
+				if (!FunctionName.IsEmpty() && !FunctionName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+				{
+					return FName(*FunctionName);
+				}
+			}
+		}
+		return NAME_None;
+	}
+
 	const FString FunctionNeedle =
 		FString::Printf(TEXT("%s=(FunctionName=\""), HookFieldName);
 	int32 NeedlePos = NodeStructText.Find(FunctionNeedle, ESearchCase::CaseSensitive);
@@ -18858,14 +18992,27 @@ void CollectSerializedStateMachineBindingSnapshotsRecursive_ImportBpy(
 			}
 			else if (bIsStateResultNode)
 			{
+				FString EditorStateEntryFunctionText;
+				if ((*NodePropsObj)->TryGetStringField(TEXT("StateEntryFunction"), EditorStateEntryFunctionText) &&
+					!EditorStateEntryFunctionText.IsEmpty())
+				{
+					Snapshot.StateEntryFunctionName =
+						ExtractStateResultHookFunctionNameFromStructText_ImportBpy(
+							EditorStateEntryFunctionText,
+							TEXT(""));
+				}
+
 				FString NodeStructText;
 				if ((*NodePropsObj)->TryGetStringField(TEXT("Node"), NodeStructText) &&
 					!NodeStructText.IsEmpty())
 				{
-					Snapshot.StateEntryFunctionName =
-						ExtractStateResultHookFunctionNameFromStructText_ImportBpy(
-							NodeStructText,
-							TEXT("StateEntryFunction"));
+					if (Snapshot.StateEntryFunctionName.IsNone())
+					{
+						Snapshot.StateEntryFunctionName =
+							ExtractStateResultHookFunctionNameFromStructText_ImportBpy(
+								NodeStructText,
+								TEXT("StateEntryFunction"));
+					}
 					Snapshot.UpdateFunctionName =
 						ExtractStateResultHookFunctionNameFromStructText_ImportBpy(
 							NodeStructText,
@@ -22514,18 +22661,37 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	}
 	if (RepairedStateEntryBindings > 0)
 	{
-		if (bStrictImportMode)
-		{
-			OutError = FString::Printf(
-				TEXT("State entry bindings required repair (%d). Import aborted in strict mode."),
-				RepairedStateEntryBindings);
-			return false;
-		}
 		UE_LOG(
 			LogTemp,
 			Warning,
-			TEXT("[ExportBpy][ImportDiag] Non-strict import: state entry bindings required repair (%d)."),
+			TEXT("[ExportBpy][ImportDiag] State entry bindings repaired deterministically (%d)."),
 			RepairedStateEntryBindings);
+
+		if (bCompileBlueprint)
+		{
+			if (!CompileAndTrackWarnings(TEXT("state_entry_binding_repair")))
+			{
+				return false;
+			}
+
+			int32 RepairedStateEntryBindingsAfterCompile = 0;
+			if (!RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
+					BP,
+					RepairedStateEntryBindingsAfterCompile,
+					OutError,
+					&Root))
+			{
+				return false;
+			}
+			if (RepairedStateEntryBindingsAfterCompile > 0)
+			{
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("[ExportBpy][ImportDiag] State entry bindings repaired again after compile (%d)."),
+					RepairedStateEntryBindingsAfterCompile);
+			}
+		}
 	}
 	LogAnimBlueprintStateMachineEntryBindings_ImportBpy(
 		BP,

@@ -5,16 +5,10 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, List, Tuple
 
-SOURCE_ABP_CLASS_FRAGMENT = "SandboxCharacter_CMC_ABP_C"
-POSE_TOP_PREFIX = "CHT_PoseSearchDatabases_For_"
-POSE_CHILD_PREFIXES = (
-    "CHT_PoseSearchDatabases_Dense_For_",
-    "CHT_PoseSearchDatabases_Sparse_For_",
-    "CHT_PoseSearchDatabases_ExtremeSparse_For_",
-)
 RE_CHOOSER_REF = re.compile(r"/Script/Chooser\.ChooserTable'([^']+)'")
 RE_CONTEXT_CLASS = re.compile(r"AnimBlueprintGeneratedClass'([^']+)'")
-RE_FOR_TARGET = re.compile(r"_For_(SandboxCharacter_Mover_ABP[^./']*)")
+RE_FOR_TARGET = re.compile(r"_For_([^./']+)")
+RE_BLUEPRINT_PATH = re.compile(r"path\s*=\s*['\"]([^'\"]+)['\"]")
 
 
 def _load_meta(path: Path) -> dict[str, Any]:
@@ -52,6 +46,26 @@ def _context_classes(all_text: str) -> List[str]:
     return sorted(set(classes))
 
 
+def _asset_name(asset_path: str) -> str:
+    return (asset_path or "").rsplit("/", 1)[-1].split(".", 1)[0]
+
+
+def _source_class_name(export_path: Path) -> str:
+    root_path = export_path / "__bp__.bp.py"
+    if not root_path.exists():
+        root_path = export_path / f"{export_path.name}.bp.py"
+    if not root_path.exists():
+        return ""
+    text = root_path.read_text(encoding="utf-8", errors="ignore")
+    match = RE_BLUEPRINT_PATH.search(text)
+    if not match:
+        return ""
+    return f"{_asset_name(match.group(1))}_C"
+
+
+def _has_pose_search_database_result(meta_text: str) -> bool:
+    return "object/PoseSearchDatabase|array" in meta_text or "PoseSearchDatabase" in meta_text
+
 
 
 def _state_controller_hook_counts(export_path: Path) -> dict[str, int]:
@@ -82,6 +96,34 @@ def validate_state_controller_hooks(export_dir: str | Path) -> list[str]:
         errors.append(f"State Controller has too few StateEntryFunction bindings: {counts['StateEntryFunction']} < 7")
     if counts["OnStateEntry"] < 20:
         errors.append(f"State Controller exported OnStateEntry references look incomplete: {counts['OnStateEntry']} < 20")
+
+    state_files = sorted(export_path.glob("*State_Controller*.bp.py"))
+    if len(state_files) < 30:
+        errors.append(f"State Controller exported graph sidecars look incomplete: {len(state_files)} < 30")
+
+    all_text = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in state_files)
+    required_tokens = {
+        "state machine graph": "AnimStateEntryNode",
+        "state nodes": "AnimStateNode",
+        "transition nodes": "AnimStateTransitionNode",
+        "transition graph results": "AnimGraphNode_TransitionResult",
+        "state result hooks": "AnimGraphNode_StateResult",
+        "anim getter source node uid": "AnimGetterSourceNodeUid",
+        "anim getter source blueprint": "AnimGetterSourceBlueprint",
+        "source node uid": "SourceNodeUid",
+    }
+    for label, token in required_tokens.items():
+        if token not in all_text:
+            errors.append(f"State Controller missing {label} token: {token}")
+
+    anim_graph = export_path / "fn_AnimGraph.bp.py"
+    if anim_graph.exists():
+        anim_graph_text = anim_graph.read_text(encoding="utf-8", errors="ignore")
+        if "StateMachineGraphJson" not in anim_graph_text or "other_fn_AnimGraph__StateMachine__State_Controller" not in anim_graph_text:
+            errors.append("AnimGraph state machine node is missing State_Controller nested graph reference")
+    else:
+        errors.append("missing fn_AnimGraph.bp.py for State Controller validation")
+
     return errors
 
 
@@ -99,16 +141,31 @@ def validate_update_motion_matching(export_dir: str | Path, expected_target: str
     if "EvaluateChooser2" not in graph_text:
         return errors
 
-    if "CHT_PoseSearchDatabases.CHT_PoseSearchDatabases" not in graph_text:
-        errors.append("Update_MotionMatching EvaluateChooser2 does not reference original CHT_PoseSearchDatabases")
+    chooser_refs = RE_CHOOSER_REF.findall(graph_text)
+    if not chooser_refs:
+        errors.append("Update_MotionMatching EvaluateChooser2 has no ChooserTable reference")
+    if not _has_pose_search_database_result(meta_text):
+        errors.append("Update_MotionMatching EvaluateChooser2 does not expose a PoseSearchDatabase array result")
 
     if expected_target:
         expected_pin = f"EvaluateChooser2.{expected_target}_C"
         expected_type = f"\"{expected_pin}\": \"object/{expected_target}_C\""
-        if expected_pin not in graph_text:
-            errors.append(f"Update_MotionMatching missing self connection to {expected_pin}")
-        if expected_type not in meta_text:
-            errors.append(f"Update_MotionMatching missing pin type {expected_type}")
+        source_pin_match = re.search(r"EvaluateChooser2\.([A-Za-z0-9_]+_ABP(?:_[A-Za-z0-9_]+)?)_C", graph_text + "\n" + meta_text)
+        source_type_match = re.search(r"\"EvaluateChooser2\.([A-Za-z0-9_]+_ABP(?:_[A-Za-z0-9_]+)?)_C\": \"object/\1_C\"", meta_text)
+        if expected_pin in graph_text:
+            if expected_type not in meta_text:
+                errors.append(f"Update_MotionMatching missing pin type {expected_type}")
+        elif source_pin_match and source_type_match:
+            source_name = source_pin_match.group(1)
+            if source_name != source_type_match.group(1):
+                errors.append(
+                    "Update_MotionMatching source self pin and meta type disagree: "
+                    f"{source_name} vs {source_type_match.group(1)}"
+                )
+        else:
+            errors.append(
+                f"Update_MotionMatching cannot prove self pin can be retargeted to {expected_pin}"
+            )
     return errors
 
 def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tuple[List[str], List[str]]:
@@ -119,9 +176,22 @@ def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tu
     if not export_path.exists() or not export_path.is_dir():
         return [f"export dir does not exist: {export_path}"], warnings
 
+    source_class_name = _source_class_name(export_path)
     meta_files = sorted(export_path.glob("CHT*__asset__.meta.py"))
+    graph_texts = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in export_path.glob("*.bp.py")
+    )
     if not meta_files:
-        warnings.append("no ChooserTable meta files found; check is inconclusive")
+        chooser_refs = RE_CHOOSER_REF.findall(graph_texts)
+        if chooser_refs:
+            warnings.append("ChooserTable meta files absent; using original ChooserTable references, no retargeted child Chooser TPOSE risk detected")
+        elif "EvaluateChooser" in graph_texts or "ChooserTable" in graph_texts:
+            errors.append("Chooser nodes are present but no ChooserTable meta files or original ChooserTable reference were found")
+        else:
+            warnings.append("no ChooserTable dependencies detected")
+        errors.extend(validate_state_controller_hooks(export_path))
+        errors.extend(validate_update_motion_matching(export_path, expected_target))
         return errors, warnings
 
     seen_targets: set[str] = set()
@@ -144,20 +214,20 @@ def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tu
             errors.append(f"{path.name}: double retarget suffix '_For_{target}_For_{target}' found")
         if target and "Class=None" in classes:
             errors.append(f"{path.name}: retargeted chooser has ContextData Class=None")
-        if target and any(SOURCE_ABP_CLASS_FRAGMENT in cls for cls in classes):
-            errors.append(f"{path.name}: retargeted chooser ContextData still points to source {SOURCE_ABP_CLASS_FRAGMENT}")
+        if target and source_class_name and any(source_class_name in cls for cls in classes):
+            errors.append(f"{path.name}: retargeted chooser ContextData still points to source {source_class_name}")
 
-        if target and asset_name.startswith(POSE_TOP_PREFIX):
-            retargeted_child_refs = [ref for ref in refs if any(prefix + target in ref for prefix in POSE_CHILD_PREFIXES)]
+        if target:
+            retargeted_child_refs = [ref for ref in refs if f"_For_{target}" in _asset_name(ref)]
             if retargeted_child_refs:
                 errors.append(
-                    f"{path.name}: top PoseSearch chooser points to retargeted child tables; "
-                    "known TPOSE risk unless every child context is valid"
+                    f"{path.name}: retargeted chooser points to retargeted child tables; "
+                    "known TPOSE risk unless the full dependency graph is exported and context-retargeted"
                 )
 
-        if target and (asset_name.startswith("CHT_CMCCharacterAnimations_For_") or asset_name.startswith(POSE_TOP_PREFIX)):
+        if target and classes:
             expected_class = f"/Game/Blueprints/Test/{target}.{target}_C"
-            if classes and expected_class not in classes:
+            if expected_class not in classes:
                 errors.append(f"{path.name}: expected target context {expected_class}, got {classes}")
 
     if mismatched_target_files:

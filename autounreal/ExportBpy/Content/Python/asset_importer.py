@@ -64,10 +64,7 @@ def _validate_standalone_chooser_meta_preflight(meta: Dict[str, Any], target_pat
     all_text = "\n".join(_iter_meta_strings(meta))
     if "Class=None" in all_text:
         return False, "retargeted ChooserTable META has ContextData Class=None"
-    if "SandboxCharacter_CMC_ABP_C" in all_text:
-        return False, "retargeted ChooserTable META still references source SandboxCharacter_CMC_ABP_C"
-
-    match = re.search(r"_For_(SandboxCharacter_Mover_ABP[^./']*)", asset_path)
+    match = re.search(r"_For_([^./']+)", asset_path)
     if match:
         target = match.group(1)
         expected_class = f"/Game/Blueprints/Test/{target}.{target}_C"

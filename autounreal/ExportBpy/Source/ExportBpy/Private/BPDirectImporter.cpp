@@ -182,6 +182,14 @@ bool ReplayStateMachineAliasNodesFromGraphJsonText_ImportBpy(
 	const FString& GraphJsonText,
 	const TCHAR* StageTag,
 	FString& OutError);
+bool EnsureStateMachineGraphOwnership_ImportBpy(
+	UAnimGraphNode_StateMachineBase* StateMachineNode,
+	const TCHAR* StageTag,
+	FString& OutError);
+bool RepairStateMachineTransitionNodeLinks_ImportBpy(
+	UAnimationStateMachineGraph* StateMachineGraph,
+	const TCHAR* StageTag,
+	FString& OutError);
 FString DescribePinType_ImportBpy(const FEdGraphPinType& PinType);
 bool TryParseGuid_ImportBpy(const FString& GuidText, FGuid& OutGuid);
 bool PopulateNestedGraphFromJsonText_ImportBpy(
@@ -264,59 +272,7 @@ bool ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
 	const TSharedPtr<FJsonObject>& Root,
 	const TCHAR* StageName,
 	FString& OutError);
-
-FGuid ResolveBlueprintFunctionGuid_ImportBpy(UBlueprint* BP, const FName& FunctionName)
-{
-	FGuid FunctionGuid;
-	if (!BP || FunctionName.IsNone())
-	{
-		return FunctionGuid;
-	}
-
-	if (const UClass* const SkeletonClass = BP->SkeletonGeneratedClass)
-	{
-		FBlueprintEditorUtils::GetFunctionGuidFromClassByFieldName(
-			SkeletonClass,
-			FunctionName,
-			FunctionGuid);
-		if (FunctionGuid.IsValid())
-		{
-			return FunctionGuid;
-		}
-	}
-
-	if (const UClass* const GeneratedClass = BP->GeneratedClass)
-	{
-		FBlueprintEditorUtils::GetFunctionGuidFromClassByFieldName(
-			GeneratedClass,
-			FunctionName,
-			FunctionGuid);
-		if (FunctionGuid.IsValid())
-		{
-			return FunctionGuid;
-		}
-	}
-
-	for (UEdGraph* FunctionGraph : BP->FunctionGraphs)
-	{
-		if (FunctionGraph && FunctionGraph->GetFName() == FunctionName)
-		{
-			return FunctionGraph->GraphGuid;
-		}
-	}
-
-	return FunctionGuid;
-}
-
-bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
-	UBlueprint* BP,
-	int32& OutRepairedCount,
-	FString& OutError,
-	const TSharedPtr<FJsonObject>* RootJsonForBpyData = nullptr);
-void LogAnimBlueprintStateMachineEntryBindings_ImportBpy(
-	UBlueprint* BP,
-	const TCHAR* StageName);
-bool ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
+bool ValidateAnimBlueprintStateMachineDebugData_ImportBpy(
 	UBlueprint* BP,
 	const TCHAR* StageName,
 	FString& OutError);
@@ -10660,10 +10616,26 @@ bool ApplyNodeProps_ImportBpy(
 				return false;
 			}
 
+			if (!RepairStateMachineTransitionNodeLinks_ImportBpy(
+					StateMachineNode->EditorStateMachineGraph,
+					TEXT("StateMachineNestedReplay"),
+					OutError))
+			{
+				return false;
+			}
+
 			if (!ReplayStateMachineAliasNodesFromGraphJsonText_ImportBpy(
 					NestedBlueprint,
 					StateMachineNode->EditorStateMachineGraph,
 					StateMachineGraphJsonTextPostReconstruct,
+					TEXT("StateMachineNestedReplay"),
+					OutError))
+			{
+				return false;
+			}
+
+			if (!EnsureStateMachineGraphOwnership_ImportBpy(
+					StateMachineNode,
 					TEXT("StateMachineNestedReplay"),
 					OutError))
 			{
@@ -13791,6 +13763,165 @@ bool ReplayStateMachineAliasNodesFromGraphJsonText_ImportBpy(
 	return true;
 }
 
+
+bool EnsureStateMachineGraphOwnership_ImportBpy(
+	UAnimGraphNode_StateMachineBase* StateMachineNode,
+	const TCHAR* StageTag,
+	FString& OutError)
+{
+	if (!StateMachineNode)
+	{
+		return true;
+	}
+
+	UAnimationStateMachineGraph* const StateMachineGraph = StateMachineNode->EditorStateMachineGraph;
+	if (!StateMachineGraph)
+	{
+		OutError = FString::Printf(
+			TEXT("State machine node %s has no EditorStateMachineGraph during %s"),
+			*DescribeNode_ImportBpy(StateMachineNode),
+			StageTag ? StageTag : TEXT("state_machine_ownership"));
+		return false;
+	}
+
+	bool bModified = false;
+	if (StateMachineGraph->OwnerAnimGraphNode != StateMachineNode)
+	{
+		StateMachineGraph->Modify();
+		StateMachineGraph->OwnerAnimGraphNode = StateMachineNode;
+		bModified = true;
+	}
+
+	UEdGraph* const ParentGraph = StateMachineNode->GetGraph();
+	if (!ParentGraph)
+	{
+		OutError = FString::Printf(
+			TEXT("State machine node %s has no parent graph during %s"),
+			*DescribeNode_ImportBpy(StateMachineNode),
+			StageTag ? StageTag : TEXT("state_machine_ownership"));
+		return false;
+	}
+
+	if (ParentGraph->SubGraphs.Find(StateMachineGraph) == INDEX_NONE)
+	{
+		ParentGraph->Modify();
+		ParentGraph->SubGraphs.Add(StateMachineGraph);
+		bModified = true;
+	}
+
+	StateMachineGraph->SetFlags(RF_Transactional);
+	for (UEdGraphNode* NestedNode : StateMachineGraph->Nodes)
+	{
+		if (NestedNode)
+		{
+			NestedNode->SetFlags(RF_Transactional);
+		}
+	}
+
+	if (bModified)
+	{
+		if (UBlueprint* OwningBlueprint = FBlueprintEditorUtils::FindBlueprintForNode(StateMachineNode))
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(OwningBlueprint);
+		}
+
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag][StateMachineOwnership][%s] repaired node=%s graph=%s owner=%s subgraphs=%d"),
+			StageTag ? StageTag : TEXT("Unknown"),
+			*DescribeNode_ImportBpy(StateMachineNode),
+			*GetPathNameSafe(StateMachineGraph),
+			*GetPathNameSafe(StateMachineGraph->OwnerAnimGraphNode),
+			ParentGraph->SubGraphs.Num());
+	}
+
+	return true;
+}
+
+
+bool RepairStateMachineTransitionNodeLinks_ImportBpy(
+	UAnimationStateMachineGraph* StateMachineGraph,
+	const TCHAR* StageTag,
+	FString& OutError)
+{
+	if (!StateMachineGraph)
+	{
+		return true;
+	}
+
+	int32 RepairedTransitions = 0;
+	for (UEdGraphNode* Node : StateMachineGraph->Nodes)
+	{
+		UAnimStateTransitionNode* const TransitionNode = Cast<UAnimStateTransitionNode>(Node);
+		if (!TransitionNode || TransitionNode->Pins.Num() < 2)
+		{
+			continue;
+		}
+
+		UAnimStateNodeBase* PreviousState = TransitionNode->GetPreviousState();
+		UAnimStateNodeBase* NextState = TransitionNode->GetNextState();
+		if (PreviousState && NextState)
+		{
+			continue;
+		}
+
+		for (UEdGraphPin* LinkedPin : TransitionNode->Pins[0]->LinkedTo)
+		{
+			if (!PreviousState && LinkedPin)
+			{
+				PreviousState = Cast<UAnimStateNodeBase>(LinkedPin->GetOwningNode());
+			}
+		}
+		for (UEdGraphPin* LinkedPin : TransitionNode->Pins[1]->LinkedTo)
+		{
+			if (!NextState && LinkedPin)
+			{
+				NextState = Cast<UAnimStateNodeBase>(LinkedPin->GetOwningNode());
+			}
+		}
+
+		if (!PreviousState || !NextState)
+		{
+			OutError = FString::Printf(
+				TEXT("State transition link repair failed (%s): transition=%s prev=%s next=%s"),
+				StageTag ? StageTag : TEXT("unknown"),
+				*DescribeNode_ImportBpy(TransitionNode),
+				*GetPathNameSafe(PreviousState),
+				*GetPathNameSafe(NextState));
+			return false;
+		}
+
+		TransitionNode->Modify();
+		PreviousState->Modify();
+		NextState->Modify();
+		TransitionNode->CreateConnections(PreviousState, NextState);
+		TransitionNode->PinConnectionListChanged(TransitionNode->Pins[0]);
+		TransitionNode->PinConnectionListChanged(TransitionNode->Pins[1]);
+		TransitionNode->NodeConnectionListChanged();
+		++RepairedTransitions;
+	}
+
+	if (RepairedTransitions > 0)
+	{
+		StateMachineGraph->Modify();
+		StateMachineGraph->NotifyGraphChanged();
+		if (UBlueprint* OwningBlueprint = FBlueprintEditorUtils::FindBlueprintForGraph(StateMachineGraph))
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(OwningBlueprint);
+		}
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy][ImportDiag][StateTransitionRepair][%s] graph=%s repaired=%d"),
+			StageTag ? StageTag : TEXT("Unknown"),
+			*GetPathNameSafe(StateMachineGraph),
+			RepairedTransitions);
+	}
+
+	return true;
+}
+
 bool ValidateStateMachineGraphReplayGate_ImportBpy(
 	UAnimGraphNode_StateMachineBase* StateMachineNode,
 	const TSharedPtr<FJsonObject>& GraphJson,
@@ -13803,6 +13934,30 @@ bool ValidateStateMachineGraphReplayGate_ImportBpy(
 	}
 
 	UEdGraph* const LiveGraph = StateMachineNode->EditorStateMachineGraph;
+	if (LiveGraph)
+	{
+		if (const UAnimationStateMachineGraph* AnimStateMachineGraph = Cast<UAnimationStateMachineGraph>(LiveGraph))
+		{
+			if (AnimStateMachineGraph->OwnerAnimGraphNode != StateMachineNode)
+			{
+				OutError = FString::Printf(
+					TEXT("State machine graph ownership regression on %s (%s): graph owner is %s."),
+					*DescribeNode_ImportBpy(StateMachineNode),
+					StageTag ? StageTag : TEXT("unknown"),
+					*GetPathNameSafe(AnimStateMachineGraph->OwnerAnimGraphNode));
+				return false;
+			}
+		}
+
+		if (StateMachineNode->GetGraph() && StateMachineNode->GetGraph()->SubGraphs.Find(LiveGraph) == INDEX_NONE)
+		{
+			OutError = FString::Printf(
+				TEXT("State machine graph ownership regression on %s (%s): graph is missing from parent SubGraphs."),
+				*DescribeNode_ImportBpy(StateMachineNode),
+				StageTag ? StageTag : TEXT("unknown"));
+			return false;
+		}
+	}
 	const TArray<TSharedPtr<FJsonValue>>* ExpectedNodes = nullptr;
 	const TArray<TSharedPtr<FJsonValue>>* ExpectedConnections = nullptr;
 	const int32 ExpectedNodeCount =
@@ -13964,7 +14119,20 @@ bool ReplayStateMachineGraphFromJsonTextFinal_ImportBpy(
 		return false;
 	}
 
+	if (!EnsureStateMachineGraphOwnership_ImportBpy(StateMachineNode, StageTag, OutError))
+	{
+		return false;
+	}
+
 	if (!UBPDirectImporter::PopulateGraph(BP, StateMachineNode->EditorStateMachineGraph, GraphJson, false, OutError))
+	{
+		return false;
+	}
+
+	if (!RepairStateMachineTransitionNodeLinks_ImportBpy(
+			StateMachineNode->EditorStateMachineGraph,
+			StageTag,
+			OutError))
 	{
 		return false;
 	}
@@ -13975,6 +14143,11 @@ bool ReplayStateMachineGraphFromJsonTextFinal_ImportBpy(
 			GraphJsonText,
 			StageTag,
 			OutError))
+	{
+		return false;
+	}
+
+	if (!EnsureStateMachineGraphOwnership_ImportBpy(StateMachineNode, StageTag, OutError))
 	{
 		return false;
 	}
@@ -14884,6 +15057,14 @@ static bool ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(
 				FindImportedTopLevelGraphNodeBySerializedUid_ImportBpy(BP, Graph, Uid);
 			UAnimGraphNode_StateMachineBase* const StateMachineNode =
 				Cast<UAnimGraphNode_StateMachineBase>(ExistingNode);
+			if (StateMachineNode)
+			{
+				// Do not replay state-machine nested graphs after compile. UE builds
+				// StateMachineDebugData from the exact nodes compiled; replacing or
+				// re-linking them afterwards leaves the editor/debugger with gray,
+				// non-flowing states even though the exported BPY text looks correct.
+				continue;
+			}
 			const bool bIsBlendStackNode = ResolveBlendStackGraph_ImportBpy(ExistingNode) != nullptr;
 			const bool bIsCachedPoseNode =
 				Cast<UAnimGraphNode_SaveCachedPose>(ExistingNode) != nullptr ||
@@ -16085,6 +16266,8 @@ bool ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
 	return true;
 }
 
+FGuid ResolveBlueprintFunctionGuid_ImportBpy(UBlueprint* BP, const FName& FunctionName);
+
 bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 	UBlueprint* BP,
 	int32& OutRepairedCount,
@@ -16341,6 +16524,150 @@ bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 
 	return true;
 }
+
+FGuid ResolveBlueprintFunctionGuid_ImportBpy(UBlueprint* BP, const FName& FunctionName)
+{
+	FGuid FunctionGuid;
+	if (!BP || FunctionName.IsNone())
+	{
+		return FunctionGuid;
+	}
+
+	if (const UClass* const SkeletonClass = BP->SkeletonGeneratedClass)
+	{
+		FBlueprintEditorUtils::GetFunctionGuidFromClassByFieldName(
+			SkeletonClass,
+			FunctionName,
+			FunctionGuid);
+		if (FunctionGuid.IsValid())
+		{
+			return FunctionGuid;
+		}
+	}
+
+	if (const UClass* const GeneratedClass = BP->GeneratedClass)
+	{
+		FBlueprintEditorUtils::GetFunctionGuidFromClassByFieldName(
+			GeneratedClass,
+			FunctionName,
+			FunctionGuid);
+		if (FunctionGuid.IsValid())
+		{
+			return FunctionGuid;
+		}
+	}
+
+	for (UEdGraph* FunctionGraph : BP->FunctionGraphs)
+	{
+		if (FunctionGraph && FunctionGraph->GetFName() == FunctionName)
+		{
+			return FunctionGraph->GraphGuid;
+		}
+	}
+
+	return FunctionGuid;
+}
+
+bool RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
+	UBlueprint* BP,
+	int32& OutRepairedCount,
+	FString& OutError,
+	const TSharedPtr<FJsonObject>* RootJsonForBpyData = nullptr);
+void LogAnimBlueprintStateMachineEntryBindings_ImportBpy(
+	UBlueprint* BP,
+	const TCHAR* StageName);
+bool ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
+	UBlueprint* BP,
+	const TCHAR* StageName,
+	FString& OutError);
+
+bool ValidateAnimBlueprintStateMachineDebugData_ImportBpy(
+	UBlueprint* BP,
+	const TCHAR* StageName,
+	FString& OutError)
+{
+	UAnimBlueprint* const AnimBP = Cast<UAnimBlueprint>(BP);
+	if (!AnimBP)
+	{
+		return true;
+	}
+
+	UAnimBlueprintGeneratedClass* const GeneratedClass = AnimBP->GetAnimBlueprintGeneratedClass();
+	if (!GeneratedClass)
+	{
+		OutError = FString::Printf(
+			TEXT("State-machine debug-data validation failed (%s): generated class is null"),
+			StageName ? StageName : TEXT("unknown"));
+		return false;
+	}
+
+	TArray<UEdGraph*> RootGraphs;
+	BP->GetAllGraphs(RootGraphs);
+	TArray<UEdGraph*> ReachableGraphs;
+	TSet<UEdGraph*> VisitedGraphs;
+	for (UEdGraph* RootGraph : RootGraphs)
+	{
+		GatherReachableGraphs_ImportBpy(RootGraph, VisitedGraphs, ReachableGraphs);
+	}
+
+	TArray<FString> Mismatches;
+	const FAnimBlueprintDebugData& DebugData = GeneratedClass->GetAnimBlueprintDebugData();
+	for (UEdGraph* Graph : ReachableGraphs)
+	{
+		UAnimationStateMachineGraph* const StateMachineGraph = Cast<UAnimationStateMachineGraph>(Graph);
+		if (!StateMachineGraph)
+		{
+			continue;
+		}
+
+		const FStateMachineDebugData* StateDebugData = DebugData.StateMachineDebugData.Find(StateMachineGraph);
+		if (!StateDebugData)
+		{
+			Mismatches.Add(FString::Printf(
+				TEXT("graph=%s missing StateMachineDebugData"),
+				*GetPathNameSafe(StateMachineGraph)));
+			continue;
+		}
+
+		if (!GeneratedClass->BakedStateMachines.IsValidIndex(StateDebugData->MachineIndex))
+		{
+			Mismatches.Add(FString::Printf(
+				TEXT("graph=%s invalid MachineIndex=%d baked_count=%d"),
+				*GetPathNameSafe(StateMachineGraph),
+				StateDebugData->MachineIndex,
+				GeneratedClass->BakedStateMachines.Num()));
+		}
+
+		for (UEdGraphNode* Node : StateMachineGraph->Nodes)
+		{
+			UAnimStateNode* const StateNode = Cast<UAnimStateNode>(Node);
+			if (!StateNode)
+			{
+				continue;
+			}
+
+			if (!StateDebugData->NodeToStateIndex.Contains(StateNode))
+			{
+				Mismatches.Add(FString::Printf(
+					TEXT("graph=%s state=%s missing NodeToStateIndex"),
+					*GetPathNameSafe(StateMachineGraph),
+					*DescribeNode_ImportBpy(StateNode)));
+			}
+		}
+	}
+
+	if (Mismatches.Num() > 0)
+	{
+		OutError = FString::Printf(
+			TEXT("State-machine debug-data validation failed (%s): %s"),
+			StageName ? StageName : TEXT("unknown"),
+			*FString::Join(Mismatches, TEXT("; ")));
+		return false;
+	}
+
+	return true;
+}
+
 
 bool ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
 	UBlueprint* BP,
@@ -22061,15 +22388,7 @@ bool ValidateStandaloneChooserJsonPreflight_ImportBpy(
 			*EffectiveAssetPath);
 		return false;
 	}
-	if (AllText.Contains(TEXT("SandboxCharacter_CMC_ABP_C")))
-	{
-		OutError = FString::Printf(
-			TEXT("Standalone Chooser META preflight failed for %s: still references source SandboxCharacter_CMC_ABP_C."),
-			*EffectiveAssetPath);
-		return false;
-	}
-
-	FRegexMatcher TargetMatcher(FRegexPattern(TEXT("_For_(SandboxCharacter_Mover_ABP[^./']*)")), EffectiveAssetPath);
+	FRegexMatcher TargetMatcher(FRegexPattern(TEXT("_For_([^./']+)")), EffectiveAssetPath);
 	if (TargetMatcher.FindNext())
 	{
 		const FString TargetName = TargetMatcher.GetCaptureGroup(1);
@@ -22101,7 +22420,6 @@ bool ValidateAnimRoundtripJsonPreflight_ImportBpy(
 	AppendJsonStringsForPreflight_ImportBpy(Root, RootText);
 	const bool bLooksLikeSandboxAnimImport =
 		TargetAssetPath.Contains(TEXT("SandboxCharacter_Mover_ABP")) ||
-		RootText.Contains(TEXT("SandboxCharacter_CMC_ABP")) ||
 		RootText.Contains(TEXT("State_Controller")) ||
 		RootText.Contains(TEXT("EvaluateChooser2"));
 	if (!bLooksLikeSandboxAnimImport)
@@ -22126,11 +22444,18 @@ bool ValidateAnimRoundtripJsonPreflight_ImportBpy(
 		return false;
 	}
 
-	if (RootText.Contains(TEXT("EvaluateChooser2")) &&
-		!RootText.Contains(TEXT("CHT_PoseSearchDatabases.CHT_PoseSearchDatabases")))
+	if (RootText.Contains(TEXT("EvaluateChooser2")))
 	{
-		OutError = TEXT("BPY animation preflight failed: Update_MotionMatching EvaluateChooser2 no longer references original CHT_PoseSearchDatabases.");
-		return false;
+		if (!RootText.Contains(TEXT("/Script/Chooser.ChooserTable'")))
+		{
+			OutError = TEXT("BPY animation preflight failed: Update_MotionMatching EvaluateChooser2 has no ChooserTable reference.");
+			return false;
+		}
+		if (!RootText.Contains(TEXT("PoseSearchDatabase")))
+		{
+			OutError = TEXT("BPY animation preflight failed: Update_MotionMatching EvaluateChooser2 does not expose PoseSearchDatabase output.");
+			return false;
+		}
 	}
 
 	return true;
@@ -22899,6 +23224,14 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 		if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
 				BP,
 				Root,
+				TEXT("post_compile"),
+				OutError))
+		{
+			return false;
+		}
+
+		if (!ValidateAnimBlueprintStateMachineDebugData_ImportBpy(
+				BP,
 				TEXT("post_compile"),
 				OutError))
 		{

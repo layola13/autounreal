@@ -7631,6 +7631,14 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeGenericNode(UEdGraphNode* No
 		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("TransitionStart"), true);
 		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("TransitionEnd"), true);
 		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("TransitionInterrupt"), true);
+		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("bSharedRules"), true);
+		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("SharedRulesName"), true);
+		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("SharedRulesGuid"), true);
+		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("SharedColor"), true);
+		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("bSharedCrossfade"), true);
+		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("SharedCrossfadeName"), true);
+		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("SharedCrossfadeGuid"), true);
+		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("SharedCrossfadeIdx"), true);
 		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("bAllowInertializationForSelfTransitions"), true);
 		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("Bidirectional"), true);
 		AddGenericNodePropertyText_ExportBpy(Node, NodeProps, TEXT("bDisabled"), true);

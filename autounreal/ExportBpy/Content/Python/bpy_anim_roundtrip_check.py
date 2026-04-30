@@ -108,6 +108,8 @@ def validate_state_controller_hooks(export_dir: str | Path) -> list[str]:
         "transition nodes": "AnimStateTransitionNode",
         "transition graph results": "AnimGraphNode_TransitionResult",
         "state result hooks": "AnimGraphNode_StateResult",
+        "shared transition rule flags": "bSharedRules",
+        "shared transition colors": "SharedColor",
         "anim getter source node uid": "AnimGetterSourceNodeUid",
         "anim getter source blueprint": "AnimGetterSourceBlueprint",
         "source node uid": "SourceNodeUid",

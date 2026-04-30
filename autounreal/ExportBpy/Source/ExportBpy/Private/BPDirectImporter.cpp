@@ -21998,6 +21998,144 @@ bool ValidateImportedAnimBlueprintAgainstSourceAsset_ImportBpy(
 
 }
 
+
+bool AppendJsonStringsForPreflight_ImportBpy(const TSharedPtr<FJsonObject>& Obj, FString& OutText)
+{
+	if (!Obj.IsValid())
+	{
+		return false;
+	}
+
+	FString JsonText;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonText);
+	if (!FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer))
+	{
+		return false;
+	}
+	OutText += JsonText;
+	return true;
+}
+
+int32 CountSubstringForPreflight_ImportBpy(const FString& Text, const TCHAR* Needle)
+{
+	if (!Needle || !Needle[0])
+	{
+		return 0;
+	}
+
+	int32 Count = 0;
+	int32 SearchStart = 0;
+	const FString NeedleText(Needle);
+	while (Text.Find(NeedleText, ESearchCase::CaseSensitive, ESearchDir::FromStart, SearchStart) != INDEX_NONE)
+	{
+		const int32 FoundAt = Text.Find(NeedleText, ESearchCase::CaseSensitive, ESearchDir::FromStart, SearchStart);
+		++Count;
+		SearchStart = FoundAt + NeedleText.Len();
+	}
+	return Count;
+}
+
+bool ValidateStandaloneChooserJsonPreflight_ImportBpy(
+	const FString& EffectiveAssetPath,
+	const TSharedPtr<FJsonObject>& PropsObj,
+	FString& OutError)
+{
+	if (!PropsObj.IsValid())
+	{
+		return true;
+	}
+
+	FString AssetClassPath;
+	PropsObj->TryGetStringField(TEXT("asset_class"), AssetClassPath);
+	if (!AssetClassPath.Contains(TEXT("ChooserTable")) || !EffectiveAssetPath.Contains(TEXT("_For_")))
+	{
+		return true;
+	}
+
+	FString AllText;
+	AppendJsonStringsForPreflight_ImportBpy(PropsObj, AllText);
+	if (AllText.Contains(TEXT("Class=None")))
+	{
+		OutError = FString::Printf(
+			TEXT("Standalone Chooser META preflight failed for %s: ContextData Class=None would break AnimBlueprint runtime."),
+			*EffectiveAssetPath);
+		return false;
+	}
+	if (AllText.Contains(TEXT("SandboxCharacter_CMC_ABP_C")))
+	{
+		OutError = FString::Printf(
+			TEXT("Standalone Chooser META preflight failed for %s: still references source SandboxCharacter_CMC_ABP_C."),
+			*EffectiveAssetPath);
+		return false;
+	}
+
+	FRegexMatcher TargetMatcher(FRegexPattern(TEXT("_For_(SandboxCharacter_Mover_ABP[^./']*)")), EffectiveAssetPath);
+	if (TargetMatcher.FindNext())
+	{
+		const FString TargetName = TargetMatcher.GetCaptureGroup(1);
+		const FString ExpectedClass = FString::Printf(TEXT("/Game/Blueprints/Test/%s.%s_C"), *TargetName, *TargetName);
+		if (AllText.Contains(TEXT("ContextObjectTypeClass")) && !AllText.Contains(ExpectedClass))
+		{
+			OutError = FString::Printf(
+				TEXT("Standalone Chooser META preflight failed for %s: missing expected target context %s."),
+				*EffectiveAssetPath,
+				*ExpectedClass);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool ValidateAnimRoundtripJsonPreflight_ImportBpy(
+	const TSharedPtr<FJsonObject>& Root,
+	const FString& TargetAssetPath,
+	FString& OutError)
+{
+	if (!Root.IsValid())
+	{
+		return true;
+	}
+
+	FString RootText;
+	AppendJsonStringsForPreflight_ImportBpy(Root, RootText);
+	const bool bLooksLikeSandboxAnimImport =
+		TargetAssetPath.Contains(TEXT("SandboxCharacter_Mover_ABP")) ||
+		RootText.Contains(TEXT("SandboxCharacter_CMC_ABP")) ||
+		RootText.Contains(TEXT("State_Controller")) ||
+		RootText.Contains(TEXT("EvaluateChooser2"));
+	if (!bLooksLikeSandboxAnimImport)
+	{
+		return true;
+	}
+
+	const int32 StateEntryCount = CountSubstringForPreflight_ImportBpy(RootText, TEXT("StateEntryFunction"));
+	const int32 OnStateEntryCount = CountSubstringForPreflight_ImportBpy(RootText, TEXT("OnStateEntry"));
+	if (RootText.Contains(TEXT("State_Controller")) && StateEntryCount < 7)
+	{
+		OutError = FString::Printf(
+			TEXT("BPY animation preflight failed: State Controller has too few StateEntryFunction bindings: %d < 7."),
+			StateEntryCount);
+		return false;
+	}
+	if (RootText.Contains(TEXT("State_Controller")) && OnStateEntryCount < 20)
+	{
+		OutError = FString::Printf(
+			TEXT("BPY animation preflight failed: State Controller has too few OnStateEntry references: %d < 20."),
+			OnStateEntryCount);
+		return false;
+	}
+
+	if (RootText.Contains(TEXT("EvaluateChooser2")) &&
+		!RootText.Contains(TEXT("CHT_PoseSearchDatabases.CHT_PoseSearchDatabases")))
+	{
+		OutError = TEXT("BPY animation preflight failed: Update_MotionMatching EvaluateChooser2 no longer references original CHT_PoseSearchDatabases.");
+		return false;
+	}
+
+	return true;
+}
+
 bool UBPDirectImporter::ImportBlueprintFromJson(
 	const FString& JsonData,
 	const FString& TargetAssetPath,
@@ -22019,6 +22157,11 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
 	{
 		OutError = TEXT("Failed to parse JSON");
+		return false;
+	}
+
+	if (!ValidateAnimRoundtripJsonPreflight_ImportBpy(Root, TargetAssetPath, OutError))
+	{
 		return false;
 	}
 
@@ -26149,6 +26292,11 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 		return false;
 	}
 
+	if (!ValidateStandaloneChooserJsonPreflight_ImportBpy(EffectiveAssetPath, PropsObj, OutError))
+	{
+		return false;
+	}
+
 	UObject* Asset = nullptr;
 	if (bIsStandaloneMeta)
 	{
@@ -26257,3 +26405,4 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 
 	return true;
 }
+

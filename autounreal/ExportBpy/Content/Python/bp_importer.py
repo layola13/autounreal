@@ -332,6 +332,32 @@ def import_directory(
     return bool(details.get("success")), str(details.get("error", ""))
 
 
+def _target_asset_name_from_path(target_path: Optional[str]) -> str:
+    if not target_path:
+        return ""
+    normalized = str(target_path).strip()
+    if "." in normalized:
+        normalized = normalized.rsplit(".", 1)[-1]
+    else:
+        normalized = normalized.rsplit("/", 1)[-1]
+    return normalized[:-2] if normalized.endswith("_C") else normalized
+
+
+def _validate_bpy_roundtrip_preflight(dir_path: str, target_path: Optional[str]) -> Tuple[bool, str]:
+    try:
+        from bpy_anim_roundtrip_check import validate_export_dir
+    except Exception as exc:
+        return False, f"无法加载 BPY 动画往返检测器: {exc}"
+
+    expected_target = _target_asset_name_from_path(target_path)
+    errors, warnings = validate_export_dir(dir_path, expected_target)
+    if errors:
+        return False, "BPY 动画导入前检测失败: " + "; ".join(errors)
+    if warnings:
+        print("[bp_importer] BPY preflight warnings: " + "; ".join(warnings))
+    return True, ""
+
+
 def import_directory_with_details(
     dir_path: str,
     target_path: Optional[str] = None,
@@ -345,6 +371,10 @@ def import_directory_with_details(
     """
     if not os.path.isdir(dir_path):
         return _error_details(f"目录不存在: {dir_path}")
+
+    preflight_ok, preflight_error = _validate_bpy_roundtrip_preflight(dir_path, target_path)
+    if not preflight_ok:
+        return _error_details(preflight_error)
 
     try:
         bp_obj = _exec_directory_dsl(dir_path, include_files=include_files, partial_mode=partial_mode)

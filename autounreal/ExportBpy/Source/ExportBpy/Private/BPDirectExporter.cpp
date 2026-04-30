@@ -4408,7 +4408,7 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 	{
 		if (Info.NodeType == TEXT("AnimGraphNode_TwoWayBlend"))
 		{
-			AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
+			AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("BlendNode"));
 		}
 		else
 		{

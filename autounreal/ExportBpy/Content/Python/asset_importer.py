@@ -14,6 +14,7 @@ import ast
 import copy
 import json
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 
 try:
@@ -43,10 +44,46 @@ def import_asset_meta(meta_path: str, target_path: Optional[str] = None) -> Tupl
     return bool(details.get("success")), str(details.get("error", ""))
 
 
+def _iter_meta_strings(value: Any):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_meta_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_meta_strings(item)
+    elif value is not None:
+        yield str(value)
+
+
+def _validate_standalone_chooser_meta_preflight(meta: Dict[str, Any], target_path: str) -> Tuple[bool, str]:
+    asset_class = str(meta.get("asset_class", "") or "")
+    asset_path = str(target_path or meta.get("asset", "") or "")
+    if "ChooserTable" not in asset_class or "_For_" not in asset_path:
+        return True, ""
+
+    all_text = "\n".join(_iter_meta_strings(meta))
+    if "Class=None" in all_text:
+        return False, "retargeted ChooserTable META has ContextData Class=None"
+    if "SandboxCharacter_CMC_ABP_C" in all_text:
+        return False, "retargeted ChooserTable META still references source SandboxCharacter_CMC_ABP_C"
+
+    match = re.search(r"_For_(SandboxCharacter_Mover_ABP[^./']*)", asset_path)
+    if match:
+        target = match.group(1)
+        expected_class = f"/Game/Blueprints/Test/{target}.{target}_C"
+        if "ContextObjectTypeClass" in all_text and expected_class not in all_text:
+            return False, f"retargeted ChooserTable META missing expected target context {expected_class}"
+    return True, ""
+
+
 def import_asset_meta_dict(meta: Dict[str, Any], target_path: Optional[str] = None) -> Dict[str, Any]:
     normalized_target_path = _normalize_asset_path(target_path or meta.get("asset", ""))
     if not normalized_target_path:
         return {"success": False, "error": "META 缺少目标资产路径"}
+
+    chooser_ok, chooser_error = _validate_standalone_chooser_meta_preflight(meta, normalized_target_path)
+    if not chooser_ok:
+        return {"success": False, "error": "Standalone Chooser META preflight failed: " + chooser_error}
 
     rewritten_meta = _rewrite_meta_for_target(meta, normalized_target_path)
     ok, err = _apply_asset_meta(normalized_target_path, rewritten_meta)

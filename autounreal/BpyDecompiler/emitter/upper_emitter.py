@@ -42,6 +42,7 @@ def _readme(bp: BlueprintIR) -> str:
 
 def _write_roundtrip_manifest(bp: BlueprintIR, out: Path) -> None:
     cst = bp.roundtrip_cst
+    graph_meta_by_file = {graph.source_path.name: _jsonable_graph_meta(graph) for graph in bp.graphs}
     payload = {
         "format": "BpyDecompiler.ExportBpyCst.v2",
         "source_name": bp.name,
@@ -64,6 +65,7 @@ def _write_roundtrip_manifest(bp: BlueprintIR, out: Path) -> None:
                 "blueprint_call": graph.blueprint_call,
                 "footer": graph.footer,
                 "connections": graph.connections,
+                "meta": graph_meta_by_file.get(graph.file_name, {}),
                 "nodes": graph.nodes,
                 "data_edges": graph.data_edges,
                 "exec_edges": graph.exec_edges,
@@ -77,6 +79,11 @@ def _write_roundtrip_manifest(bp: BlueprintIR, out: Path) -> None:
         newline="\n",
     )
 
+
+
+def _jsonable_graph_meta(graph) -> dict:
+    meta = getattr(graph, "meta", {}) or {}
+    return {key: value for key, value in meta.items() if key != "_cst"}
 
 def _write_blueprint_meta(bp: BlueprintIR, out: Path) -> None:
     payload = {

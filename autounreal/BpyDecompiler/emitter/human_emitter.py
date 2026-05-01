@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import builtins
 import keyword
 import pprint
@@ -98,11 +99,59 @@ def emit_human_package(bp: BlueprintIR, lifted_graphs: Iterable[LiftedGraph], ou
     (out / "__init__.py").write_text('"""Human-readable Blueprint source."""\n', encoding="utf-8", newline="\n")
     _write_support_modules(bp, out, lifted_list, local_functions)
     _write_class_defaults(bp, out)
+    _write_human_roundtrip_meta(bp, out)
     _write_blueprint_class(bp, lifted_list, local_functions, out)
     return out
 
 
 
+
+def _write_human_roundtrip_meta(bp: BlueprintIR, out: Path) -> None:
+    cst = bp.roundtrip_cst
+    graph_meta_by_file = {graph.source_path.name: _jsonable_graph_meta(graph) for graph in bp.graphs}
+    payload = {
+        "format": "BpyDecompiler.HumanSource.v1",
+        "compile_payload_format": "BpyDecompiler.ExportBpyCst.v2",
+        "source_name": bp.name,
+        "root": {
+            "graph_modules": cst.root.graph_modules,
+            "blueprint_call": cst.root.blueprint_call,
+            "variables": cst.root.variables,
+            "defaults": cst.root.defaults,
+            "inherited_component_defaults": cst.root.inherited_component_defaults,
+            "components": cst.root.components,
+            "interfaces": cst.root.interfaces,
+            "event_dispatchers": cst.root.event_dispatchers,
+        },
+        "graphs": [
+            {
+                "file_name": graph.file_name,
+                "context_expr": graph.context_expr,
+                "is_sidecar": graph.is_sidecar,
+                "has_sidecar_loader": graph.has_sidecar_loader,
+                "meta_text": graph.meta_text,
+                "blueprint_call": graph.blueprint_call,
+                "footer": graph.footer,
+                "connections": graph.connections,
+                "meta": graph_meta_by_file.get(graph.file_name, {}),
+                "nodes": graph.nodes,
+                "data_edges": graph.data_edges,
+                "exec_edges": graph.exec_edges,
+            }
+            for graph in cst.graphs
+        ],
+    }
+    (out / ".bpy_meta.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+
+def _jsonable_graph_meta(graph) -> dict:
+    meta = getattr(graph, "meta", {}) or {}
+    return {key: value for key, value in meta.items() if key != "_cst"}
 
 def _write_class_defaults(bp: BlueprintIR, out: Path) -> None:
     class_defaults = {str(key): _human_default_value(value) for key, value in bp.defaults}
@@ -1006,8 +1055,8 @@ def _annotation_for_value(value: object) -> str:
 def _readme(bp: BlueprintIR) -> str:
     return (
         f"# {bp.name} humanized Python\n\n"
-        "This directory is optimized for human review. Compile-back metadata stays in the sibling upper package; "
-        "these files intentionally hide Blueprint decorator/type noise where possible.\n"
+        "This directory is optimized for human review and editable-source experiments. "
+        "Lossless compile-back metadata is stored in .bpy_meta.json; human code intentionally hides Blueprint decorator/type noise where possible.\n"
     )
 
 
@@ -1066,11 +1115,13 @@ def _humanize_lines(lines: list[str], graph: GraphIR, local_functions: dict[str,
         text = _replace_empty_self_args(text)
         text = _replace_local_calls(text, local_functions)
         text = _snake_case_constructor_keywords(text, output_class)
+        text = _snake_case_keyword_arguments(text)
         text = _strip_redundant_boolean_parens(text)
         text = re.sub(r"\bReturnValue=None,?", "", text)
         for original, readable in output_field_names.items():
             if original != "ReturnValue":
                 text = re.sub(rf"\b{re.escape(original)}=", f"{readable}=", text)
+        text = re.sub(r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)=\s", r"\g<name> = ", text)
         result.append(text)
     return _rename_local_temporaries(result)
 
@@ -1102,9 +1153,13 @@ def _rename_local_temporaries(lines: list[str]) -> list[str]:
     rewritten: list[str] = []
     for line in lines:
         text = line
+        anchor = ""
+        if "# bpy:" in text:
+            text, anchor = text.split("# bpy:", 1)
+            anchor = "# bpy:" + anchor
         for old, new in sorted(rename_map.items(), key=lambda item: len(item[0]), reverse=True):
             text = re.sub(rf"(?<![\w.]){re.escape(old)}(?![\w])", new, text)
-        rewritten.append(text)
+        rewritten.append(text + anchor)
     return rewritten
 
 
@@ -1212,8 +1267,28 @@ def _replace_readable_helpers(text: str) -> str:
     text = re.sub(r"std\.MoverComponent_GetVelocity\(self=(?P<arg>[^\)]+)\)", r"mover.velocity(\g<arg>)", text)
     text = re.sub(r"std\.MoverComponent_GetTargetOrientation\(self=(?P<arg>[^\)]+)\)", r"mover.target_orientation(\g<arg>)", text)
     text = re.sub(r"std\.MoverComponent_GetMovementIntent\(self=(?P<arg>[^\)]+)\)", r"mover.movement_intent(\g<arg>)", text)
+    text = re.sub(r"std\.MoverComponent_GetLastInputCmd\(self=(?P<arg>[^\)]+)\)", r"mover.last_input_command(\g<arg>)", text)
+    text = _replace_simple_keyword_helper_call(text, "std.MoverDataCollectionLibrary_K2_GetDataFromCollection", "mover.data_from_collection", {"Collection": "collection"})
+    text = _replace_simple_keyword_helper_call(text, "std.MoverDataCollectionLibrary_K2_GetDataFromCollection", "mover.data_from_collection", {"collection": "collection"})
+    text = _replace_simple_keyword_helper_call(text, "std.MoverDataCollectionLibrary_K2_AddDataToCollection", "mover.add_data_to_collection", {"Collection": "collection", "SourceAsRawBytes": "source"})
+    text = _replace_simple_keyword_helper_call(text, "std.MoverDataCollectionLibrary_K2_AddDataToCollection", "mover.add_data_to_collection", {"collection": "collection", "source_as_raw_bytes": "source"})
+    text = _replace_simple_keyword_helper_call(text, "std.MoverDataModelBlueprintLibrary_SetDirectionalInput", "mover.set_directional_input", {"Inputs": "inputs", "DirectionInput": "direction"})
+    text = _replace_simple_keyword_helper_call(text, "std.MoverDataModelBlueprintLibrary_SetDirectionalInput", "mover.set_directional_input", {"inputs": "inputs", "direction_input": "direction"})
+    text = re.sub(r"std\.CharacterMoverComponent_IsCrouching\(self=(?P<arg>[^\)]+)\)", r"mover.is_crouching(\g<arg>)", text)
+    text = re.sub(r"std\.un_crouch\(self=(?P<arg>[^\)]+)\)", r"mover.uncrouch(\g<arg>)", text)
     text = re.sub(r"std\.K2_GetActorRotation\(\)", "actor.rotation()", text)
     text = re.sub(r"std\.GetActorForwardVector\(\)", "actor.forward_vector()", text)
+    text = re.sub(r"std\.GetControlRotation\(\)", "actor.control_rotation()", text)
+    text = re.sub(r"std\.GetController\(\)", "actor.controller()", text)
+    text = _replace_simple_keyword_helper_call(text, "std.GetInputActionValue", "actor.input_action_value", {"InputAction": "action"})
+    text = _replace_simple_keyword_helper_call(text, "std.GetInputActionValue", "actor.input_action_value", {"input_action": "action"})
+    text = _replace_simple_keyword_helper_call(text, "std.AddControllerYawInput", "actor.add_controller_yaw_input", {"Val": "value"})
+    text = _replace_simple_keyword_helper_call(text, "std.AddControllerYawInput", "actor.add_controller_yaw_input", {"val": "value"})
+    text = _replace_simple_keyword_helper_call(text, "std.AddControllerPitchInput", "actor.add_controller_pitch_input", {"Val": "value"})
+    text = _replace_simple_keyword_helper_call(text, "std.AddControllerPitchInput", "actor.add_controller_pitch_input", {"val": "value"})
+    text = re.sub(r"std\.GetTransform\(\)", "actor.transform()", text)
+    text = re.sub(r"std\.K2_GetActorLocation\(\)", "actor.location()", text)
+    text = _replace_simple_keyword_helper_call(text, "std.K2_GetActorLocation", "actor.location", {"self": "actor"})
     text = re.sub(r"std\.vsize_xy\(A=(?P<arg>[^\)]+)\)", r"vectors.size_xy(\g<arg>)", text)
     text = re.sub(
         r"math\.LessLess_VectorRotator\(B=(?P<rotation>actor\.rotation\(\)), A=mover\.velocity\((?P<component>[^\)]+)\)\)",
@@ -1364,6 +1439,14 @@ def _enum_context_for_expression(text: str, previous: str = "MovementMode") -> s
     if "MovementMode" in text:
         return "MovementMode"
     return previous
+
+
+def _snake_case_keyword_arguments(text: str) -> str:
+    return re.sub(
+        r"(?P<prefix>[(,]\s*)(?P<name>[A-Z][A-Za-z0-9_]*)\s*=",
+        lambda match: f"{match.group('prefix')}{_snake_case(match.group('name'))}=",
+        text,
+    )
 
 
 def _snake_case_constructor_keywords(text: str, class_name: str) -> str:
@@ -1773,3 +1856,4 @@ def _split_call_args(source: str) -> list[str]:
     if tail:
         parts.append(tail)
     return parts
+

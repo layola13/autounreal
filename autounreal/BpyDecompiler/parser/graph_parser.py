@@ -13,7 +13,7 @@ def parse_graph_file(path: str | Path) -> GraphIR:
     graph_path = Path(path).resolve()
     source = graph_path.read_text(encoding="utf-8")
     module = ast.parse(source, filename=str(graph_path))
-    meta = _load_meta(graph_path)
+    meta, meta_text = _load_meta(graph_path)
     graph = GraphIR(
         stem=graph_path.name[:-6] if graph_path.name.endswith(".bp.py") else graph_path.stem,
         graph_name=_default_graph_name(graph_path),
@@ -46,6 +46,7 @@ def _capture_graph_cst(source: str, with_stmt: ast.With, graph: GraphIR) -> None
         context_expr=context_expr,
         is_sidecar=graph.source_path.name.startswith("other_"),
         has_sidecar_loader="def _load_sidecar_graph" in source,
+        meta_text=str(graph.meta.get("_meta_text") or ""),
         blueprint_call=_find_nested_blueprint_call(source, with_stmt),
         footer=_find_sidecar_footer(source) if graph.source_path.name.startswith("other_") else [],
         connections=_find_sidecar_connections(source, with_stmt) if graph.source_path.name.startswith("other_") else [],
@@ -131,17 +132,20 @@ def _cst_edge_is_exec(line: str, src: PinRefIR | None, dst: PinRefIR | None) -> 
     return bool(src and dst and (_is_exec_pin(src.pin) or _is_exec_pin(dst.pin)))
 
 
-def _load_meta(graph_path: Path) -> dict[str, Any]:
+def _load_meta(graph_path: Path) -> tuple[dict[str, Any], str]:
     meta_path = graph_path.with_name(graph_path.name[:-6] + "_meta.py")
     if not meta_path.is_file():
-        return {}
+        return {}, ""
+    meta_text = meta_path.read_text(encoding="utf-8")
     spec = importlib.util.spec_from_file_location(f"_bpy_decompile_meta_{graph_path.stem}", meta_path)
     if spec is None or spec.loader is None:
-        return {}
+        return {"_meta_text": meta_text}, meta_text
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     value = getattr(module, "META", {})
-    return value if isinstance(value, dict) else {}
+    meta = value if isinstance(value, dict) else {}
+    meta["_meta_text"] = meta_text
+    return meta, meta_text
 
 
 def _find_graph_with(module: ast.Module) -> ast.With | None:
@@ -255,3 +259,4 @@ def _default_graph_name(path: Path) -> str:
     if name.startswith("macro_"):
         return name[6:]
     return name
+

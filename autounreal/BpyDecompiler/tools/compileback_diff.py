@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from Plugins.autounreal.autounreal.BpyDecompiler.api import decompile_blueprint
-from Plugins.autounreal.autounreal.BpyDecompiler.compiler import emit_bpy_package_from_upper
+from Plugins.autounreal.autounreal.BpyDecompiler.compiler import emit_bpy_package_from_human, emit_bpy_package_from_upper
 
 
 def _ensure_exportbpy_python_path() -> None:
@@ -25,10 +25,14 @@ class DiffResult:
     compiled_dir: Path
     semantic_compiled_dir: Path
     human_dir: Path
+    human_compiled_dir: Path
     semantic_ok: bool
     differing: list[str]
     missing: list[str]
     extra: list[str]
+    human_differing: list[str]
+    human_missing: list[str]
+    human_extra: list[str]
 
 
 def validate_compileback_diff(exported_dir: str | Path, work_dir: str | Path, *, label: str | None = None) -> DiffResult:
@@ -40,17 +44,44 @@ def validate_compileback_diff(exported_dir: str | Path, work_dir: str | Path, *,
     compiled_dir = work / f"{name}_compiled_bpy"
     semantic_compiled_dir = work / f"{name}_semantic_compiled_bpy"
     human_dir = work / f"{name}_human"
+    human_compiled_dir = work / f"{name}_human_compiled_bpy"
     shutil.rmtree(upper_dir, ignore_errors=True)
     shutil.rmtree(compiled_dir, ignore_errors=True)
     shutil.rmtree(semantic_compiled_dir, ignore_errors=True)
     shutil.rmtree(human_dir, ignore_errors=True)
+    shutil.rmtree(human_compiled_dir, ignore_errors=True)
     upper_result = decompile_blueprint(source, upper_dir, human_dir)
     if not upper_result.ok:
         print(f"warning: decompile produced diagnostics for {source}")
     emit_bpy_package_from_upper(upper_dir, compiled_dir)
+    emit_bpy_package_from_human(human_dir, human_compiled_dir)
     semantic_ok = _compile_upper_semantic_to_tmp(upper_dir, source, semantic_compiled_dir)
     differing, missing, extra = _diff_non_meta_py(source, compiled_dir)
-    return DiffResult(not differing and not missing and not extra and semantic_ok, upper_dir, compiled_dir, semantic_compiled_dir, human_dir, semantic_ok, differing, missing, extra)
+    human_differing, human_missing, human_extra = _diff_non_meta_py(source, human_compiled_dir)
+    ok = (
+        not differing
+        and not missing
+        and not extra
+        and not human_differing
+        and not human_missing
+        and not human_extra
+        and semantic_ok
+    )
+    return DiffResult(
+        ok,
+        upper_dir,
+        compiled_dir,
+        semantic_compiled_dir,
+        human_dir,
+        human_compiled_dir,
+        semantic_ok,
+        differing,
+        missing,
+        extra,
+        human_differing,
+        human_missing,
+        human_extra,
+    )
 
 
 def _compile_upper_semantic_to_tmp(upper_dir: Path, source_dir: Path, output_dir: Path) -> bool:
@@ -105,9 +136,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"compiled_dir={result.compiled_dir}")
     print(f"semantic_compiled_dir={result.semantic_compiled_dir}")
     print(f"human_dir={result.human_dir}")
+    print(f"human_compiled_dir={result.human_compiled_dir}")
     print(f"semantic_ok={result.semantic_ok}")
     print(f"differing={len(result.differing)} missing={len(result.missing)} extra={len(result.extra)}")
-    for title, values in (("DIFF", result.differing), ("MISSING", result.missing), ("EXTRA", result.extra)):
+    print(
+        f"human_differing={len(result.human_differing)} "
+        f"human_missing={len(result.human_missing)} human_extra={len(result.human_extra)}"
+    )
+    for title, values in (
+        ("DIFF", result.differing),
+        ("MISSING", result.missing),
+        ("EXTRA", result.extra),
+        ("HUMAN_DIFF", result.human_differing),
+        ("HUMAN_MISSING", result.human_missing),
+        ("HUMAN_EXTRA", result.human_extra),
+    ):
         for value in values[:50]:
             print(f"{title}: {value}")
     return 0 if result.ok else 1

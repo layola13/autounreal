@@ -72,6 +72,7 @@ class GraphCstIR:
     context_expr: str
     is_sidecar: bool = False
     has_sidecar_loader: bool = False
+    meta_text: str = ""
     blueprint_call: str = ""
     footer: list[str] = field(default_factory=list)
     connections: list[str] = field(default_factory=list)

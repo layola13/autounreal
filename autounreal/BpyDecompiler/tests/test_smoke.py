@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from Plugins.autounreal.autounreal.BpyDecompiler.compiler import emit_bpy_package_from_human
 from Plugins.autounreal.autounreal.BpyDecompiler.parser import parse_blueprint_package
 from Plugins.autounreal.autounreal.BpyDecompiler.tools.compileback_diff import validate_compileback_diff
 from Plugins.autounreal.autounreal.BpyDecompiler.tools.upper_check import check_upper_dir
@@ -33,12 +34,18 @@ class BpyDecompilerRoundtripTests(unittest.TestCase):
         self.assertEqual([], result.missing)
         self.assertEqual([], result.extra)
         self.assertEqual([], result.differing)
+        self.assertEqual([], result.human_missing)
+        self.assertEqual([], result.human_extra)
+        self.assertEqual([], result.human_differing)
 
     def test_abp_compileback_diff_matches_non_meta_bpy(self) -> None:
         result = validate_compileback_diff(SAMPLES["ABP"], WORK_DIR, label="ABP")
         self.assertEqual([], result.missing)
         self.assertEqual([], result.extra)
         self.assertEqual([], result.differing)
+        self.assertEqual([], result.human_missing)
+        self.assertEqual([], result.human_extra)
+        self.assertEqual([], result.human_differing)
 
 
     def test_cbp_human_traversal_is_source_style_python(self) -> None:
@@ -118,9 +125,16 @@ class BpyDecompilerRoundtripTests(unittest.TestCase):
         self.assertNotIn("system.GetConsoleVariableIntValue", source)
         self.assertNotIn("strings.Concat_StrStr", source)
         self.assertNotIn("math.Clamp(", source)
+        self.assertIn("def get_movement_direction_from_thresholds(self, thresholds, direction) -> MovementDirection:", source)
+        self.assertIn("thresholds=self.get_movement_direction_thresholds()", source)
+        self.assertIn("direction=self.MovementDirectionAngle", source)
+        self.assertNotIn("def get_movement_direction_from_thresholds(self, Thresholds, Direction)", source)
+        self.assertNotIn("Thresholds=self.get_movement_direction_thresholds()", source)
+        self.assertNotIn("Direction=self.MovementDirectionAngle", source)
 
     def test_human_outputs_include_blueprint_defaults(self) -> None:
         cbp_result = validate_compileback_diff(SAMPLES["CBP"], WORK_DIR, label="CBP")
+        self.assertTrue((cbp_result.human_dir / ".bpy_meta.json").is_file())
         cbp_defaults = (cbp_result.human_dir / "class_defaults.py").read_text(encoding="utf-8")
         self.assertIn("CLASS_DEFAULTS", cbp_defaults)
         self.assertIn("'bReplicateMovement': False", cbp_defaults)
@@ -133,6 +147,119 @@ class BpyDecompilerRoundtripTests(unittest.TestCase):
         self.assertIn("'TargetSkeleton':", abp_defaults)
         self.assertIn("'PreviewSkeletalMesh':", abp_defaults)
 
+    def test_human_class_defaults_edit_compiles_to_bpy_change(self) -> None:
+        result = validate_compileback_diff(SAMPLES["CBP"], WORK_DIR, label="CBP_EDIT")
+        defaults_path = result.human_dir / "class_defaults.py"
+        source = defaults_path.read_text(encoding="utf-8")
+        source = source.replace("'bReplicateMovement': False", "'bReplicateMovement': True")
+        source = source.replace("'CapsuleHalfHeight': 86.0", "'CapsuleHalfHeight': 90.0")
+        defaults_path.write_text(source, encoding="utf-8", newline="\n")
+
+        edited_dir = WORK_DIR / "CBP_EDIT_human_edited_bpy"
+        emit_bpy_package_from_human(result.human_dir, edited_dir)
+        root_source = (edited_dir / "__bp__.bp.py").read_text(encoding="utf-8")
+
+        self.assertIn('bp.default("bReplicateMovement", True)', root_source)
+        self.assertIn("CapsuleHalfHeight", root_source)
+        self.assertIn("90.0", root_source)
+        self.assertTrue(edited_dir.is_dir())
+
+    def test_human_variable_defaults_edit_compiles_to_bpy_change(self) -> None:
+        result = validate_compileback_diff(SAMPLES["CBP"], WORK_DIR, label="CBP_VAR_EDIT")
+        defaults_path = result.human_dir / "class_defaults.py"
+        source = defaults_path.read_text(encoding="utf-8")
+        source = source.replace("'Jump_JustPressed': False", "'Jump_JustPressed': True")
+        source = source.replace("'ControlRotationRate': 0.0", "'ControlRotationRate': 12.5")
+        defaults_path.write_text(source, encoding="utf-8", newline="\n")
+
+        edited_dir = WORK_DIR / "CBP_VAR_EDIT_human_edited_bpy"
+        emit_bpy_package_from_human(result.human_dir, edited_dir)
+        root_source = (edited_dir / "__bp__.bp.py").read_text(encoding="utf-8")
+
+        self.assertIn("Jump_JustPressed", root_source)
+        self.assertIn("default='True'", root_source)
+        self.assertIn("ControlRotationRate", root_source)
+        self.assertIn("default='12.500000'", root_source)
+        self.assertTrue(edited_dir.is_dir())
+
+    def test_human_enum_return_anchor_edit_compiles_to_bpy_change(self) -> None:
+        result = validate_compileback_diff(SAMPLES["CBP"], WORK_DIR, label="CBP_LOGIC_EDIT")
+        blueprint_path = result.human_dir / "blueprint.py"
+        source = blueprint_path.read_text(encoding="utf-8")
+        source = source.replace(
+            "return Gait.SPRINT  # bpy: Return__7.ReturnValue",
+            "return Gait.WALK  # bpy: Return__7.ReturnValue",
+            1,
+        )
+        blueprint_path.write_text(source, encoding="utf-8", newline="\n")
+
+        edited_dir = WORK_DIR / "CBP_LOGIC_EDIT_human_edited_bpy"
+        emit_bpy_package_from_human(result.human_dir, edited_dir)
+        graph_source = (edited_dir / "fn_Get_Gait.bp.py").read_text(encoding="utf-8")
+
+        self.assertIn('Return__7.pin("ReturnValue", "NewEnumerator0")', graph_source)
+        self.assertNotIn('Return__7.pin("ReturnValue", "NewEnumerator2")', graph_source)
+        self.assertTrue(edited_dir.is_dir())
+
+    def test_human_rotation_mode_return_anchor_edit_compiles_to_bpy_change(self) -> None:
+        result = validate_compileback_diff(SAMPLES["CBP"], WORK_DIR, label="CBP_ROTATION_LOGIC_EDIT")
+        blueprint_path = result.human_dir / "blueprint.py"
+        source = blueprint_path.read_text(encoding="utf-8")
+        source = source.replace(
+            "return RotationMode.STRAFE  # bpy: Return__4.ReturnValue",
+            "return RotationMode.AIM  # bpy: Return__4.ReturnValue",
+            1,
+        )
+        blueprint_path.write_text(source, encoding="utf-8", newline="\n")
+
+        edited_dir = WORK_DIR / "CBP_ROTATION_LOGIC_EDIT_human_edited_bpy"
+        emit_bpy_package_from_human(result.human_dir, edited_dir)
+        graph_source = (edited_dir / "fn_Get_RotationMode.bp.py").read_text(encoding="utf-8")
+
+        self.assertIn('Return__4.pin("ReturnValue", "NewEnumerator2")', graph_source)
+        self.assertNotIn('Return__4.pin("ReturnValue", "NewEnumerator1")', graph_source)
+        self.assertTrue(edited_dir.is_dir())
+
+    def test_human_struct_return_anchor_edit_compiles_to_bpy_change(self) -> None:
+        result = validate_compileback_diff(SAMPLES["CBP"], WORK_DIR, label="CBP_STRUCT_LOGIC_EDIT")
+        blueprint_path = result.human_dir / "blueprint.py"
+        source = blueprint_path.read_text(encoding="utf-8")
+        source = source.replace(
+            "return MovementDirectionThresholds(fl=-60, fr=60, bl=-120, br=120)  # bpy: Return__0",
+            "return MovementDirectionThresholds(fl=-55, fr=65, bl=-125, br=115)  # bpy: Return__0",
+            1,
+        )
+        blueprint_path.write_text(source, encoding="utf-8", newline="\n")
+
+        edited_dir = WORK_DIR / "CBP_STRUCT_LOGIC_EDIT_human_edited_bpy"
+        emit_bpy_package_from_human(result.human_dir, edited_dir)
+        graph_source = (edited_dir / "fn_Get_MovementDirectionThresholds.bp.py").read_text(encoding="utf-8")
+
+        self.assertIn('Return__0.pin("ReturnValue_FL_3_747C69604F939E7EFF347D97BBD8A811", -55)', graph_source)
+        self.assertIn('Return__0.pin("ReturnValue_FR_5_790F2C4742CB53A5585DBFAF660F9CF0", 65)', graph_source)
+        self.assertIn('Return__0.pin("ReturnValue_BL_7_630ADC5A4B6C3AF9DA182E816EDB311B", -125)', graph_source)
+        self.assertIn('Return__0.pin("ReturnValue_BR_9_67DF35F84900050330F770A709E84CF7", 115)', graph_source)
+        self.assertTrue(edited_dir.is_dir())
+
+    def test_human_call_literal_anchor_edit_compiles_to_bpy_change(self) -> None:
+        result = validate_compileback_diff(SAMPLES["CBP"], WORK_DIR, label="CBP_CALL_LOGIC_EDIT")
+        blueprint_path = result.human_dir / "blueprint.py"
+        source = blueprint_path.read_text(encoding="utf-8")
+        source = source.replace(
+            "std.ActorComponent_Activate(self=self.Camera, bReset=False)  # bpy: Activate",
+            "std.ActorComponent_Activate(self=self.Camera, bReset=True)  # bpy: Activate",
+            1,
+        )
+        blueprint_path.write_text(source, encoding="utf-8", newline="\n")
+
+        edited_dir = WORK_DIR / "CBP_CALL_LOGIC_EDIT_human_edited_bpy"
+        emit_bpy_package_from_human(result.human_dir, edited_dir)
+        graph_source = (edited_dir / "fn_SetupCamera.bp.py").read_text(encoding="utf-8")
+
+        self.assertIn('Activate.pin("bReset", True)', graph_source)
+        self.assertNotIn('Activate.pin("bReset", False)', graph_source)
+        self.assertTrue(edited_dir.is_dir())
+
     def test_upper_python_passes_checker(self) -> None:
         for label, sample_dir in SAMPLES.items():
             with self.subTest(label=label):
@@ -143,11 +270,13 @@ class BpyDecompilerRoundtripTests(unittest.TestCase):
     def test_upper_and_human_outputs_have_separate_roles(self) -> None:
         result = validate_compileback_diff(SAMPLES["CBP"], WORK_DIR, label="CBP")
         upper_readme = (result.upper_dir / "README.md").read_text(encoding="utf-8")
+        human_readme = (result.human_dir / "README.md").read_text(encoding="utf-8")
         human_source = (result.human_dir / "blueprint.py").read_text(encoding="utf-8")
         upper_function = (result.upper_dir / "fn_Get_CurrentMovementMode.py").read_text(encoding="utf-8")
 
         self.assertIn("lossless compile-back representation", upper_readme)
         self.assertIn("sibling *_human/blueprint.py", upper_readme)
+        self.assertIn(".bpy_meta.json", human_readme)
         self.assertIn("@std.function", upper_function)
         self.assertIn("def graph", upper_function)
         self.assertIn("class SandboxCharacterMover(Pawn):", human_source)
@@ -157,3 +286,5 @@ class BpyDecompilerRoundtripTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

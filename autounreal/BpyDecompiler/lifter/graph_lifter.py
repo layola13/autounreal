@@ -244,9 +244,10 @@ class GraphLifter:
             return [f"self.{target} = {value}"]
         if node.kind in {"call", "message"}:
             call = self._call_expr(node)
+            anchor = f"  # bpy: {node.name}"
             if self._has_data_consumers(node):
-                return [f"{self._temp_name(node)} = {call}"]
-            return [call]
+                return [f"{self._temp_name(node)} = {call}{anchor}"]
+            return [f"{call}{anchor}"]
         return [self._opaque_node_statement(node)]
 
     def _opaque_node_statement(self, node: NodeIR) -> str:
@@ -328,12 +329,13 @@ class GraphLifter:
     def _emit_return(self, node: NodeIR) -> str:
         output_names = [name for name, _type in self.graph.outputs] or self._output_pins(node)
         if not output_names:
-            return "return"
+            return f"return  # bpy: {node.name}"
         values = [self._expr_for_pin(node.name, name) or self._pin_default(node, name) or "None" for name in output_names]
+        anchor = f"  # bpy: {node.name}" if len(output_names) != 1 else f"  # bpy: {node.name}.{output_names[0]}"
         if len(values) == 1:
-            return f"return {values[0]}"
+            return f"return {values[0]}{anchor}"
         pairs = ", ".join(f"{self._readable_pin_name(name)}={value}" for name, value in zip(output_names, values))
-        return f"return std.output({pairs})"
+        return f"return std.output({pairs}){anchor}"
 
     def _call_expr(self, node: NodeIR, wanted_pin: str | None = None) -> str:
         special = self._special_call_expr(node)

@@ -499,6 +499,102 @@ def _forward_unreal_command(command: str, params: Optional[Dict[str, Any]] = Non
         return {"success": False, "message": str(e)}
 
 
+def _first_nonempty(*values: str) -> str:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+
+def _extract_result(response: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(response.get("result"), dict):
+        return response["result"]
+    return response
+
+
+def _export_humanpy_via_bpydecompiler(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Export BPY through Unreal, then decompile that BPY with BpyDecompiler."""
+    try:
+        from pathlib import Path
+        import shutil
+        import sys
+
+        plugin_root = Path(__file__).resolve().parents[2]
+        project_root = Path(__file__).resolve().parents[5]
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+
+        from Plugins.autounreal.autounreal.BpyDecompiler.api import decompile_blueprint
+
+        output_arg = _first_nonempty(
+            str(params.get("output_path") or ""),
+            str(params.get("output_dir") or ""),
+            str(params.get("output_directory") or ""),
+            str(params.get("path") or ""),
+        )
+        output_root = Path(output_arg).resolve() if output_arg else (project_root / "tmp" / "exporthumanpy")
+        scratch_root = output_root / "_bpy_reference_export"
+        shutil.rmtree(scratch_root, ignore_errors=True)
+        scratch_root.mkdir(parents=True, exist_ok=True)
+
+        bpy_params = dict(params)
+        for key in ("output_dir", "output_directory", "output_file", "path"):
+            bpy_params.pop(key, None)
+        bpy_params["output_path"] = str(scratch_root)
+        export_response = _forward_unreal_command("export_blueprint_bpy", bpy_params)
+        export_result = _extract_result(export_response)
+        if not bool(export_response.get("success", export_result.get("success", False))):
+            return {
+                "success": False,
+                "message": "export_blueprint_bpy failed before BpyDecompiler decompile",
+                "export_response": export_response,
+            }
+
+        exported_dir = Path(str(export_result.get("output_dir") or ""))
+        if not exported_dir.is_dir():
+            output_path = Path(str(export_result.get("output_path") or ""))
+            exported_dir = output_path.parent if output_path else Path("")
+        if not exported_dir.is_dir() or not (exported_dir / "__bp__.bp.py").is_file():
+            return {
+                "success": False,
+                "message": f"ExportBpy output package not found: {exported_dir}",
+                "export_response": export_response,
+            }
+
+        blueprint_name = str(export_result.get("blueprint_name") or exported_dir.name)
+        human_dir = output_root / f"{blueprint_name}_human"
+        upper_dir = output_root / f"{blueprint_name}_upper"
+        shutil.rmtree(human_dir, ignore_errors=True)
+        shutil.rmtree(upper_dir, ignore_errors=True)
+        decompile_result = decompile_blueprint(exported_dir, upper_dir, human_dir)
+        diagnostics = [
+            {
+                "level": item.level,
+                "message": item.message,
+                "graph": item.graph,
+                "node": item.node,
+            }
+            for item in decompile_result.diagnostics
+        ]
+        return {
+            "success": bool(decompile_result.ok),
+            "asset_path": export_result.get("asset_path") or params.get("asset_path") or params.get("target") or "",
+            "blueprint_name": blueprint_name,
+            "format": "humanpy_directory",
+            "producer": "BpyDecompiler",
+            "output_dir": str(human_dir),
+            "output_path": str(human_dir / "blueprint.py"),
+            "upper_dir": str(upper_dir),
+            "bpy_reference_dir": str(exported_dir),
+            "diagnostics": diagnostics,
+            "export_response": export_response,
+        }
+    except Exception as exc:
+        logger.exception("exporthumanpy via BpyDecompiler failed")
+        return {"success": False, "message": str(exc)}
+
+
 def _normalize_asset_path_for_editor_load(path: str) -> str:
     """Normalize blueprint object paths to package paths for unreal.load_asset."""
     candidate = (path or "").strip()
@@ -2079,6 +2175,72 @@ def export_asset_bpy(
     _maybe_add_param(params, "output_file", output_file)
     _maybe_add_param(params, "path", path)
     return _forward_unreal_command("export_asset_bpy", params)
+
+
+@mcp.tool()
+def export_asset_humanpy(
+    target: str = "",
+    asset_path: str = "",
+    blueprint_path: str = "",
+    soft_path_from_project_root: str = "",
+    blueprint_name: str = "",
+    blueprint: str = "",
+    output_path: str = "",
+    output_dir: str = "",
+    output_directory: str = "",
+    output_file: str = "",
+    path: str = ""
+) -> Dict[str, Any]:
+    """Export human Python package by ExportBpy + BpyDecompiler using the asset alias."""
+    params: Dict[str, Any] = {}
+    _apply_blueprint_target_params(
+        params,
+        target=target,
+        asset_path=asset_path,
+        blueprint_path=blueprint_path,
+        soft_path_from_project_root=soft_path_from_project_root,
+        blueprint_name=blueprint_name,
+        blueprint=blueprint
+    )
+    _maybe_add_param(params, "output_path", output_path)
+    _maybe_add_param(params, "output_dir", output_dir)
+    _maybe_add_param(params, "output_directory", output_directory)
+    _maybe_add_param(params, "output_file", output_file)
+    _maybe_add_param(params, "path", path)
+    return _export_humanpy_via_bpydecompiler(params)
+
+
+@mcp.tool()
+def export_blueprint_humanpy(
+    target: str = "",
+    asset_path: str = "",
+    blueprint_path: str = "",
+    soft_path_from_project_root: str = "",
+    blueprint_name: str = "",
+    blueprint: str = "",
+    output_path: str = "",
+    output_dir: str = "",
+    output_directory: str = "",
+    output_file: str = "",
+    path: str = ""
+) -> Dict[str, Any]:
+    """Export human Python package by ExportBpy + BpyDecompiler."""
+    params: Dict[str, Any] = {}
+    _apply_blueprint_target_params(
+        params,
+        target=target,
+        asset_path=asset_path,
+        blueprint_path=blueprint_path,
+        soft_path_from_project_root=soft_path_from_project_root,
+        blueprint_name=blueprint_name,
+        blueprint=blueprint
+    )
+    _maybe_add_param(params, "output_path", output_path)
+    _maybe_add_param(params, "output_dir", output_dir)
+    _maybe_add_param(params, "output_directory", output_directory)
+    _maybe_add_param(params, "output_file", output_file)
+    _maybe_add_param(params, "path", path)
+    return _export_humanpy_via_bpydecompiler(params)
 
 
 @mcp.tool()

@@ -68,6 +68,25 @@ def _has_pose_search_database_result(meta_text: str) -> bool:
 
 
 
+def _is_anim_blueprint_export(export_path: Path, graph_texts: str = "") -> bool:
+    root_path = export_path / "__bp__.bp.py"
+    if not root_path.exists():
+        root_path = export_path / f"{export_path.name}.bp.py"
+    root_text = root_path.read_text(encoding="utf-8", errors="ignore") if root_path.exists() else ""
+    bp_type_match = re.search(r"bp_type\s*=\s*['\"]([^'\"]+)['\"]", root_text)
+    if bp_type_match:
+        return bp_type_match.group(1).lower() in {"animblueprint", "animationblueprint"}
+    all_text = root_text + "\n" + graph_texts
+    if "AnimGraphNode_" in all_text:
+        return True
+    if re.search(r"parent\s*=\s*['\"][^'\"]*AnimInstance", root_text):
+        return True
+    if "fn_AnimGraph.bp.py" in all_text or (export_path / "fn_AnimGraph.bp.py").exists():
+        return True
+    return False
+
+
+
 def _state_controller_hook_counts(export_path: Path) -> dict[str, int]:
     patterns = (
         "StateEntryFunction",
@@ -130,6 +149,37 @@ def validate_state_controller_hooks(export_dir: str | Path) -> list[str]:
 
 
 
+
+def validate_anim_node_fallback_defaults(export_dir: str | Path) -> list[str]:
+    export_path = Path(export_dir)
+    errors: list[str] = []
+    anim_graph = export_path / "fn_AnimGraph.bp.py"
+    if not anim_graph.exists():
+        return errors
+
+    text = anim_graph.read_text(encoding="utf-8", errors="ignore")
+    if "AnimGraphNode_OffsetRootBone" in text and "BindingPropertyBindings" in text:
+        required = {
+            "OffsetRootBone RotationMode fallback": 'AnimGraphNode_OffsetRootBone.pin("RotationMode", "Accumulate")',
+            "OffsetRootBone TranslationHalflife fallback": 'AnimGraphNode_OffsetRootBone.pin("TranslationHalflife", 0.200000)',
+            "OffsetRootBone MaxTranslationError fallback": 'AnimGraphNode_OffsetRootBone.pin("MaxTranslationError", 30.000000)',
+            "OffsetRootBone Node RotationMode": "RotationMode=Accumulate",
+            "OffsetRootBone Node MaxTranslationError": "MaxTranslationError=30.000000",
+        }
+        for label, token in required.items():
+            if token not in text:
+                errors.append(f"AnimGraph missing {label}; bound AnimNode fallback defaults were likely stripped")
+
+    if "AnimGraphNode_MotionMatching" in text and "BindingPropertyBindings" in text:
+        if 'AnimGraphNode_MotionMatching.pin("BlendTime", 0.500000)' not in text and "BlendTime=0.500000" not in text:
+            errors.append("AnimGraph missing MotionMatching BlendTime fallback 0.500000")
+
+    if "AnimGraphNode_BlendStack" in text and "BindingPropertyBindings" in text:
+        if 'AnimGraphNode_BlendStack.pin("BlendTime", 0.000000)' not in text and "BlendTime=0.000000" not in text:
+            errors.append("AnimGraph missing BlendStack BlendTime fallback 0.000000")
+
+    return errors
+
 def validate_update_motion_matching(export_dir: str | Path, expected_target: str = "") -> list[str]:
     export_path = Path(export_dir)
     errors: list[str] = []
@@ -184,6 +234,11 @@ def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tu
         path.read_text(encoding="utf-8", errors="ignore")
         for path in export_path.glob("*.bp.py")
     )
+    is_anim_blueprint = _is_anim_blueprint_export(export_path, graph_texts)
+    if not is_anim_blueprint:
+        warnings.append("non-AnimBlueprint export; skipped animation roundtrip preflight")
+        return errors, warnings
+
     if not meta_files:
         chooser_refs = RE_CHOOSER_REF.findall(graph_texts)
         if chooser_refs:
@@ -194,6 +249,7 @@ def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tu
             warnings.append("no ChooserTable dependencies detected")
         errors.extend(validate_state_controller_hooks(export_path))
         errors.extend(validate_update_motion_matching(export_path, expected_target))
+        errors.extend(validate_anim_node_fallback_defaults(export_path))
         return errors, warnings
 
     seen_targets: set[str] = set()
@@ -242,7 +298,9 @@ def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tu
         warnings.append(f"no retargeted chooser assets found for expected target '{expected_target}'")
     errors.extend(validate_state_controller_hooks(export_path))
     errors.extend(validate_update_motion_matching(export_path, expected_target))
+    errors.extend(validate_anim_node_fallback_defaults(export_path))
     return errors, warnings
+
 
 
 

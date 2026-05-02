@@ -4397,7 +4397,7 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 					(!LogicalPinName.IsEmpty() && AnimBindingDrivenPins.Contains(LogicalPinName)) ? TEXT("true") : TEXT("false"));
 			}
 
-			if (!bIsAnimBindingDrivenInput && !PinDefaultValue.IsEmpty())
+			if (!PinDefaultValue.IsEmpty())
 			{
 				Info.DefaultValues.Add(PinNameForMetadata, PinDefaultValue);
 			}
@@ -4450,20 +4450,10 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 			}
 		}
 
-		// Strip bound fields from the serialized `Node=(...)` struct so that
-		// re-import doesn't overwrite the PropertyBindings-driven values with
-		// stale in-memory constants cached inside the FAnimNode_* struct.
-		if (AnimBindingDrivenPins.Num() > 0)
-		{
-			if (FString* NodeStruct = Info.NodeProps.Find(TEXT("Node")))
-			{
-				StripBoundFieldsFromStructText_ExportBpy(*NodeStruct, AnimBindingDrivenPins);
-				if (NodeStruct->IsEmpty() || *NodeStruct == TEXT("()"))
-				{
-					Info.NodeProps.Remove(TEXT("Node"));
-				}
-			}
-		}
+		// Keep bound fields in the serialized `Node=(...)` struct. UE can use
+		// these values as the node's fallback/default data before or outside the
+		// generated property-access path; dropping them changes OffsetRootBone and
+		// motion matching behavior even when the BindingPropertyBindings map round-trips.
 	}
 
 	return Info;

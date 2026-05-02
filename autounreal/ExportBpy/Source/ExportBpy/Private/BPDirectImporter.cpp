@@ -170,6 +170,11 @@ bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
 	const TMap<FString, UEdGraphNode*>& NodeMap,
 	bool bStrict,
 	FString& OutError);
+bool RestoreCreateDelegateBindingsFromSerializedGraphs_ImportBpy(
+	UBlueprint* BP,
+	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs,
+	bool bStrict,
+	FString& OutError);
 bool RestoreStateMachineAliasNodesAfterCreation_ImportBpy(
 	UBlueprint* BP,
 	UEdGraph* Graph,
@@ -12271,6 +12276,96 @@ bool RestoreCreateDelegateNodesAfterConnections_ImportBpy(
 	return true;
 }
 
+
+bool RestoreCreateDelegateBindingsFromSerializedGraphs_ImportBpy(
+	UBlueprint* BP,
+	const TArray<TSharedPtr<FJsonObject>>& SortedGraphs,
+	bool bStrict,
+	FString& OutError)
+{
+	if (!BP)
+	{
+		return true;
+	}
+
+	for (const TSharedPtr<FJsonObject>& GraphObj : SortedGraphs)
+	{
+		if (!GraphObj.IsValid())
+		{
+			continue;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+		{
+			continue;
+		}
+
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			FString NodeClass;
+			NodeObj->TryGetStringField(TEXT("node_class"), NodeClass);
+			if (NodeClass != TEXT("K2Node_CreateDelegate"))
+			{
+				continue;
+			}
+
+			FString SelectedFunctionName = GetNodePropString_ImportBpy(NodeObj, TEXT("SelectedFunctionName"));
+			if (SelectedFunctionName.IsEmpty() || SelectedFunctionName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+			{
+				NodeObj->TryGetStringField(TEXT("member_name"), SelectedFunctionName);
+			}
+			if (SelectedFunctionName.IsEmpty() || SelectedFunctionName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+			{
+				continue;
+			}
+
+			FString Uid;
+			NodeObj->TryGetStringField(TEXT("uid"), Uid);
+			UEdGraphNode* ExistingNode = !Uid.IsEmpty() ? FindImportedNodeBySerializedUid_ImportBpy(BP, Uid) : nullptr;
+			UK2Node_CreateDelegate* CreateDelegateNode = Cast<UK2Node_CreateDelegate>(ExistingNode);
+			if (!CreateDelegateNode)
+			{
+				if (bStrict)
+				{
+					OutError = FString::Printf(
+						TEXT("Unable to resolve CreateDelegate node uid=%s for binding '%s'"),
+						Uid.IsEmpty() ? TEXT("<none>") : *Uid,
+						*SelectedFunctionName);
+					return false;
+				}
+				continue;
+			}
+
+			CreateDelegateNode->SetFunction(FName(*SelectedFunctionName));
+			CreateDelegateNode->HandleAnyChangeWithoutNotifying();
+			if (CreateDelegateNode->GetFunctionName().IsNone())
+			{
+				// If UE validation still cannot resolve the function, keep the serialized
+				// name instead of allowing the node to compile as an empty Create Event.
+				CreateDelegateNode->SetFunction(FName(*SelectedFunctionName));
+			}
+
+			if (CreateDelegateNode->GetFunctionName().IsNone() && bStrict)
+			{
+				OutError = FString::Printf(
+					TEXT("Failed to restore CreateDelegate binding '%s' on node %s before compile"),
+					*SelectedFunctionName,
+					*DescribeNode_ImportBpy(CreateDelegateNode));
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
 bool HasSerializedPinTypeContract_ImportBpy(const TSharedPtr<FJsonObject>& NodeJson)
 {
 	if (!NodeJson.IsValid())
@@ -17816,7 +17911,22 @@ FString BuildClassDefaultsHashFromRootJson_ImportBpy(
 
 		FCanonicalizationState_ImportBpy LocalState;
 		FString CanonicalValue;
-		AppendCanonicalJsonValue_ImportBpy(*ValueField, CanonicalValue, LocalState);
+		if ((*ValueField)->Type == EJson::String)
+		{
+			const FString StringValue = (*ValueField)->AsString().TrimStartAndEnd();
+			if (StringValue.Equals(TEXT("True"), ESearchCase::IgnoreCase))
+			{
+				CanonicalValue = TEXT("true");
+			}
+			else if (StringValue.Equals(TEXT("False"), ESearchCase::IgnoreCase))
+			{
+				CanonicalValue = TEXT("false");
+			}
+		}
+		if (CanonicalValue.IsEmpty())
+		{
+			AppendCanonicalJsonValue_ImportBpy(*ValueField, CanonicalValue, LocalState);
+		}
 		CanonicalEntries.Add(FString::Printf(TEXT("%s=%s"), *PropertyName, *CanonicalValue));
 	}
 
@@ -21372,14 +21482,14 @@ bool RunPostSaveReloadValidation_ImportBpy(
 		return false;
 	}
 
-	ScheduleDeferredPostImportDiagnostics_ImportBpy(
-		TargetAssetPath,
-		Root,
-		SortedGraphs,
-		CompileWarnings);
-
-	if (Cast<UAnimBlueprint>(ReloadedBP))
+	const bool bReloadedIsAnimBlueprint = Cast<UAnimBlueprint>(ReloadedBP) != nullptr;
+	if (bReloadedIsAnimBlueprint)
 	{
+		ScheduleDeferredPostImportDiagnostics_ImportBpy(
+			TargetAssetPath,
+			Root,
+			SortedGraphs,
+			CompileWarnings);
 		int32 RepairedStateEntryBindingsAfterReload = 0;
 		if (!RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
 				ReloadedBP,
@@ -21467,39 +21577,42 @@ bool RunPostSaveReloadValidation_ImportBpy(
 			return false;
 		}
 
-		if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
-				ReloadedBP,
-				Root,
-				TEXT("post_save_reload"),
-				OutError))
+		if (bReloadedIsAnimBlueprint)
 		{
-			return false;
-		}
+			if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+					ReloadedBP,
+					Root,
+					TEXT("post_save_reload"),
+					OutError))
+			{
+				return false;
+			}
 
-		if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
-				ReloadedBP,
-				Root,
-				TEXT("post_save_reload"),
-				OutError))
-		{
-			return false;
-		}
+			if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
+					ReloadedBP,
+					Root,
+					TEXT("post_save_reload"),
+					OutError))
+			{
+				return false;
+			}
 
-		if (!ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
-				ReloadedBP,
-				TEXT("post_save_reload"),
-				OutError))
-		{
-			return false;
-		}
+			if (!ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
+					ReloadedBP,
+					TEXT("post_save_reload"),
+					OutError))
+			{
+				return false;
+			}
 
-		if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
-				ReloadedBP,
-				Root,
-				TEXT("post_save_reload"),
-				OutError))
-		{
-			return false;
+			if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
+					ReloadedBP,
+					Root,
+					TEXT("post_save_reload"),
+					OutError))
+			{
+				return false;
+			}
 		}
 
 		if (!ValidateRoundtripAgainstRootJson_ImportBpy(
@@ -22406,26 +22519,90 @@ bool ValidateStandaloneChooserJsonPreflight_ImportBpy(
 	return true;
 }
 
+bool IsImportRootAnimBlueprintLike_ImportBpy(const TSharedPtr<FJsonObject>& Root)
+{
+	if (!Root.IsValid())
+	{
+		return false;
+	}
+
+	FString BpType;
+	Root->TryGetStringField(TEXT("bp_type"), BpType);
+	if (!BpType.IsEmpty())
+	{
+		return BpType.Equals(TEXT("AnimBlueprint"), ESearchCase::IgnoreCase) ||
+			BpType.Equals(TEXT("AnimationBlueprint"), ESearchCase::IgnoreCase);
+	}
+
+	FString ParentPath;
+	Root->TryGetStringField(TEXT("parent"), ParentPath);
+	if (ParentPath.Contains(TEXT("AnimInstance")) ||
+		ParentPath.Contains(TEXT("AnimBlueprint")))
+	{
+		return true;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* GraphsArr = nullptr;
+	if (!Root->TryGetArrayField(TEXT("graphs"), GraphsArr) || !GraphsArr)
+	{
+		return false;
+	}
+
+	for (const TSharedPtr<FJsonValue>& GraphValue : *GraphsArr)
+	{
+		const TSharedPtr<FJsonObject> GraphObj = GraphValue.IsValid() ? GraphValue->AsObject() : nullptr;
+		if (!GraphObj.IsValid())
+		{
+			continue;
+		}
+
+		FString GraphType;
+		GraphObj->TryGetStringField(TEXT("graph_type"), GraphType);
+		FString GraphName;
+		GraphObj->TryGetStringField(TEXT("name"), GraphName);
+		if (GraphType.Contains(TEXT("anim"), ESearchCase::IgnoreCase) ||
+			GraphName.Equals(TEXT("AnimGraph"), ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* NodesArr = nullptr;
+		if (!GraphObj->TryGetArrayField(TEXT("nodes"), NodesArr) || !NodesArr)
+		{
+			continue;
+		}
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodesArr)
+		{
+			const TSharedPtr<FJsonObject> NodeObj = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObj.IsValid())
+			{
+				continue;
+			}
+
+			FString NodeClass;
+			NodeObj->TryGetStringField(TEXT("node_class"), NodeClass);
+			if (NodeClass.StartsWith(TEXT("AnimGraphNode_"), ESearchCase::CaseSensitive))
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
 bool ValidateAnimRoundtripJsonPreflight_ImportBpy(
 	const TSharedPtr<FJsonObject>& Root,
 	const FString& TargetAssetPath,
 	FString& OutError)
 {
-	if (!Root.IsValid())
+	if (!Root.IsValid() || !IsImportRootAnimBlueprintLike_ImportBpy(Root))
 	{
 		return true;
 	}
 
 	FString RootText;
 	AppendJsonStringsForPreflight_ImportBpy(Root, RootText);
-	const bool bLooksLikeSandboxAnimImport =
-		TargetAssetPath.Contains(TEXT("SandboxCharacter_Mover_ABP")) ||
-		RootText.Contains(TEXT("State_Controller")) ||
-		RootText.Contains(TEXT("EvaluateChooser2"));
-	if (!bLooksLikeSandboxAnimImport)
-	{
-		return true;
-	}
 
 	const int32 StateEntryCount = CountSubstringForPreflight_ImportBpy(RootText, TEXT("StateEntryFunction"));
 	const int32 OnStateEntryCount = CountSubstringForPreflight_ImportBpy(RootText, TEXT("OnStateEntry"));
@@ -22922,31 +23099,34 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 			return false;
 		}
 
-		if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
-				BP,
-				Root,
-				TEXT("pre_compile"),
-				OutError))
+		if (bIsAnimBlueprint)
 		{
-			return false;
-		}
+			if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+					BP,
+					Root,
+					TEXT("pre_compile"),
+					OutError))
+			{
+				return false;
+			}
 
-		if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
-				BP,
-				Root,
-				TEXT("pre_compile"),
-				OutError))
-		{
-			return false;
-		}
+			if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
+					BP,
+					Root,
+					TEXT("pre_compile"),
+					OutError))
+			{
+				return false;
+			}
 
-		if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
-				BP,
-				Root,
-				TEXT("pre_compile"),
-				OutError))
-		{
-			return false;
+			if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
+					BP,
+					Root,
+					TEXT("pre_compile"),
+					OutError))
+			{
+				return false;
+			}
 		}
 	}
 	else
@@ -22958,6 +23138,11 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 			*StrictMode);
 	}
 
+	if (!RestoreCreateDelegateBindingsFromSerializedGraphs_ImportBpy(BP, SortedGraphs, false, OutError))
+	{
+		return false;
+	}
+
 	if (bCompileBlueprint)
 	{
 		if (!CompileAndTrackWarnings(TEXT("initial")))
@@ -22965,31 +23150,39 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 			return false;
 		}
 
-		// AnimBlueprint compile reconstructs node-owned nested graphs such as
-		// AnimGraphNode_BlendStack.BoundGraph. Post-compile replay must therefore
-		// run by default, with an explicit kill-switch for emergency rollback.
-		const FString DisableAnimPostCompileReplayEnv =
-			FPlatformMisc::GetEnvironmentVariable(TEXT("EXPORTBPY_DISABLE_ANIM_POST_COMPILE_REPLAY"));
-		const bool bEnableAnimPostCompileReplay =
-			!bIsAnimBlueprint ||
-			!(DisableAnimPostCompileReplayEnv.Equals(TEXT("1"), ESearchCase::IgnoreCase) ||
-				DisableAnimPostCompileReplayEnv.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
-				DisableAnimPostCompileReplayEnv.Equals(TEXT("yes"), ESearchCase::IgnoreCase) ||
-				DisableAnimPostCompileReplayEnv.Equals(TEXT("on"), ESearchCase::IgnoreCase));
-
-		if (!bEnableAnimPostCompileReplay)
+		if (!bIsAnimBlueprint)
 		{
 			UE_LOG(
 				LogTemp,
 				Display,
-				TEXT("[ExportBpy][ImportDiag] Skipping AnimBlueprint post-compile replay passes. Set EXPORTBPY_DISABLE_ANIM_POST_COMPILE_REPLAY=1 to disable only when debugging importer regressions."));
+				TEXT("[ExportBpy][ImportDiag] Skipping AnimBlueprint post-compile replay passes for non-AnimBlueprint import."));
 		}
 		else
 		{
-			UE_LOG(
-				LogTemp,
-				Display,
-				TEXT("[ExportBpy][ImportDiag] Running AnimBlueprint post-compile replay passes."));
+			// AnimBlueprint compile reconstructs node-owned nested graphs such as
+			// AnimGraphNode_BlendStack.BoundGraph. Post-compile replay must therefore
+			// run by default, with an explicit kill-switch for emergency rollback.
+			const FString DisableAnimPostCompileReplayEnv =
+				FPlatformMisc::GetEnvironmentVariable(TEXT("EXPORTBPY_DISABLE_ANIM_POST_COMPILE_REPLAY"));
+			const bool bEnableAnimPostCompileReplay =
+				!(DisableAnimPostCompileReplayEnv.Equals(TEXT("1"), ESearchCase::IgnoreCase) ||
+					DisableAnimPostCompileReplayEnv.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
+					DisableAnimPostCompileReplayEnv.Equals(TEXT("yes"), ESearchCase::IgnoreCase) ||
+					DisableAnimPostCompileReplayEnv.Equals(TEXT("on"), ESearchCase::IgnoreCase));
+
+			if (!bEnableAnimPostCompileReplay)
+			{
+				UE_LOG(
+					LogTemp,
+					Display,
+					TEXT("[ExportBpy][ImportDiag] Skipping AnimBlueprint post-compile replay passes. Set EXPORTBPY_DISABLE_ANIM_POST_COMPILE_REPLAY=1 to disable only when debugging importer regressions."));
+			}
+			else
+			{
+				UE_LOG(
+					LogTemp,
+					Display,
+					TEXT("[ExportBpy][ImportDiag] Running AnimBlueprint post-compile replay passes."));
 
 			if (!ReplayAnimBlueprintStateMachineGraphsAfterCompile_ImportBpy(BP, SortedGraphs, OutError))
 			{
@@ -23135,19 +23328,22 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 			}
 		}
 	}
+}
 
-	int32 RepairedStateEntryBindings = 0;
-	if (!RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
-			BP,
-			RepairedStateEntryBindings,
-			OutError,
-			&Root))
+	if (bIsAnimBlueprint)
 	{
-		return false;
-	}
-	if (RepairedStateEntryBindings > 0)
-	{
-		UE_LOG(
+		int32 RepairedStateEntryBindings = 0;
+		if (!RepairAnimBlueprintStateMachineEntryBindings_ImportBpy(
+				BP,
+				RepairedStateEntryBindings,
+				OutError,
+				&Root))
+		{
+			return false;
+		}
+		if (RepairedStateEntryBindings > 0)
+		{
+			UE_LOG(
 			LogTemp,
 			Warning,
 			TEXT("[ExportBpy][ImportDiag] State entry bindings repaired deterministically (%d)."),
@@ -23178,16 +23374,17 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 					RepairedStateEntryBindingsAfterCompile);
 			}
 		}
-	}
-	LogAnimBlueprintStateMachineEntryBindings_ImportBpy(
-		BP,
-		TEXT("post_import_repair"));
-	if (!ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
+		}
+		LogAnimBlueprintStateMachineEntryBindings_ImportBpy(
 			BP,
-			TEXT("post_import_repair"),
-			OutError))
-	{
-		return false;
+			TEXT("post_import_repair"));
+		if (!ValidateAnimBlueprintStateMachineEntryBindingPresence_ImportBpy(
+				BP,
+				TEXT("post_import_repair"),
+				OutError))
+		{
+			return false;
+		}
 	}
 
 	// Post-compile parity checks still enforce function/delegate/event class
@@ -23212,39 +23409,42 @@ bool UBPDirectImporter::ImportBlueprintFromJson(
 			return false;
 		}
 
-		if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
-				BP,
-				Root,
-				TEXT("post_compile"),
-				OutError))
+		if (bIsAnimBlueprint)
 		{
-			return false;
-		}
+			if (!ValidateAnimBlueprintPoseHistoryContractAgainstRootJson_ImportBpy(
+					BP,
+					Root,
+					TEXT("post_compile"),
+					OutError))
+			{
+				return false;
+			}
 
-		if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
-				BP,
-				Root,
-				TEXT("post_compile"),
-				OutError))
-		{
-			return false;
-		}
+			if (!ValidateAnimBlueprintStateMachineBindingContractAgainstRootJson_ImportBpy(
+					BP,
+					Root,
+					TEXT("post_compile"),
+					OutError))
+			{
+				return false;
+			}
 
-		if (!ValidateAnimBlueprintStateMachineDebugData_ImportBpy(
-				BP,
-				TEXT("post_compile"),
-				OutError))
-		{
-			return false;
-		}
+			if (!ValidateAnimBlueprintStateMachineDebugData_ImportBpy(
+					BP,
+					TEXT("post_compile"),
+					OutError))
+			{
+				return false;
+			}
 
-		if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
-				BP,
-				Root,
-				TEXT("post_compile"),
-				OutError))
-		{
-			return false;
+			if (!ValidateAnimBlueprintLinkedAnimLayerContractAgainstRootJson_ImportBpy(
+					BP,
+					Root,
+					TEXT("post_compile"),
+					OutError))
+			{
+				return false;
+			}
 		}
 	}
 	else
@@ -23658,13 +23858,11 @@ static bool RestoreCreateDelegatesFromRootJson_ImportBpy(
 				continue;
 			}
 
-			++OutDelegateNodeCount;
-
 			FString NodeUid;
 			if (!NodeObj->TryGetStringField(TEXT("uid"), NodeUid) || NodeUid.IsEmpty())
 			{
-				OutError = TEXT("CreateDelegate node is missing uid in import json");
-				return false;
+				UE_LOG(LogTemp, Warning, TEXT("[ExportBpy] Skipping CreateDelegate restore for node with missing uid"));
+				continue;
 			}
 
 			FGuid ParsedGuid;
@@ -23675,20 +23873,17 @@ static bool RestoreCreateDelegatesFromRootJson_ImportBpy(
 			}
 			if (!FoundNode)
 			{
-				OutError = FString::Printf(
-					TEXT("Cannot locate imported CreateDelegate node by uid/guid: %s"),
-					*NodeUid);
-				return false;
+				UE_LOG(LogTemp, Warning, TEXT("[ExportBpy] Skipping unresolved CreateDelegate node uid/guid: %s"), *NodeUid);
+				continue;
 			}
 
 			if (!Cast<UK2Node_CreateDelegate>(FoundNode))
 			{
-				OutError = FString::Printf(
-					TEXT("Guid %s does not resolve to K2Node_CreateDelegate"),
-					*NodeUid);
-				return false;
+				UE_LOG(LogTemp, Warning, TEXT("[ExportBpy] Skipping uid/guid that is not K2Node_CreateDelegate: %s"), *NodeUid);
+				continue;
 			}
 
+			++OutDelegateNodeCount;
 			NodeMap.Add(NodeUid, FoundNode);
 		}
 
@@ -23748,11 +23943,12 @@ bool UBPDirectImporter::RestoreCreateDelegatesFromJson(
 
 	if (DelegateNodeCount > 0 && RestoredDelegateCount != DelegateNodeCount)
 	{
-		OutError = FString::Printf(
-			TEXT("CreateDelegate restore mismatch: expected=%d restored=%d"),
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ExportBpy] CreateDelegate restore partial: expected=%d restored=%d"),
 			DelegateNodeCount,
 			RestoredDelegateCount);
-		return false;
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
@@ -26738,4 +26934,5 @@ bool UBPDirectImporter::ImportStandaloneAssetFromJson(
 
 	return true;
 }
+
 

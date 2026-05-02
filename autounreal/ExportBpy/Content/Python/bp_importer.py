@@ -345,7 +345,10 @@ def _target_asset_name_from_path(target_path: Optional[str]) -> str:
 
 def _validate_bpy_roundtrip_preflight(dir_path: str, target_path: Optional[str]) -> Tuple[bool, str]:
     try:
-        from bpy_anim_roundtrip_check import validate_export_dir
+        import importlib
+        import bpy_anim_roundtrip_check
+        bpy_anim_roundtrip_check = importlib.reload(bpy_anim_roundtrip_check)
+        validate_export_dir = bpy_anim_roundtrip_check.validate_export_dir
     except Exception as exc:
         return False, f"无法加载 BPY 动画往返检测器: {exc}"
 
@@ -597,8 +600,9 @@ def _import_blueprint_object_with_details(
     if not ok and err:
         err = _describe_missing_connection_nodes(payload, err)
     bridge_asset_path = _normalize_bridge_blueprint_path(asset_path)
+    bp_type = str(payload.get("bp_type", "") or "")
     parent_class_path = str(payload.get("parent", "") or "")
-    is_anim_blueprint_payload = "AnimInstance" in parent_class_path
+    is_anim_blueprint_payload = bp_type.lower() in {"animblueprint", "animationblueprint"} or "AnimInstance" in parent_class_path
     force_py_post_repair = str(
         os.environ.get("EXPORTBPY_FORCE_PY_POST_REPAIR", "")
     ).strip().lower() in {"1", "true", "yes", "on"}

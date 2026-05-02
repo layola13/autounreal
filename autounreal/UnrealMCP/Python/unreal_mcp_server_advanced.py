@@ -862,6 +862,36 @@ def compile_blueprint(blueprint_name: str) -> Dict[str, Any]:
         logger.error(f"compile_blueprint error: {e}")
         return {"success": False, "message": str(e)}
 
+
+@mcp.tool()
+def compile_human_bpy(human_dir: str, output_dir: str) -> Dict[str, Any]:
+    """Compile a BpyDecompiler human package back into an ExportBpy BPY package."""
+    try:
+        from pathlib import Path
+        import shutil
+        import sys
+
+        project_root = Path(__file__).resolve().parents[5]
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+
+        from Plugins.autounreal.autounreal.BpyDecompiler.compiler import emit_bpy_package_from_human
+
+        human_path = Path(human_dir).resolve()
+        output_path = Path(output_dir).resolve()
+        shutil.rmtree(output_path, ignore_errors=True)
+        output_path.mkdir(parents=True, exist_ok=True)
+        compiled_dir = emit_bpy_package_from_human(human_path, output_path)
+        return {
+            "success": True,
+            "human_dir": str(human_path),
+            "output_dir": str(compiled_dir),
+            "format": "bpy_directory",
+            "producer": "BpyDecompiler",
+        }
+    except Exception as e:
+        logger.error(f"compile_human_bpy error: {e}")
+        return {"success": False, "message": str(e)}
 @mcp.tool()
 def copy_value(
     source: Dict[str, Any],
@@ -5344,3 +5374,4 @@ def format_graph(
 if __name__ == "__main__":
     logger.info("Starting Advanced MCP server with stdio transport")
     mcp.run(transport='stdio') 
+

@@ -100,6 +100,7 @@ The only warning was that ChooserTable meta files were absent, so the importer k
 4. Return `producer = "BpyDecompiler"`, `format = "humanpy_directory"`, `output_path = <...>/blueprint.py`, `upper_dir`, and `bpy_reference_dir`.
 
 This replaces the abandoned direct C++ `ExportHumanPy` path. Direct C++ Blueprint serialization remains useful for ExportBpy itself, but human py export should not maintain a second lossy graph emitter.
+`compile_human_bpy(human_dir, output_dir)` is the matching MCP compile-back entry. It calls `BpyDecompiler.compiler.emit_bpy_package_from_human(...)` and writes a strict ExportBpy BPY directory that can be passed to `import_blueprint_from_bpy(...)`. Keep this as a separate explicit step so export, human editing, compile-back, and UE import can each be validated independently.
 
 Acceptance checks used for the MCP wrapper:
 
@@ -155,3 +156,4 @@ Import the latest compiled ABP package with UnrealMCP or equivalent importer int
 - Continue improving `blueprint.py` so it reads less like Blueprint IR and more like hand-written Python while preserving strict reversibility.
 - Expand strict full-file diff checks from ABP-only validation to more Blueprint classes and representative animation/state-machine assets.
 - Add an automated human py -> BPY -> UE import -> UE re-export -> diff gate once the importer/exporter path is stable enough for unattended validation.
+

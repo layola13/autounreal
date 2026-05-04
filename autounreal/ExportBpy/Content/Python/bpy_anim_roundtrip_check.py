@@ -160,25 +160,86 @@ def validate_anim_node_fallback_defaults(export_dir: str | Path) -> list[str]:
     text = anim_graph.read_text(encoding="utf-8", errors="ignore")
     if "AnimGraphNode_OffsetRootBone" in text and "BindingPropertyBindings" in text:
         required = {
-            "OffsetRootBone RotationMode fallback": 'AnimGraphNode_OffsetRootBone.pin("RotationMode", "Accumulate")',
-            "OffsetRootBone TranslationHalflife fallback": 'AnimGraphNode_OffsetRootBone.pin("TranslationHalflife", 0.200000)',
-            "OffsetRootBone MaxTranslationError fallback": 'AnimGraphNode_OffsetRootBone.pin("MaxTranslationError", 30.000000)',
-            "OffsetRootBone Node RotationMode": "RotationMode=Accumulate",
-            "OffsetRootBone Node MaxTranslationError": "MaxTranslationError=30.000000",
+            "OffsetRootBone Node RotationMode": "RotationMode=Interpolate",
+            "OffsetRootBone Node TranslationHalflife": "TranslationHalflife=0.100000",
+            "OffsetRootBone Node MaxTranslationError": "MaxTranslationError=-1.000000",
         }
         for label, token in required.items():
             if token not in text:
-                errors.append(f"AnimGraph missing {label}; bound AnimNode fallback defaults were likely stripped")
+                errors.append(f"AnimGraph missing {label}; imported ABP may evaluate root offset sideways")
+
+        forbidden = {
+            "OffsetRootBone sideway RotationMode": "RotationMode=Accumulate",
+            "OffsetRootBone sideway TranslationHalflife": "TranslationHalflife=0.200000",
+            "OffsetRootBone sideway MaxTranslationError": "MaxTranslationError=30.000000",
+        }
+        for label, token in forbidden.items():
+            if token in text:
+                errors.append(f"AnimGraph contains {label}; this is the known sideways baseline")
 
     if "AnimGraphNode_MotionMatching" in text and "BindingPropertyBindings" in text:
-        if 'AnimGraphNode_MotionMatching.pin("BlendTime", 0.500000)' not in text and "BlendTime=0.500000" not in text:
-            errors.append("AnimGraph missing MotionMatching BlendTime fallback 0.500000")
+        if 'AnimGraphNode_MotionMatching.pin("BlendTime", 0.200000)' not in text and "BlendTime=0.200000" not in text:
+            errors.append("AnimGraph missing MotionMatching BlendTime 0.200000")
+        if "BlendTime=0.500000" in text:
+            errors.append("AnimGraph contains MotionMatching BlendTime=0.500000; this is the known sideways baseline")
 
     if "AnimGraphNode_BlendStack" in text and "BindingPropertyBindings" in text:
-        if 'AnimGraphNode_BlendStack.pin("BlendTime", 0.000000)' not in text and "BlendTime=0.000000" not in text:
-            errors.append("AnimGraph missing BlendStack BlendTime fallback 0.000000")
+        if 'AnimGraphNode_BlendStack.pin("BlendTime", 0.200000)' not in text and "BlendTime=0.200000" not in text:
+            errors.append("AnimGraph missing BlendStack BlendTime 0.200000")
 
     return errors
+
+
+def validate_orientation_warping_sideways_defaults(export_dir: str | Path) -> list[str]:
+    export_path = Path(export_dir)
+    errors: list[str] = []
+
+    blend_stack_graph = export_path / "other_fn_AnimGraph__BlendStack__AnimationBlendStackGraph_0.bp.py"
+    if blend_stack_graph.exists():
+        text = blend_stack_graph.read_text(encoding="utf-8", errors="ignore")
+        if "AnimGraphNode_OrientationWarping" in text:
+            required = {
+                "BlendStack OrientationWarping Mode=Graph": "Mode=Graph",
+                "BlendStack OrientationWarping RootBoneTransform": "WarpingSpace=RootBoneTransform",
+                "BlendStack OrientationWarping angle guard": "LocomotionAngleDeltaThreshold=135.000000",
+                "BlendStack OrientationWarping distributed spine alpha": "DistributedBoneOrientationAlpha=0.600000",
+                "BlendStack OrientationWarping LocomotionDirection pin": 'AnimGraphNode_OrientationWarping.pin("LocomotionDirection", "0.000000,0.000000,0.000000")',
+                "BlendStack OrientationWarping LocomotionDirection property": 'PropertyName=\\"LocomotionDirection\\"',
+                "BlendStack OrientationWarping strafe direction binding": 'PropertyPath=(\\"Get_StrafeWarpDirection\\")',
+            }
+            for label, token in required.items():
+                if token not in text:
+                    errors.append(f"{label} missing; imported ABP may evaluate locomotion sideways")
+
+        if "AnimGraphNode_StrideWarping" in text:
+            required = {
+                "BlendStack StrideWarping Mode=Graph": "Mode=Graph",
+                "BlendStack StrideWarping speed property": 'PropertyName=\\"LocomotionSpeed\\"',
+                "BlendStack StrideWarping Speed2D binding": 'PropertyPath=(\\"Speed2D\\")',
+            }
+            for label, token in required.items():
+                if token not in text:
+                    errors.append(f"{label} missing; imported ABP stride/locomotion warping may be invalid")
+
+    motion_matching_graph = export_path / "other_fn_AnimGraph__MotionMatching__AnimationBlendStackGraph_0.bp.py"
+    if motion_matching_graph.exists():
+        text = motion_matching_graph.read_text(encoding="utf-8", errors="ignore")
+        if "AnimGraphNode_OrientationWarping" in text:
+            required = {
+                "MotionMatching OrientationWarping Mode=Graph": "Mode=Graph",
+                "MotionMatching OrientationWarping ComponentTransform": "WarpingSpace=ComponentTransform",
+                "MotionMatching OrientationWarping angle guard": "LocomotionAngleDeltaThreshold=135.000000",
+                "MotionMatching OrientationWarping WarpingSpace property": 'PropertyName=\\"WarpingSpace\\"',
+                "MotionMatching OrientationWarping WarpingSpace binding": 'PropertyPath=(\\"Get_OrientationWarpingWarpingSpace\\")',
+            }
+            for label, token in required.items():
+                if token not in text:
+                    errors.append(f"{label} missing; imported ABP may evaluate orientation warping sideways")
+            if "WarpingSpace=RootBoneTransform" in text:
+                errors.append("MotionMatching OrientationWarping uses RootBoneTransform; this is the known sideways baseline")
+
+    return errors
+
 
 def validate_update_motion_matching(export_dir: str | Path, expected_target: str = "") -> list[str]:
     export_path = Path(export_dir)
@@ -250,6 +311,7 @@ def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tu
         errors.extend(validate_state_controller_hooks(export_path))
         errors.extend(validate_update_motion_matching(export_path, expected_target))
         errors.extend(validate_anim_node_fallback_defaults(export_path))
+        errors.extend(validate_orientation_warping_sideways_defaults(export_path))
         return errors, warnings
 
     seen_targets: set[str] = set()
@@ -299,6 +361,7 @@ def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tu
     errors.extend(validate_state_controller_hooks(export_path))
     errors.extend(validate_update_motion_matching(export_path, expected_target))
     errors.extend(validate_anim_node_fallback_defaults(export_path))
+    errors.extend(validate_orientation_warping_sideways_defaults(export_path))
     return errors, warnings
 
 

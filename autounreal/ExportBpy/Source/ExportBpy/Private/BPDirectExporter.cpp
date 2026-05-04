@@ -94,6 +94,7 @@ namespace
 {
 FString MakePythonStringLiteral_ExportBpy(const FString& Text);
 FString BuildPinRefAttribute_ExportBpy(const FString& NodeVar, const FString& RawPinName, bool bAllowGuidCleanup);
+bool LooksLikeStrictPythonNumberLiteral_ExportBpy(const FString& Value);
 
 void AddNodePropertyTextIfPresent_ExportBpy(UK2Node* Node, FNodeInfo& Info, const TCHAR* PropertyName)
 {
@@ -334,7 +335,8 @@ bool ShouldTraceAnimBindingNode_ExportBpy(const UK2Node* Node)
 
 	const FString NodeClass = Node->GetClass()->GetName();
 	return NodeClass == TEXT("AnimGraphNode_MotionMatching") ||
-		NodeClass == TEXT("AnimGraphNode_OffsetRootBone");
+		NodeClass == TEXT("AnimGraphNode_OffsetRootBone") ||
+		NodeClass == TEXT("AnimGraphNode_BlendStack");
 }
 
 void LogAnimBindingPins_ExportBpy(UK2Node* Node, const TSet<FString>& PinNames, const TCHAR* SourceTag)
@@ -520,6 +522,274 @@ void StripBoundFieldsFromStructText_ExportBpy(
 		return;
 	}
 	InOutStructText = TEXT("(") + FString::Join(Kept, TEXT(",")) + TEXT(")");
+}
+
+int32 FindTopLevelEqualsInStructEntry_ExportBpy(const FString& Entry)
+{
+	int32 Depth = 0;
+	bool bInQuotes = false;
+	bool bEscapeNext = false;
+	for (int32 i = 0; i < Entry.Len(); ++i)
+	{
+		const TCHAR Ch = Entry[i];
+		if (bEscapeNext)
+		{
+			bEscapeNext = false;
+			continue;
+		}
+		if (Ch == TEXT('\\'))
+		{
+			bEscapeNext = true;
+			continue;
+		}
+		if (Ch == TEXT('"'))
+		{
+			bInQuotes = !bInQuotes;
+			continue;
+		}
+		if (bInQuotes)
+		{
+			continue;
+		}
+		if (Ch == TEXT('('))
+		{
+			++Depth;
+			continue;
+		}
+		if (Ch == TEXT(')'))
+		{
+			--Depth;
+			continue;
+		}
+		if (Ch == TEXT('=') && Depth == 0)
+		{
+			return i;
+		}
+	}
+	return INDEX_NONE;
+}
+
+TMap<FString, FString> ExtractTopLevelStructFields_ExportBpy(const FString& StructText)
+{
+	TMap<FString, FString> Fields;
+	if (!StructText.StartsWith(TEXT("(")) || !StructText.EndsWith(TEXT(")")))
+	{
+		return Fields;
+	}
+
+	const FString Body = StructText.Mid(1, StructText.Len() - 2);
+	int32 FieldStart = 0;
+	int32 Depth = 0;
+	bool bInQuotes = false;
+	bool bEscapeNext = false;
+
+	auto EmitField = [&](const int32 EndExclusive)
+	{
+		if (EndExclusive <= FieldStart)
+		{
+			return;
+		}
+
+		const FString Entry = Body.Mid(FieldStart, EndExclusive - FieldStart);
+		const int32 EqIdx = FindTopLevelEqualsInStructEntry_ExportBpy(Entry);
+		if (EqIdx == INDEX_NONE)
+		{
+			return;
+		}
+
+		const FString Key = Entry.Left(EqIdx).TrimStartAndEnd();
+		const FString Value = Entry.Mid(EqIdx + 1).TrimStartAndEnd();
+		if (!Key.IsEmpty())
+		{
+			Fields.Add(Key, Value);
+		}
+	};
+
+	for (int32 i = 0; i < Body.Len(); ++i)
+	{
+		const TCHAR Ch = Body[i];
+		if (bEscapeNext)
+		{
+			bEscapeNext = false;
+			continue;
+		}
+		if (Ch == TEXT('\\'))
+		{
+			bEscapeNext = true;
+			continue;
+		}
+		if (Ch == TEXT('"'))
+		{
+			bInQuotes = !bInQuotes;
+			continue;
+		}
+		if (bInQuotes)
+		{
+			continue;
+		}
+		if (Ch == TEXT('('))
+		{
+			++Depth;
+			continue;
+		}
+		if (Ch == TEXT(')'))
+		{
+			--Depth;
+			continue;
+		}
+		if (Ch == TEXT(',') && Depth == 0)
+		{
+			EmitField(i);
+			FieldStart = i + 1;
+		}
+	}
+	EmitField(Body.Len());
+
+	return Fields;
+}
+
+bool ExportAnimNodeStructFieldText_ExportBpy(
+	UK2Node* Node,
+	const FString& FieldName,
+	FString& OutValue)
+{
+	OutValue.Reset();
+	if (!Node || FieldName.IsEmpty())
+	{
+		return false;
+	}
+
+	FStructProperty* NodeProperty = FindFProperty<FStructProperty>(Node->GetClass(), TEXT("Node"));
+	if (!NodeProperty || !NodeProperty->Struct)
+	{
+		return false;
+	}
+
+	void* NodeStructPtr = NodeProperty->ContainerPtrToValuePtr<void>(Node);
+	if (!NodeStructPtr)
+	{
+		return false;
+	}
+
+	FProperty* FieldProperty = NodeProperty->Struct->FindPropertyByName(FName(*FieldName));
+	if (!FieldProperty)
+	{
+		return false;
+	}
+
+	void* FieldValuePtr = FieldProperty->ContainerPtrToValuePtr<void>(NodeStructPtr);
+	if (!FieldValuePtr)
+	{
+		return false;
+	}
+
+	FieldProperty->ExportTextItem_Direct(OutValue, FieldValuePtr, nullptr, Node, PPF_None);
+	OutValue.TrimStartAndEndInline();
+	return !OutValue.IsEmpty();
+}
+
+void AddMissingStructField_ExportBpy(
+	FString& InOutStructText,
+	const FString& FieldName,
+	const FString& FieldValue)
+{
+	if (FieldName.IsEmpty() || FieldValue.IsEmpty())
+	{
+		return;
+	}
+
+	const TMap<FString, FString> ExistingFields = ExtractTopLevelStructFields_ExportBpy(InOutStructText);
+	if (ExistingFields.Contains(FieldName))
+	{
+		return;
+	}
+
+	if (!InOutStructText.StartsWith(TEXT("(")) || !InOutStructText.EndsWith(TEXT(")")))
+	{
+		InOutStructText = FString::Printf(TEXT("(%s=%s)"), *FieldName, *FieldValue);
+		return;
+	}
+
+	if (InOutStructText == TEXT("()"))
+	{
+		InOutStructText = FString::Printf(TEXT("(%s=%s)"), *FieldName, *FieldValue);
+		return;
+	}
+
+	InOutStructText.InsertAt(InOutStructText.Len() - 1, FString::Printf(TEXT(",%s=%s"), *FieldName, *FieldValue));
+}
+
+bool AreAnimFallbackValuesEquivalent_ExportBpy(
+	const FString& LeftValue,
+	const FString& RightValue)
+{
+	FString Left = LeftValue;
+	FString Right = RightValue;
+	Left.TrimStartAndEndInline();
+	Right.TrimStartAndEndInline();
+	if (Left == Right)
+	{
+		return true;
+	}
+
+	if (LooksLikeStrictPythonNumberLiteral_ExportBpy(Left) &&
+		LooksLikeStrictPythonNumberLiteral_ExportBpy(Right))
+	{
+		return FMath::IsNearlyEqual(FCString::Atod(*Left), FCString::Atod(*Right), UE_DOUBLE_SMALL_NUMBER);
+	}
+
+	return false;
+}
+
+void PreserveAnimNodeBindingFallbacks_ExportBpy(
+	UK2Node* Node,
+	FNodeInfo& Info,
+	const TSet<FString>& AnimBindingDrivenPins)
+{
+	if (!Node || !Info.NodeType.StartsWith(TEXT("AnimGraphNode_")) || AnimBindingDrivenPins.Num() == 0)
+	{
+		return;
+	}
+
+	FString* NodeText = Info.NodeProps.Find(TEXT("Node"));
+	if (!NodeText)
+	{
+		Info.NodeProps.Add(TEXT("Node"), TEXT("()"));
+		NodeText = Info.NodeProps.Find(TEXT("Node"));
+	}
+	if (!NodeText)
+	{
+		return;
+	}
+
+	TArray<FString> SortedPins = AnimBindingDrivenPins.Array();
+	SortedPins.Sort();
+	for (const FString& PinName : SortedPins)
+	{
+		FString FieldValue;
+		if (!ExportAnimNodeStructFieldText_ExportBpy(Node, PinName, FieldValue))
+		{
+			continue;
+		}
+
+		AddMissingStructField_ExportBpy(*NodeText, PinName, FieldValue);
+		if (!Info.InputPinTypes.Contains(PinName))
+		{
+			continue;
+		}
+
+		if (FString* ExistingValue = Info.DefaultValues.Find(PinName))
+		{
+			if (AreAnimFallbackValuesEquivalent_ExportBpy(*ExistingValue, FieldValue))
+			{
+				*ExistingValue = FieldValue;
+			}
+		}
+		else
+		{
+			Info.DefaultValues.Add(PinName, FieldValue);
+		}
+	}
 }
 
 void AddGenericNodePropertyText_ExportBpy(
@@ -4414,6 +4684,7 @@ FNodeInfo BuildNodeInfo_ExportBpy(UK2Node* Node)
 		{
 			AddNodePropertyDeltaTextIfPresent_ExportBpy(Node, Info, TEXT("Node"));
 		}
+		PreserveAnimNodeBindingFallbacks_ExportBpy(Node, Info, AnimBindingDrivenPins);
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("ShowPinForProperties"));
 		AddNodePropertyTextIfPresent_ExportBpy(Node, Info, TEXT("CustomPinProperties"));
 		AddAnimNodeBindingPropertyBindingsIfPresent_ExportBpy(Node, Info);
@@ -7370,6 +7641,18 @@ TSharedPtr<FJsonObject> UBPDirectExporter::SerializeNode(UK2Node* Node)
 		{
 			DefaultsObj->SetStringField(PinName, PinDefaultValue);
 		}
+	}
+	for (const TPair<FString, FString>& Entry : Info.DefaultValues)
+	{
+		DefaultsObj->SetStringField(Entry.Key, Entry.Value);
+	}
+	for (const TPair<FString, FString>& Entry : Info.InputPinTypes)
+	{
+		InputPinTypesObj->SetStringField(Entry.Key, Entry.Value);
+	}
+	for (const TPair<FString, FString>& Entry : Info.OutputPinTypes)
+	{
+		OutputPinTypesObj->SetStringField(Entry.Key, Entry.Value);
 	}
 	NObj->SetObjectField(TEXT("defaults"), DefaultsObj);
 	NObj->SetObjectField(TEXT("input_pin_types"), InputPinTypesObj);

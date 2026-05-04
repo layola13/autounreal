@@ -44,8 +44,23 @@ The import/export validation now infers Chooser dependencies dynamically from th
 - Chooser table references are dynamically consistent with the exported asset.
 - Shared transition rule metadata is present.
 - Shared transition color metadata is present.
+- OffsetRootBone, MotionMatching, BlendStack, OrientationWarping and StrideWarping keep the fallback/runtime `Node` fields that Unreal still needs when pins are bound through property access.
 
 Do not weaken this checker to make an import pass. If it fails, fix the exporter or importer so the BPY faithfully represents the source asset.
+
+### 5. Sideways locomotion regression
+
+The imported `SandboxCharacter_Mover_ABP` could avoid TPOSE and still play sideways. The root cause was importer-side loss of serialized AnimGraph runtime struct fields after node reconstruction/compile. Unreal can rebuild bound anim nodes from property access metadata, but runtime fallback data such as `OffsetRootBone`, `MotionMatching`, `BlendStack`, `OrientationWarping` and `StrideWarping` values must still survive the roundtrip.
+
+The importer now replays serialized AnimGraph runtime structs after binding/reconstruction, after pin defaults, during defaults contract replay and after compile. The exporter also preserves bound anim-node fallback values in BPY so the post-import export can prove these fields survived.
+
+Validated Demo chain:
+
+- Source exports: `tmp/sideways_chain_fix02/orig/`
+- Imported targets: `/Game/Blueprints/Demo/AC_TraversalLogic_RTFix02`, `/Game/Blueprints/Demo/SandboxCharacter_Mover_ABP_RTFix02`, `/Game/Blueprints/Demo/SandboxCharacter_Mover_RTFix02`
+- Re-exported targets: `tmp/sideways_chain_fix02/demo_export/`
+- Key ABP guards passed: `RotationMode=Accumulate`, `TranslationMode=Interpolate`, `TranslationHalflife=0.200000`, `MaxTranslationError=30.000000`, `MotionMatching BlendTime=0.500000`, `BlendStack AnimationTime=-1.000000`, `OrientationWarping WarpingSpace=RootBoneTransform`, `Get_StrafeWarpDirection` binding and `StrideWarping Speed2D` binding.
+- CBP reference remap proof: Demo CBP uses `/Game/Blueprints/Demo/SandboxCharacter_Mover_ABP_RTFix02` for `AnimClass` and `/Game/Blueprints/Demo/AC_TraversalLogic_RTFix02` for the traversal component, with no remaining references to the original ABP or traversal component.
 
 ## Validation Workflow
 
@@ -84,6 +99,8 @@ Screenshots are useful for final confidence, but they are not enough for regress
 - Do not relax validation to bypass missing data.
 - Always separate export bugs from import bugs by checking BPY before and after import.
 - Before closing UE during automated validation, call UnrealMCP `save_all`.
+- After every UE import, call UnrealMCP `save_all` before closing or restarting UE.
+- Check `UnrealEditor` memory during long import loops; if memory is high, `save_all`, close UE, and restart before continuing.
 - Prefer UnrealMCP live compile/trigger compile where possible; restart UE only when the editor or bridge is stuck.
 
 ## Relevant Files

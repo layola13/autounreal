@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from pathlib import Path
 from typing import Any, Iterable, List, Tuple
 
@@ -65,6 +66,29 @@ def _source_class_name(export_path: Path) -> str:
 
 def _has_pose_search_database_result(meta_text: str) -> bool:
     return "object/PoseSearchDatabase|array" in meta_text or "PoseSearchDatabase" in meta_text
+
+
+def _looks_like_export_dir(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    return (
+        (path / "__bp__.bp.py").exists()
+        or any(path.glob("*.bp.py"))
+        or any(path.glob("*_meta.py"))
+    )
+
+
+def _resolve_export_dir(export_dir: str | Path) -> Path:
+    export_path = Path(export_dir)
+    if not export_path.exists() or not export_path.is_dir():
+        return export_path
+    if _looks_like_export_dir(export_path):
+        return export_path
+
+    child_dirs = [child for child in export_path.iterdir() if child.is_dir() and _looks_like_export_dir(child)]
+    if len(child_dirs) == 1:
+        return child_dirs[0]
+    return export_path
 
 
 
@@ -160,32 +184,32 @@ def validate_anim_node_fallback_defaults(export_dir: str | Path) -> list[str]:
     text = anim_graph.read_text(encoding="utf-8", errors="ignore")
     if "AnimGraphNode_OffsetRootBone" in text and "BindingPropertyBindings" in text:
         required = {
-            "OffsetRootBone Node RotationMode": "RotationMode=Interpolate",
-            "OffsetRootBone Node TranslationHalflife": "TranslationHalflife=0.100000",
-            "OffsetRootBone Node MaxTranslationError": "MaxTranslationError=-1.000000",
+            "OffsetRootBone Node RotationMode": "RotationMode=Accumulate",
+            "OffsetRootBone Node TranslationHalflife": "TranslationHalflife=0.200000",
+            "OffsetRootBone Node MaxTranslationError": "MaxTranslationError=30.000000",
         }
         for label, token in required.items():
             if token not in text:
                 errors.append(f"AnimGraph missing {label}; imported ABP may evaluate root offset sideways")
 
         forbidden = {
-            "OffsetRootBone sideway RotationMode": "RotationMode=Accumulate",
-            "OffsetRootBone sideway TranslationHalflife": "TranslationHalflife=0.200000",
-            "OffsetRootBone sideway MaxTranslationError": "MaxTranslationError=30.000000",
+            "OffsetRootBone drifted RotationMode": "RotationMode=Interpolate",
+            "OffsetRootBone drifted TranslationHalflife": "TranslationHalflife=0.100000",
+            "OffsetRootBone drifted MaxTranslationError": "MaxTranslationError=-1.000000",
         }
         for label, token in forbidden.items():
             if token in text:
-                errors.append(f"AnimGraph contains {label}; this is the known sideways baseline")
+                errors.append(f"AnimGraph contains {label}; importer drifted away from the original runtime fallback values")
 
     if "AnimGraphNode_MotionMatching" in text and "BindingPropertyBindings" in text:
-        if 'AnimGraphNode_MotionMatching.pin("BlendTime", 0.200000)' not in text and "BlendTime=0.200000" not in text:
-            errors.append("AnimGraph missing MotionMatching BlendTime 0.200000")
-        if "BlendTime=0.500000" in text:
-            errors.append("AnimGraph contains MotionMatching BlendTime=0.500000; this is the known sideways baseline")
+        if 'AnimGraphNode_MotionMatching.pin("BlendTime", 0.500000)' not in text and "BlendTime=0.500000" not in text:
+            errors.append("AnimGraph missing MotionMatching BlendTime 0.500000")
+        if "BlendTime=0.200000" in text:
+            errors.append("AnimGraph contains MotionMatching BlendTime=0.200000; importer drifted away from the original runtime fallback values")
 
     if "AnimGraphNode_BlendStack" in text and "BindingPropertyBindings" in text:
-        if 'AnimGraphNode_BlendStack.pin("BlendTime", 0.200000)' not in text and "BlendTime=0.200000" not in text:
-            errors.append("AnimGraph missing BlendStack BlendTime 0.200000")
+        if 'AnimGraphNode_BlendStack.pin("BlendTime", 0.500000)' not in text and "BlendTime=0.500000" not in text:
+            errors.append("AnimGraph missing BlendStack BlendTime 0.500000")
 
     return errors
 
@@ -227,7 +251,7 @@ def validate_orientation_warping_sideways_defaults(export_dir: str | Path) -> li
         if "AnimGraphNode_OrientationWarping" in text:
             required = {
                 "MotionMatching OrientationWarping Mode=Graph": "Mode=Graph",
-                "MotionMatching OrientationWarping ComponentTransform": "WarpingSpace=ComponentTransform",
+                "MotionMatching OrientationWarping RootBoneTransform": "WarpingSpace=RootBoneTransform",
                 "MotionMatching OrientationWarping angle guard": "LocomotionAngleDeltaThreshold=135.000000",
                 "MotionMatching OrientationWarping WarpingSpace property": 'PropertyName=\\"WarpingSpace\\"',
                 "MotionMatching OrientationWarping WarpingSpace binding": 'PropertyPath=(\\"Get_OrientationWarpingWarpingSpace\\")',
@@ -235,8 +259,8 @@ def validate_orientation_warping_sideways_defaults(export_dir: str | Path) -> li
             for label, token in required.items():
                 if token not in text:
                     errors.append(f"{label} missing; imported ABP may evaluate orientation warping sideways")
-            if "WarpingSpace=RootBoneTransform" in text:
-                errors.append("MotionMatching OrientationWarping uses RootBoneTransform; this is the known sideways baseline")
+            if "WarpingSpace=ComponentTransform" in text:
+                errors.append("MotionMatching OrientationWarping uses ComponentTransform; importer drifted away from the original runtime fallback values")
 
     return errors
 
@@ -282,7 +306,7 @@ def validate_update_motion_matching(export_dir: str | Path, expected_target: str
     return errors
 
 def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tuple[List[str], List[str]]:
-    export_path = Path(export_dir)
+    export_path = _resolve_export_dir(export_dir)
     errors: List[str] = []
     warnings: List[str] = []
 
@@ -363,6 +387,34 @@ def validate_export_dir(export_dir: str | Path, expected_target: str = "") -> Tu
     errors.extend(validate_anim_node_fallback_defaults(export_path))
     errors.extend(validate_orientation_warping_sideways_defaults(export_path))
     return errors, warnings
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print("usage: bpy_anim_roundtrip_check.py <export_dir> [expected_target]", file=sys.stderr)
+        return 2
+
+    export_dir = argv[1]
+    expected_target = argv[2] if len(argv) > 2 else ""
+    resolved_dir = _resolve_export_dir(export_dir)
+    errors, warnings = validate_export_dir(resolved_dir, expected_target)
+
+    print(f"export_dir={resolved_dir}")
+    for warning in warnings:
+        print(f"WARNING: {warning}")
+    for error in errors:
+        print(f"ERROR: {error}")
+
+    if errors:
+        print(f"FAILED: {len(errors)} error(s), {len(warnings)} warning(s)")
+        return 1
+
+    print(f"OK: 0 error(s), {len(warnings)} warning(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
 
 
 
